@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import io
+import time
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -114,6 +115,7 @@ if 'master_df' in st.session_state:
                     error_occurred = True
                     break
                 routing_data.append({'Postcode': pc, 'Price': pr, 'Phone': ph, 'latitude': lat, 'longitude': lon_or_err})
+                time.sleep(0.8) # Paced to prevent rate limits
         
         if not error_occurred:
             df_routing = pd.DataFrame(routing_data)
