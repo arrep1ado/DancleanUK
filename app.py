@@ -208,15 +208,17 @@ if 'master_df' in st.session_state:
         status = str(row['Status'])
         price = row.get('Price', 0)
         phone = row.get('Phone', '')
+        payment = str(row.get('Payment', 'waiting'))
         
         is_return_depot = (idx == len(st.session_state.master_df) - 1) and (price == 0)
         card_label = "🏁 Return to Depot (Grantham)" if is_return_depot else f"Postcode: {postcode}"
         
         status_icon = "✅" if status.lower() == 'completed' else "⏳"
         status_text = "Completed" if status.lower() == 'completed' else "Pending"
+        payment_display = f" | **Payment:** {payment}" if not is_return_depot else ""
         
         with st.container(border=True):
-            st.write(f"**{status_icon} {card_label}** | **Price:** £{price} | **Status:** {status_text}")
+            st.write(f"**{status_icon} {card_label}** | **Price:** £{price} | **Status:** {status_text}{payment_display}")
             
             col1, col2 = st.columns(2)
             
@@ -231,6 +233,14 @@ if 'master_df' in st.session_state:
                         msg = f"Hi from DanCleanUK! Your service is complete today. Total: £{price}. Please pay via bank transfer to Mettle - Sort Code: 04-03-33 | Account: 72515806. Thank you!"
                         wa_url = f"https://wa.me/{phone}?text={msg.replace(' ', '%20')}"
                         st.link_button("Send WhatsApp", wa_url, key=f"wa_{idx}")
+                
+                if not is_return_depot:
+                    if payment.lower() == 'waiting':
+                        if st.button("💵 Cash Paid", key=f"cash_{idx}"):
+                            st.session_state.master_df.at[idx, 'Payment'] = 'Cash'
+                            st.rerun()
+                    else:
+                        st.caption(f"Payment Status: {payment}")
                     
             with col2:
                 map_url = f"https://www.google.com/maps/dir/?api=1&destination={postcode}&travelmode=driving"
