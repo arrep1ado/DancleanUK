@@ -76,25 +76,34 @@ if uploaded_file and 'master_df' not in st.session_state:
     except Exception as e:
         st.error(f"Error loading file: {e}")
 
-# --- ROBUST MULTI-SOURCE GEOCODER (POSTCODES.IO + NOMINATIM FALLBACK) ---
+# --- FOOLPROOF MULTI-SOURCE GEOCODER (POSTCODES.IO ACTIVE + TERMINATED + NOMINATIM) ---
 def get_coords(postcode):
     cleaned_pc = postcode.upper().strip()
     pc_no_space = cleaned_pc.replace(" ", "")
     
-    # 1. Try postcodes.io first
-    url_io = f"https://api.postcodes.io/postcodes/{pc_no_space}"
+    # 1. Try postcodes.io (Active postcodes)
     try:
-        res = requests.get(url_io, timeout=5)
+        res = requests.get(f"https://api.postcodes.io/postcodes/{pc_no_space}", timeout=4)
         if res.status_code == 200:
             data = res.json().get("result", {})
-            lat = data.get("latitude")
-            lon = data.get("longitude")
+            lat, lon = data.get("latitude"), data.get("longitude")
             if lat is not None and lon is not None:
                 return lat, lon
     except Exception:
         pass
 
-    # 2. Fallback to OpenStreetMap Nominatim API (handles older, terminated, or niche postcodes)
+    # 2. Try postcodes.io (Terminated/historical postcodes like AL1 1AA)
+    try:
+        res = requests.get(f"https://api.postcodes.io/terminated_postcodes/{pc_no_space}", timeout=4)
+        if res.status_code == 200:
+            data = res.json().get("result", {})
+            lat, lon = data.get("latitude"), data.get("longitude")
+            if lat is not None and lon is not None:
+                return lat, lon
+    except Exception:
+        pass
+
+    # 3. Fallback to OpenStreetMap Nominatim API
     url_nom = "https://nominatim.openstreetmap.org/search"
     headers = {'User-Agent': 'DanCleanUKOptimizer/1.0'}
     params = {'q': f"{cleaned_pc}, United Kingdom", 'format': 'json', 'limit': 1}
@@ -104,8 +113,8 @@ def get_coords(postcode):
             results = res.json()
             if results:
                 return float(results[0]['lat']), float(results[0]['lon'])
-    except Exception as e:
-        return None, str(e)
+    except Exception:
+        pass
 
     return None, f"Postcode not found or invalid ({postcode})."
 
@@ -127,7 +136,7 @@ if 'master_df' in st.session_state:
                     error_occurred = True
                     break
                 routing_data.append({'Postcode': pc, 'Price': pr, 'Phone': ph, 'latitude': lat, 'longitude': lon_or_err})
-                time.sleep(0.3) # Gentle pacing
+                time.sleep(0.2)
         
         if not error_occurred:
             df_routing = pd.DataFrame(routing_data)
