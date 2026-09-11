@@ -67,7 +67,7 @@ if "API_KEY" not in st.secrets:
     st.stop()
 
 API_KEY = st.secrets["API_KEY"]
-uploaded_file = st.file_uploader("Upload your Day's File (Headers: Postcode, Price, Phone, Name/Address)", type=["csv", "xlsx"])
+uploaded_file = st.file_uploader("Upload your Day's File (Headers required: Postcode, Price, Phone)", type=["csv", "xlsx"])
 
 if uploaded_file and 'master_df' not in st.session_state:
     try:
@@ -129,13 +129,12 @@ if 'master_df' in st.session_state:
     if st.button("Optimize Route"):
         all_postcodes = [DEPOT_POSTCODE.upper().strip()] + st.session_state.master_df['Postcode'].tolist()
         
-        # Preserve extra columns dynamically if they exist in the dataframe
+        # Capture any extra columns dynamically (e.g. Door No, Address, Name)
         extra_cols = [col for col in st.session_state.master_df.columns if col not in ['Postcode', 'Price', 'Phone', 'Status', 'Payment', 'latitude', 'longitude']]
         
         routing_data = []
         error_occurred = False
         
-        # Build base lists aligned with all_postcodes (depot gets empty/default values for job-specific fields)
         prices = [0.0] + st.session_state.master_df['Price'].tolist()
         phones = [''] + st.session_state.master_df['Phone'].tolist()
         
@@ -200,7 +199,6 @@ if 'master_df' in st.session_state:
                     new_master['Status'] = 'pending'
                     new_master['Payment'] = 'waiting'
                     
-                    # Mark depot rows explicitly
                     new_master.loc[0, 'Status'] = 'depot'
                     new_master.loc[len(new_master) - 1, 'Status'] = 'depot'
                     
@@ -220,6 +218,17 @@ if 'master_df' in st.session_state:
         st.write(f"### Planned Daily Take-Home Profit: £{st.session_state.route_data.get('locked_profit', 0):.2f}")
         st.write(f"### Estimated Total Distance: {st.session_state.route_data.get('initial_miles', 0):.2f} miles")
     
+    # --- HELPER FUNCTION TO BUILD MAP URL WITH DOOR/ADDRESS ---
+    def get_map_destination_string(row_data):
+        parts = []
+        for col_name in st.session_state.master_df.columns:
+            if col_name.lower() in ['door', 'door no', 'door number', 'address', 'street', 'name']:
+                val = row_data.get(col_name)
+                if pd.notna(val) and str(val).strip() != '':
+                    parts.append(str(val).strip())
+        parts.append(str(row_data['Postcode']))
+        return ", ".join(parts)
+
     # --- OPTIMIZED SIDEBAR NAVIGATION (NEXT STOP EXCLUDING DEPOT) ---
     st.sidebar.markdown("---")
     st.sidebar.title("Route Navigation")
@@ -230,10 +239,11 @@ if 'master_df' in st.session_state:
     ]
     
     if not pending_df.empty:
-        next_stop = str(pending_df.iloc[0]['Postcode'])
-        gmaps_url = f"https://www.google.com/maps/dir/?api=1&destination={next_stop}&travelmode=driving"
+        next_row = pending_df.iloc[0]
+        next_dest = get_map_destination_string(next_row)
+        gmaps_url = f"https://www.google.com/maps/dir/?api=1&destination={next_dest}&travelmode=driving"
         st.sidebar.link_button("🚗 Navigate to Next Stop", gmaps_url)
-        st.sidebar.caption(f"Next in sequence: {next_stop} ({len(pending_df)} stops remaining)")
+        st.sidebar.caption(f"Next in sequence: {next_dest} ({len(pending_df)} stops remaining)")
     else:
         st.sidebar.success("All customer stops completed for today!")
 
@@ -245,7 +255,7 @@ if 'master_df' in st.session_state:
         phone = row.get('Phone', '')
         payment = str(row.get('Payment', 'waiting'))
         
-        # Dynamically extract any additional info columns like Name, Address, etc. if present
+        # Build extra info text for display cards
         extra_info_parts = []
         for col_name in st.session_state.master_df.columns:
             if col_name not in ['Postcode', 'Price', 'Phone', 'Status', 'Payment', 'latitude', 'longitude']:
@@ -260,13 +270,15 @@ if 'master_df' in st.session_state:
         is_start_depot = (idx == 0)
         is_return_depot = (idx == len(st.session_state.master_df) - 1)
         
+        dest_string = get_map_destination_string(row)
+        map_url = f"https://www.google.com/maps/dir/?api=1&destination={dest_string}&travelmode=driving"
+
         if is_start_depot:
             with st.container(border=True):
                 st.write(f"**📍 Start Depot (Grantham)** ({postcode})")
         elif is_return_depot:
             with st.container(border=True):
                 st.write(f"**🏁 Return to Depot (Grantham)** ({postcode})")
-                map_url = f"https://www.google.com/maps/dir/?api=1&destination={postcode}&travelmode=driving"
                 st.link_button("🚗 Navigate Here", map_url, key=f"nav_{idx}")
         else:
             status_icon = "✅" if status.lower() == 'completed' else "⏳"
@@ -301,7 +313,6 @@ if 'master_df' in st.session_state:
                             st.rerun()
                         
                 with col2:
-                    map_url = f"https://www.google.com/maps/dir/?api=1&destination={postcode}&travelmode=driving"
                     st.link_button("🚗 Navigate Here", map_url, key=f"nav_{idx}")
 else:
     st.info("Upload your day's file to begin.")
