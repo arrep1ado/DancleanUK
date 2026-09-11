@@ -4,27 +4,26 @@ import requests
 import io
 import time
 import math
-from itertools import permutations
+import random
 from urllib.parse import quote
-
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
 
 
 # ============================================================
-# APP CONFIG
+# CONFIG
 # ============================================================
 
-APP_VERSION = "7.0"
+APP_VERSION = "10.0"
 
 st.set_page_config(
-    page_title="DanCleanUK Optimizer",
+    page_title="DanCleanUK Route Optimizer",
     page_icon="🚗",
     layout="centered"
 )
 
-st.title("🚗 Daily Route & Profit Optimizer")
+st.title("🚗 DanCleanUK Daily Route Optimizer")
 
 st.markdown(
     """
@@ -44,16 +43,10 @@ st.markdown(
 
 if st.session_state.get("app_version") != APP_VERSION:
 
-    for key in [
-        "master_df",
-        "route_data",
-        "unrouted_df",
-        "geocode_cache"
-    ]:
-        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
 
     st.session_state.app_version = APP_VERSION
-
 
 if "geocode_cache" not in st.session_state:
     st.session_state.geocode_cache = {}
@@ -107,23 +100,45 @@ MPG = st.sidebar.number_input(
 TAX_RATE = (
     st.sidebar.slider(
         "Tax Deduction (%)",
-        min_value=0,
-        max_value=50,
-        value=20
+        0,
+        50,
+        20
     ) / 100
 )
 
-TIME_VALUE = st.sidebar.number_input(
-    "Value of Driving Time (£/hour)",
-    min_value=0.0,
-    value=20.0,
-    step=1.0
+
+# ============================================================
+# ROUTE PRIORITY SETTINGS
+# ============================================================
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧠 Route Priorities")
+
+TIME_PRIORITY = st.sidebar.slider(
+    "Driving Time Priority",
+    1,
+    10,
+    10
+)
+
+DISTANCE_PRIORITY = st.sidebar.slider(
+    "Distance/Fuel Priority",
+    1,
+    10,
+    7
+)
+
+CLUSTER_PRIORITY = st.sidebar.slider(
+    "Stay Near Nearby Jobs",
+    1,
+    10,
+    9
 )
 
 st.sidebar.caption(
-    "Higher driving-time value makes the optimiser "
-    "prefer faster routes, even when the distance is "
-    "slightly longer."
+    "For a normal Grantham day, leave these near "
+    "the defaults. The optimiser will strongly prefer "
+    "clearing nearby jobs before travelling to a distant area."
 )
 
 
@@ -147,7 +162,7 @@ API_KEY = st.secrets["API_KEY"]
 
 
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
 def clean_val(value):
@@ -155,21 +170,27 @@ def clean_val(value):
     if pd.isna(value):
         return ""
 
-    value = str(value).strip()
+    text = str(value).strip()
 
-    if value.endswith(".0"):
+    if text.endswith(".0"):
         try:
-            value = str(int(float(value)))
+            text = str(int(float(text)))
         except Exception:
             pass
 
-    return value
+    return text
+
+
+def maps_url(destination):
+
+    return (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&destination={quote(str(destination))}"
+        "&travelmode=driving"
+    )
 
 
 def format_duration(seconds):
-
-    if seconds is None:
-        return "0m"
 
     minutes = round(float(seconds) / 60)
 
@@ -182,24 +203,15 @@ def format_duration(seconds):
     return f"{mins}m"
 
 
-def maps_url(destination):
-
-    return (
-        "https://www.google.com/maps/dir/?api=1"
-        f"&destination={quote(str(destination))}"
-        "&travelmode=driving"
-    )
-
-
 # ============================================================
-# BUILD BEST ADDRESS QUERY
+# BUILD GEOCODING QUERY
 # ============================================================
 
 def build_geo_query(row, default_postcode):
 
     parts = []
 
-    preferred_columns = [
+    address_columns = [
         "address",
         "street",
         "location",
@@ -212,10 +224,9 @@ def build_geo_query(row, default_postcode):
         "address1"
     ]
 
-    # Add address information first.
     for column in row.index:
 
-        if column.lower() in preferred_columns:
+        if column.lower() in address_columns:
 
             value = clean_val(
                 row[column]
@@ -224,7 +235,6 @@ def build_geo_query(row, default_postcode):
             if value:
                 parts.append(value)
 
-    # Always add postcode.
     postcode = clean_val(
         row.get("Postcode", "")
     )
@@ -234,40 +244,40 @@ def build_geo_query(row, default_postcode):
     else:
         parts.append(default_postcode)
 
-    # Add UK so geocoder doesn't confuse locations.
     parts.append("United Kingdom")
 
     return ", ".join(parts)
 
 
 # ============================================================
-# GEOCODING
+# GEOCODER
 # ============================================================
 
-def get_coords(query_string, postcode_fallback):
+def get_coords(query_string, postcode):
 
     query = str(query_string).strip()
-    postcode = str(postcode_fallback).upper().strip()
+    postcode = str(postcode).upper().strip()
 
     cache_key = (
         query + "|" + postcode
     ).lower()
 
     if cache_key in st.session_state.geocode_cache:
+
         return st.session_state.geocode_cache[
             cache_key
         ]
 
     headers = {
         "User-Agent":
-            "DanCleanUKOptimizer/7.0"
+            "DanCleanUKRouteOptimizer/10.0"
     }
 
     # --------------------------------------------------------
-    # 1. Full address
+    # FULL ADDRESS
     # --------------------------------------------------------
 
-    if query and query.lower() != "nan":
+    if query:
 
         try:
 
@@ -288,11 +298,11 @@ def get_coords(query_string, postcode_fallback):
                 and response.json()
             ):
 
-                result = response.json()[0]
+                item = response.json()[0]
 
                 coords = (
-                    float(result["lat"]),
-                    float(result["lon"])
+                    float(item["lat"]),
+                    float(item["lon"])
                 )
 
                 st.session_state.geocode_cache[
@@ -305,7 +315,7 @@ def get_coords(query_string, postcode_fallback):
             pass
 
     # --------------------------------------------------------
-    # 2. Postcode through Nominatim
+    # POSTCODE FALLBACK - NOMINATIM
     # --------------------------------------------------------
 
     if postcode:
@@ -329,11 +339,11 @@ def get_coords(query_string, postcode_fallback):
                 and response.json()
             ):
 
-                result = response.json()[0]
+                item = response.json()[0]
 
                 coords = (
-                    float(result["lat"]),
-                    float(result["lon"])
+                    float(item["lat"]),
+                    float(item["lon"])
                 )
 
                 st.session_state.geocode_cache[
@@ -346,21 +356,17 @@ def get_coords(query_string, postcode_fallback):
             pass
 
     # --------------------------------------------------------
-    # 3. Postcodes.io
+    # POSTCODES.IO
     # --------------------------------------------------------
 
-    postcode_clean = (
-        postcode
-        .replace(" ", "")
-    )
+    pc = postcode.replace(" ", "")
 
-    if postcode_clean:
+    if pc:
 
         try:
 
             response = requests.get(
-                f"https://api.postcodes.io/postcodes/"
-                f"{postcode_clean}",
+                f"https://api.postcodes.io/postcodes/{pc}",
                 timeout=6
             )
 
@@ -395,9 +401,8 @@ def get_coords(query_string, postcode_fallback):
         except Exception:
             pass
 
-    # --------------------------------------------------------
-    # DO NOT PUT FAILED JOB AT DEPOT
-    # --------------------------------------------------------
+    # IMPORTANT:
+    # Never silently put a failed customer at the depot.
 
     return None
 
@@ -427,8 +432,10 @@ def haversine_km(
         math.sin(dlat / 2) ** 2
         +
         math.cos(math.radians(lat1))
-        * math.cos(math.radians(lat2))
-        * math.sin(dlon / 2) ** 2
+        *
+        math.cos(math.radians(lat2))
+        *
+        math.sin(dlon / 2) ** 2
     )
 
     c = (
@@ -460,7 +467,7 @@ def offline_matrix(locations):
     ]
 
     ROAD_FACTOR = 1.30
-    AVERAGE_SPEED = 40.0
+    AVERAGE_SPEED = 35.0
 
     for i in range(n):
 
@@ -480,9 +487,7 @@ def offline_matrix(locations):
                 lon2
             )
 
-            road_km = (
-                km * ROAD_FACTOR
-            )
+            road_km = km * ROAD_FACTOR
 
             distances[i][j] = (
                 road_km * 1000
@@ -519,7 +524,7 @@ def get_ors_matrix(locations):
                 "Authorization": API_KEY,
                 "Content-Type": "application/json"
             },
-            timeout=40
+            timeout=60
         )
 
         if response.status_code != 200:
@@ -527,37 +532,48 @@ def get_ors_matrix(locations):
 
         data = response.json()
 
-        distances = data.get(
-            "distances"
+        return (
+            data.get("distances"),
+            data.get("durations")
         )
-
-        durations = data.get(
-            "durations"
-        )
-
-        if not distances or not durations:
-            return None, None
-
-        return distances, durations
 
     except Exception:
+
         return None, None
 
 
 # ============================================================
-# LEG COST
+# ROUTE METRICS
 # ============================================================
 
-def leg_cost(
-    distance_m,
-    duration_s,
+def route_metrics(
+    route,
+    distances,
+    durations,
     fuel_price,
-    mpg,
-    time_value
+    mpg
 ):
 
+    total_distance = 0.0
+    total_time = 0.0
+
+    for i in range(
+        len(route) - 1
+    ):
+
+        a = route[i]
+        b = route[i + 1]
+
+        total_distance += (
+            distances[a][b]
+        )
+
+        total_time += (
+            durations[a][b]
+        )
+
     miles = (
-        distance_m
+        total_distance
         / 1000
         * 0.621371
     )
@@ -573,241 +589,180 @@ def leg_cost(
         * fuel_price
     )
 
-    time_cost = (
-        duration_s
-        / 3600
-        * time_value
-    )
-
-    return (
-        fuel_cost
-        + time_cost
-    )
+    return {
+        "distance_m": total_distance,
+        "time_s": total_time,
+        "miles": miles,
+        "litres": litres,
+        "fuel_cost": fuel_cost
+    }
 
 
 # ============================================================
-# ROUTE TOTAL
+# CLUSTER PENALTY
 # ============================================================
 
-def route_total(
+def calculate_cluster_penalty(
+    route,
+    distances,
+    durations
+):
+
+    penalty = 0.0
+
+    # --------------------------------------------------------
+    # This is NOT saying "always choose nearest".
+    #
+    # It asks:
+    #
+    # "Are we making a big jump while there are still
+    # several customers close to where we currently are?"
+    #
+    # If yes, penalise that behaviour.
+    # --------------------------------------------------------
+
+    customers = route[1:-1]
+
+    for position in range(
+        1,
+        len(route) - 1
+    ):
+
+        current = route[position]
+
+        remaining = [
+            x
+            for x in customers
+            if x not in route[:position + 1]
+        ]
+
+        if not remaining:
+            continue
+
+        next_stop = route[position + 1]
+
+        next_distance = (
+            distances[current][next_stop]
+        )
+
+        # Find nearby unvisited jobs.
+        nearby = []
+
+        for job in remaining:
+
+            d = distances[current][job]
+
+            if d <= 15000:
+                nearby.append(d)
+
+        # If there are nearby jobs and we're leaving
+        # the area for a much longer journey, penalise it.
+        if nearby:
+
+            nearest_local = min(
+                nearby
+            )
+
+            if next_distance > (
+                nearest_local * 2.5
+            ):
+
+                penalty += (
+                    next_distance
+                    - nearest_local
+                ) * 3.0
+
+    return penalty
+
+
+# ============================================================
+# ROUTE SCORE
+# ============================================================
+
+def route_score(
     route,
     distances,
     durations,
     fuel_price,
-    mpg,
-    time_value
+    mpg
 ):
 
-    total_distance = 0
-    total_duration = 0
-    total_cost = 0
-
-    for position in range(
-        len(route) - 1
-    ):
-
-        a = route[position]
-        b = route[position + 1]
-
-        distance = distances[a][b]
-        duration = durations[a][b]
-
-        total_distance += distance
-        total_duration += duration
-
-        total_cost += leg_cost(
-            distance,
-            duration,
-            fuel_price,
-            mpg,
-            time_value
-        )
-
-    return (
-        total_cost,
-        total_distance,
-        total_duration
-    )
-
-
-# ============================================================
-# FIND FIRST CUSTOMER
-# ============================================================
-
-def find_nearest_first_customer(
-    distances,
-    durations,
-    fuel_price,
-    mpg,
-    time_value
-):
-
-    customer_count = (
-        len(distances) - 1
-    )
-
-    best_customer = None
-    best_score = float("inf")
-
-    for customer in range(
-        1,
-        customer_count + 1
-    ):
-
-        # PRIMARY:
-        # driving time from depot
-        #
-        # SECONDARY:
-        # actual operating cost
-        #
-        # This guarantees the first stop is
-        # genuinely near the depot.
-
-        driving_time = (
-            durations[0][customer]
-        )
-
-        operating_cost = leg_cost(
-            distances[0][customer],
-            durations[0][customer],
-            fuel_price,
-            mpg,
-            time_value
-        )
-
-        score = (
-            driving_time,
-            operating_cost
-        )
-
-        if (
-            best_customer is None
-            or score < best_score
-        ):
-
-            best_customer = customer
-            best_score = score
-
-    return best_customer
-
-
-# ============================================================
-# EXACT OPTIMISATION AFTER FIRST STOP
-# ============================================================
-
-def optimise_after_first_exact(
-    first_customer,
-    distances,
-    durations,
-    fuel_price,
-    mpg,
-    time_value
-):
-
-    customer_count = (
-        len(distances) - 1
-    )
-
-    remaining = [
-        x
-        for x in range(
-            1,
-            customer_count + 1
-        )
-        if x != first_customer
-    ]
-
-    # --------------------------------------------------------
-    # No other customers.
-    # --------------------------------------------------------
-
-    if not remaining:
-
-        return [
-            0,
-            first_customer,
-            0
-        ]
-
-    # --------------------------------------------------------
-    # Up to 9 remaining customers:
-    # exact permutation search.
-    #
-    # This is intentionally done AFTER fixing the first
-    # customer.
-    # --------------------------------------------------------
-
-    if len(remaining) <= 9:
-
-        best_route = None
-        best_score = None
-
-        for permutation in permutations(
-            remaining
-        ):
-
-            route = (
-                [0, first_customer]
-                + list(permutation)
-                + [0]
-            )
-
-            score = route_total(
-                route,
-                distances,
-                durations,
-                fuel_price,
-                mpg,
-                time_value
-            )
-
-            # Primary objective:
-            # total driving time.
-            #
-            # Secondary:
-            # fuel/operating cost.
-            #
-            # Tertiary:
-            # total distance.
-
-            comparison = (
-                score[2],
-                score[0],
-                score[1]
-            )
-
-            if (
-                best_score is None
-                or comparison < best_score
-            ):
-
-                best_score = comparison
-                best_route = route
-
-        return best_route
-
-    # --------------------------------------------------------
-    # Larger route:
-    # use nearest-neighbour starts + 2-opt.
-    # --------------------------------------------------------
-
-    return optimise_large_route_after_first(
-        first_customer,
+    metrics = route_metrics(
+        route,
         distances,
         durations,
         fuel_price,
-        mpg,
-        time_value
+        mpg
+    )
+
+    cluster_penalty = (
+        calculate_cluster_penalty(
+            route,
+            distances,
+            durations
+        )
+    )
+
+    # Time is the most important factor.
+    time_score = (
+        metrics["time_s"]
+        * TIME_PRIORITY
+    )
+
+    distance_score = (
+        metrics["distance_m"]
+        * DISTANCE_PRIORITY
+    )
+
+    cluster_score = (
+        cluster_penalty
+        * CLUSTER_PRIORITY
+    )
+
+    return (
+        time_score
+        + distance_score
+        + cluster_score
     )
 
 
 # ============================================================
-# NEAREST NEIGHBOUR
+# NEAREST FIRST
 # ============================================================
 
-def nearest_neighbour_route(
+def find_first_customer(
+    distances,
+    durations
+):
+
+    best = None
+    best_time = float("inf")
+
+    for customer in range(
+        1,
+        len(distances)
+    ):
+
+        travel_time = (
+            durations[0][customer]
+        )
+
+        if travel_time < best_time:
+
+            best_time = travel_time
+            best = customer
+
+    return best
+
+
+# ============================================================
+# GREEDY ROUTE
+# ============================================================
+
+def build_greedy_route(
     first_customer,
-    distances
+    distances,
+    durations
 ):
 
     customer_count = (
@@ -834,10 +789,61 @@ def nearest_neighbour_route(
 
     while remaining:
 
-        next_customer = min(
-            remaining,
-            key=lambda x:
-                distances[current][x]
+        candidates = []
+
+        for candidate in remaining:
+
+            direct_time = (
+                durations[current][candidate]
+            )
+
+            # Look one step ahead.
+            future = [
+                x
+                for x in remaining
+                if x != candidate
+            ]
+
+            if future:
+
+                nearest_future = min(
+                    future,
+                    key=lambda x:
+                        durations[candidate][x]
+                )
+
+                future_time = (
+                    durations[candidate]
+                    [nearest_future]
+                )
+
+            else:
+
+                future_time = (
+                    durations[candidate][0]
+                )
+
+            # Mostly nearest next stop,
+            # but look ahead to prevent bad jumps.
+            score = (
+                direct_time * 0.70
+                +
+                future_time * 0.30
+            )
+
+            candidates.append(
+                (
+                    score,
+                    candidate
+                )
+            )
+
+        candidates.sort(
+            key=lambda x: x[0]
+        )
+
+        next_customer = (
+            candidates[0][1]
         )
 
         route.append(
@@ -856,7 +862,7 @@ def nearest_neighbour_route(
 
 
 # ============================================================
-# 2 OPT
+# 2-OPT
 # ============================================================
 
 def two_opt(
@@ -864,29 +870,17 @@ def two_opt(
     distances,
     durations,
     fuel_price,
-    mpg,
-    time_value
+    mpg
 ):
 
     best = route[:]
 
-    (
-        best_cost,
-        best_distance,
-        best_time
-    ) = route_total(
+    best_score = route_score(
         best,
         distances,
         durations,
         fuel_price,
-        mpg,
-        time_value
-    )
-
-    best_score = (
-        best_time,
-        best_cost,
-        best_distance
+        mpg
     )
 
     improved = True
@@ -913,29 +907,27 @@ def two_opt(
                     best[j + 1:]
                 )
 
-                (
-                    candidate_cost,
-                    candidate_distance,
-                    candidate_time
-                ) = route_total(
-                    candidate,
-                    distances,
-                    durations,
-                    fuel_price,
-                    mpg,
-                    time_value
-                )
+                # First stop must remain first.
+                if candidate[1] != route[1]:
+                    continue
 
                 candidate_score = (
-                    candidate_time,
-                    candidate_cost,
-                    candidate_distance
+                    route_score(
+                        candidate,
+                        distances,
+                        durations,
+                        fuel_price,
+                        mpg
+                    )
                 )
 
-                if candidate_score < best_score:
+                if candidate_score < (
+                    best_score - 0.01
+                ):
 
                     best = candidate
                     best_score = candidate_score
+
                     improved = True
 
                     break
@@ -947,25 +939,112 @@ def two_opt(
 
 
 # ============================================================
-# LARGE ROUTE
+# 3-OPT STYLE RELOCATION
 # ============================================================
 
-def optimise_large_route_after_first(
-    first_customer,
+def relocate_improvement(
+    route,
     distances,
     durations,
     fuel_price,
-    mpg,
-    time_value
+    mpg
+):
+
+    best = route[:]
+
+    best_score = route_score(
+        best,
+        distances,
+        durations,
+        fuel_price,
+        mpg
+    )
+
+    improved = True
+
+    while improved:
+
+        improved = False
+
+        # Don't move the first customer.
+        for i in range(
+            2,
+            len(best) - 1
+        ):
+
+            customer = best[i]
+
+            shortened = (
+                best[:i]
+                +
+                best[i + 1:]
+            )
+
+            for j in range(
+                1,
+                len(shortened)
+            ):
+
+                # Never put anything before the
+                # compulsory first customer.
+                if j < 2:
+                    continue
+
+                candidate = (
+                    shortened[:j]
+                    + [customer]
+                    + shortened[j:]
+                )
+
+                if candidate[1] != best[1]:
+                    continue
+
+                candidate_score = (
+                    route_score(
+                        candidate,
+                        distances,
+                        durations,
+                        fuel_price,
+                        mpg
+                    )
+                )
+
+                if candidate_score < (
+                    best_score - 0.01
+                ):
+
+                    best = candidate
+                    best_score = candidate_score
+
+                    improved = True
+
+                    break
+
+            if improved:
+                break
+
+    return best
+
+
+# ============================================================
+# CREATE MULTIPLE STARTING ROUTES
+# ============================================================
+
+def generate_candidate_routes(
+    first_customer,
+    distances,
+    durations
 ):
 
     candidates = []
 
-    # Main nearest-neighbour route.
+    # Candidate 1:
+    # normal look-ahead greedy.
     candidates.append(
-        nearest_neighbour_route(
+        build_greedy_route(
             first_customer,
-            distances
+            distances,
+            durations
         )
     )
 
@@ -973,35 +1052,41 @@ def optimise_large_route_after_first(
         len(distances) - 1
     )
 
+    remaining = [
+        x
+        for x in range(
+            1,
+            customer_count + 1
+        )
+        if x != first_customer
+    ]
+
     # --------------------------------------------------------
-    # Also try different SECOND stops.
+    # Try several possible second stops.
     #
-    # This prevents:
+    # This is extremely useful for your situation.
     #
-    # Grantham
-    # -> nearest
-    # -> stupid direction
+    # Example:
     #
-    # and allows the optimiser to choose a sensible
-    # geographical progression after the compulsory
-    # first stop.
+    # Depot
+    # -> nearest Grantham job
+    #
+    # There might be:
+    #   5 more Grantham jobs
+    #   4 village jobs
+    #   10 distant jobs
+    #
+    # We test several sensible local second stops instead
+    # of blindly committing to one.
     # --------------------------------------------------------
 
     second_candidates = sorted(
-        [
-            x
-            for x in range(
-                1,
-                customer_count + 1
-            )
-            if x != first_customer
-        ],
+        remaining,
         key=lambda x:
-            distances[first_customer][x]
+            durations[first_customer][x]
     )
 
-    # Test up to 12 promising second stops.
-    for second in second_candidates[:12]:
+    for second in second_candidates[:15]:
 
         route = [
             0,
@@ -1009,40 +1094,80 @@ def optimise_large_route_after_first(
             second
         ]
 
-        remaining = set(
-            range(
-                1,
-                customer_count + 1
-            )
+        unvisited = set(
+            remaining
         )
 
-        remaining.discard(
-            first_customer
-        )
-
-        remaining.discard(
+        unvisited.discard(
             second
         )
 
         current = second
 
-        while remaining:
+        while unvisited:
 
-            next_customer = min(
-                remaining,
-                key=lambda x:
-                    distances[current][x]
+            candidate_scores = []
+
+            for candidate in unvisited:
+
+                direct = (
+                    durations[current][candidate]
+                )
+
+                future_jobs = [
+                    x
+                    for x in unvisited
+                    if x != candidate
+                ]
+
+                if future_jobs:
+
+                    future = min(
+                        future_jobs,
+                        key=lambda x:
+                            durations[candidate][x]
+                    )
+
+                    lookahead = (
+                        durations[candidate][future]
+                    )
+
+                else:
+
+                    lookahead = (
+                        durations[candidate][0]
+                    )
+
+                score = (
+                    direct * 0.65
+                    +
+                    lookahead * 0.35
+                )
+
+                candidate_scores.append(
+                    (
+                        score,
+                        candidate
+                    )
+                )
+
+            candidate_scores.sort(
+                key=lambda x: x[0]
+            )
+
+            chosen = (
+                candidate_scores[0][1]
             )
 
             route.append(
-                next_customer
+                chosen
             )
 
-            remaining.remove(
-                next_customer
+            unvisited.remove(
+                chosen
             )
 
-            current = next_customer
+            current = chosen
 
         route.append(0)
 
@@ -1051,11 +1176,67 @@ def optimise_large_route_after_first(
         )
 
     # --------------------------------------------------------
-    # Improve every candidate.
+    # Randomised candidates.
+    #
+    # This helps escape a poor greedy route.
     # --------------------------------------------------------
 
+    for _ in range(20):
+
+        shuffled = remaining[:]
+
+        random.shuffle(
+            shuffled
+        )
+
+        route = [
+            0,
+            first_customer
+        ] + shuffled + [0]
+
+        candidates.append(
+            route
+        )
+
+    return candidates
+
+
+# ============================================================
+# FULL OPTIMISER
+# ============================================================
+
+def optimise_route(
+    distances,
+    durations,
+    fuel_price,
+    mpg
+):
+
+    # --------------------------------------------------------
+    # FIRST STOP IS ALWAYS THE CLOSEST CUSTOMER TO DEPOT.
+    # --------------------------------------------------------
+
+    first_customer = (
+        find_first_customer(
+            distances,
+            durations
+        )
+    )
+
+    candidates = (
+        generate_candidate_routes(
+            first_customer,
+            distances,
+            durations
+        )
+    )
+
     best_route = None
-    best_score = None
+    best_score = float("inf")
+
+    # --------------------------------------------------------
+    # Improve every candidate.
+    # --------------------------------------------------------
 
     for candidate in candidates:
 
@@ -1064,93 +1245,46 @@ def optimise_large_route_after_first(
             distances,
             durations,
             fuel_price,
-            mpg,
-            time_value
+            mpg
         )
 
-        (
-            cost,
-            distance,
-            duration
-        ) = route_total(
+        improved = relocate_improvement(
             improved,
             distances,
             durations,
             fuel_price,
-            mpg,
-            time_value
+            mpg
         )
 
-        score = (
-            duration,
-            cost,
-            distance
+        improved = two_opt(
+            improved,
+            distances,
+            durations,
+            fuel_price,
+            mpg
         )
 
-        if (
-            best_score is None
-            or score < best_score
-        ):
+        score = route_score(
+            improved,
+            distances,
+            durations,
+            fuel_price,
+            mpg
+        )
+
+        if score < best_score:
 
             best_score = score
             best_route = improved
 
-    return best_route
-
-
-# ============================================================
-# MAIN ROUTE OPTIMISER
-# ============================================================
-
-def optimise_complete_route(
-    distances,
-    durations,
-    fuel_price,
-    mpg,
-    time_value
-):
-
-    # --------------------------------------------------------
-    # STEP 1:
-    # Find the closest customer to the depot.
-    #
-    # THIS IS NOW LOCKED.
-    # --------------------------------------------------------
-
-    first_customer = (
-        find_nearest_first_customer(
-            distances,
-            durations,
-            fuel_price,
-            mpg,
-            time_value
-        )
-    )
-
-    # --------------------------------------------------------
-    # STEP 2:
-    # Optimise everything AFTER the first stop.
-    # --------------------------------------------------------
-
-    route = (
-        optimise_after_first_exact(
-            first_customer,
-            distances,
-            durations,
-            fuel_price,
-            mpg,
-            time_value
-        )
-    )
-
     return (
-        route,
+        best_route,
         first_customer
     )
 
 
 # ============================================================
-# DESTINATION
+# DESTINATION TEXT
 # ============================================================
 
 def get_destination(row):
@@ -1189,7 +1323,7 @@ def get_destination(row):
                 parts.append(value)
 
     postcode = clean_val(
-        row.get("Postcode", "")
+        row.get("Postcode")
     )
 
     if postcode:
@@ -1199,7 +1333,7 @@ def get_destination(row):
 
 
 # ============================================================
-# UPLOAD
+# FILE UPLOAD
 # ============================================================
 
 uploaded_file = st.file_uploader(
@@ -1238,16 +1372,16 @@ if (
             .str.strip()
         )
 
-        required_columns = [
+        required = [
             "Postcode",
             "Price",
             "Phone"
         ]
 
         missing = [
-            column
-            for column in required_columns
-            if column not in df.columns
+            x
+            for x in required
+            if x not in df.columns
         ]
 
         if missing:
@@ -1259,7 +1393,7 @@ if (
 
             st.stop()
 
-        # Remove empty rows.
+        # Remove empty Excel rows.
         df = df.dropna(
             how="all"
         ).copy()
@@ -1296,10 +1430,8 @@ if (
         )
 
         df = df.dropna(
-            subset=[
-                "Price"
-            ]
-        ).copy()
+            subset=["Price"]
+        )
 
         df = df[
             df["Price"] > 0
@@ -1349,7 +1481,7 @@ if (
 
 
 # ============================================================
-# NO DATA
+# WAIT FOR FILE
 # ============================================================
 
 if "master_df" not in st.session_state:
@@ -1365,11 +1497,11 @@ df = st.session_state.master_df
 
 
 # ============================================================
-# OPTIMISE
+# PLAN ROUTE BUTTON
 # ============================================================
 
 if st.button(
-    "🚀 PLAN ROUTE",
+    "🚀 PLAN BEST DAILY ROUTE",
     type="primary",
     use_container_width=True
 ):
@@ -1377,17 +1509,17 @@ if st.button(
     if df.empty:
 
         st.error(
-            "There are no valid jobs."
+            "No valid customer jobs found."
         )
 
         st.stop()
 
     # --------------------------------------------------------
-    # DEPOT LOCATION
+    # DEPOT
     # --------------------------------------------------------
 
     with st.spinner(
-        "📍 Locating depot..."
+        "📍 Locating your depot..."
     ):
 
         depot_coords = get_coords(
@@ -1404,19 +1536,20 @@ if st.button(
         st.stop()
 
     # --------------------------------------------------------
-    # CUSTOMER GEOCODING
+    # GEOCODE CUSTOMERS
     # --------------------------------------------------------
+
+    total = len(df)
 
     progress = st.progress(
         0,
         text="Locating customer addresses..."
     )
 
-    valid_indices = []
-    failed_indices = []
-    customer_coords = {}
+    valid = []
+    failed = []
 
-    total_jobs = len(df)
+    coords_by_index = {}
 
     for number, (idx, row) in enumerate(
         df.iterrows(),
@@ -1435,50 +1568,44 @@ if st.button(
 
         if coords is None:
 
-            failed_indices.append(
-                idx
-            )
+            failed.append(idx)
 
         else:
 
-            valid_indices.append(
-                idx
-            )
+            valid.append(idx)
 
-            customer_coords[idx] = coords
+            coords_by_index[idx] = coords
 
         progress.progress(
-            number / total_jobs,
+            number / total,
             text=(
                 f"Locating customer "
-                f"{number} of {total_jobs}"
+                f"{number}/{total}"
             )
         )
 
-        # Respect Nominatim rate limit.
-        time.sleep(1.0)
+        # Nominatim polite rate.
+        time.sleep(1)
 
     progress.empty()
 
     # --------------------------------------------------------
-    # FAILED ADDRESSES
+    # FAILED JOBS
     # --------------------------------------------------------
 
-    if failed_indices:
+    if failed:
 
-        st.session_state.unrouted_df = (
-            df.loc[
-                failed_indices
-            ].copy()
+        st.session_state.failed_jobs = (
+            df.loc[failed].copy()
         )
 
     else:
 
-        st.session_state.unrouted_df = (
+        st.session_state.failed_jobs = (
             pd.DataFrame()
         )
 
-    if not valid_indices:
+    if not valid:
 
         st.error(
             "No customer addresses could be located."
@@ -1487,10 +1614,10 @@ if st.button(
         st.stop()
 
     # --------------------------------------------------------
-    # BUILD ROUTING DATA
+    # ROUTING DATA
     # --------------------------------------------------------
 
-    routing_rows = []
+    rows = []
 
     locations = [
         [
@@ -1499,72 +1626,68 @@ if st.button(
         ]
     ]
 
-    # Depot.
-    routing_rows.append(
-        {
-            "Postcode":
-                DEPOT_POSTCODE,
+    depot_row = {
 
-            "Price":
-                0.0,
+        "Postcode":
+            DEPOT_POSTCODE,
 
-            "Phone":
-                "",
+        "Price":
+            0.0,
 
-            "Status":
-                "depot",
+        "Phone":
+            "",
 
-            "Payment":
-                "waiting",
+        "Status":
+            "depot",
 
-            "geo_query":
-                DEPOT_FULL_ADDRESS,
+        "Payment":
+            "waiting",
 
-            "latitude":
-                depot_coords[0],
+        "geo_query":
+            DEPOT_FULL_ADDRESS,
 
-            "longitude":
-                depot_coords[1]
-        }
+        "latitude":
+            depot_coords[0],
+
+        "longitude":
+            depot_coords[1]
+    }
+
+    rows.append(
+        depot_row
     )
 
-    # Customers.
-    for idx in valid_indices:
+    for idx in valid:
 
-        row = df.loc[idx]
+        original = df.loc[idx]
 
-        coords = customer_coords[idx]
+        row = original.to_dict()
 
-        row_dict = row.to_dict()
+        lat, lon = coords_by_index[idx]
 
-        row_dict["geo_query"] = (
+        row["geo_query"] = (
             build_geo_query(
-                row,
+                original,
                 DEPOT_POSTCODE
             )
         )
 
-        row_dict["latitude"] = (
-            coords[0]
-        )
+        row["latitude"] = lat
+        row["longitude"] = lon
 
-        row_dict["longitude"] = (
-            coords[1]
-        )
-
-        routing_rows.append(
-            row_dict
+        rows.append(
+            row
         )
 
         locations.append(
             [
-                coords[1],
-                coords[0]
+                lon,
+                lat
             ]
         )
 
     routing_df = pd.DataFrame(
-        routing_rows
+        rows
     )
 
     # --------------------------------------------------------
@@ -1572,7 +1695,7 @@ if st.button(
     # --------------------------------------------------------
 
     with st.spinner(
-        "🛣️ Calculating actual driving times..."
+        "🛣️ Getting actual road distances and driving times..."
     ):
 
         distances, durations = (
@@ -1581,18 +1704,18 @@ if st.button(
             )
         )
 
-    offline = False
+    using_offline = False
 
     if (
         distances is None
         or durations is None
     ):
 
-        offline = True
+        using_offline = True
 
         st.warning(
-            "OpenRouteService was unavailable. "
-            "Using an offline road-distance estimate."
+            "OpenRouteService could not provide the "
+            "road matrix. Using an offline estimate."
         )
 
         distances, durations = (
@@ -1606,64 +1729,36 @@ if st.button(
     # --------------------------------------------------------
 
     with st.spinner(
-        "🧠 Finding the smartest route..."
+        "🧠 Optimising the complete 30–40 stop route..."
     ):
 
-        (
-            route,
-            first_customer
-        ) = optimise_complete_route(
-            distances,
-            durations,
-            FUEL_PRICE,
-            MPG,
-            TIME_VALUE
+        route, first_customer = (
+            optimise_route(
+                distances,
+                durations,
+                FUEL_PRICE,
+                MPG
+            )
         )
 
     # --------------------------------------------------------
-    # TOTALS
+    # FINAL METRICS
     # --------------------------------------------------------
 
-    (
-        operating_cost,
-        total_meters,
-        total_seconds
-    ) = route_total(
+    metrics = route_metrics(
         route,
         distances,
         durations,
         FUEL_PRICE,
-        MPG,
-        TIME_VALUE
-    )
-
-    total_km = (
-        total_meters / 1000
-    )
-
-    total_miles = (
-        total_km * 0.621371
-    )
-
-    fuel_litres = (
-        total_miles
-        / MPG
-        * 4.54609
-    )
-
-    fuel_cost = (
-        fuel_litres
-        * FUEL_PRICE
-    )
-
-    driving_time_value = (
-        total_seconds
-        / 3600
-        * TIME_VALUE
+        MPG
     )
 
     revenue = float(
         routing_df["Price"].sum()
+    )
+
+    fuel_cost = (
+        metrics["fuel_cost"]
     )
 
     pre_tax_profit = (
@@ -1671,7 +1766,7 @@ if st.button(
         - fuel_cost
     )
 
-    take_home_profit = (
+    take_home = (
         pre_tax_profit
         * (1 - TAX_RATE)
     )
@@ -1683,8 +1778,8 @@ if st.button(
     final_df = (
         routing_df
         .iloc[route]
-        .copy()
         .reset_index(drop=True)
+        .copy()
     )
 
     final_df.loc[
@@ -1701,10 +1796,6 @@ if st.button(
         final_df
     )
 
-    # --------------------------------------------------------
-    # SAVE ECONOMICS
-    # --------------------------------------------------------
-
     st.session_state.route_data = {
 
         "revenue":
@@ -1713,32 +1804,20 @@ if st.button(
         "fuel_cost":
             fuel_cost,
 
-        "fuel_litres":
-            fuel_litres,
+        "take_home":
+            take_home,
 
-        "driving_time_value":
-            driving_time_value,
+        "miles":
+            metrics["miles"],
 
-        "operating_cost":
-            operating_cost,
+        "litres":
+            metrics["litres"],
 
-        "take_home_profit":
-            take_home_profit,
-
-        "total_miles":
-            total_miles,
-
-        "total_km":
-            total_km,
-
-        "total_seconds":
-            total_seconds,
-
-        "first_customer":
-            int(first_customer),
+        "time":
+            metrics["time_s"],
 
         "offline":
-            offline
+            using_offline
     }
 
     st.rerun()
@@ -1750,7 +1829,9 @@ if st.button(
 
 if "route_data" in st.session_state:
 
-    data = st.session_state.route_data
+    data = (
+        st.session_state.route_data
+    )
 
     st.markdown("---")
 
@@ -1763,14 +1844,14 @@ if "route_data" in st.session_state:
     with c1:
 
         st.metric(
-            "Take-Home Profit",
-            f"£{data['take_home_profit']:.2f}"
+            "Take-Home",
+            f"£{data['take_home']:.2f}"
         )
 
     with c2:
 
         st.metric(
-            "Customer Revenue",
+            "Revenue",
             f"£{data['revenue']:.2f}"
         )
 
@@ -1779,8 +1860,8 @@ if "route_data" in st.session_state:
     with c3:
 
         st.metric(
-            "Total Driving",
-            f"{data['total_miles']:.1f} miles"
+            "Driving Distance",
+            f"{data['miles']:.1f} miles"
         )
 
     with c4:
@@ -1788,7 +1869,7 @@ if "route_data" in st.session_state:
         st.metric(
             "Driving Time",
             format_duration(
-                data["total_seconds"]
+                data["time"]
             )
         )
 
@@ -1805,88 +1886,56 @@ if "route_data" in st.session_state:
 
         st.metric(
             "Fuel Used",
-            f"{data['fuel_litres']:.1f} L"
+            f"{data['litres']:.1f} litres"
         )
 
-    st.success(
-        "🚗 First stop is locked to the closest "
-        "customer to the Grantham depot."
-    )
+    if data["offline"]:
 
-    with st.expander(
-        "🧠 How this route was calculated"
-    ):
-
-        st.write(
-            """
-            **Rule 1 — Start at the depot**
-
-            The route starts from your actual depot.
-
-            **Rule 2 — Find the nearest customer**
-
-            Every customer is compared with the depot.
-            The first stop is the customer with the shortest
-            actual driving time from the depot.
-
-            **Rule 3 — Optimise the rest**
-
-            Once that first stop is locked, the program
-            optimises the remaining customers.
-
-            **Rule 4 — Avoid unnecessary backtracking**
-
-            The optimiser considers the entire remaining
-            journey rather than simply picking the nearest
-            postcode at every step.
-
-            **Rule 5 — Return to Grantham**
-
-            The route is always completed back at the depot.
-            """
+        st.warning(
+            "This route used estimated distances because "
+            "the live road-routing matrix was unavailable."
         )
 
-        if data["offline"]:
+    else:
 
-            st.warning(
-                "The OpenRouteService road matrix was unavailable, "
-                "so an estimated route was used."
-            )
+        st.success(
+            "✅ Route calculated using actual driving "
+            "distance and time."
+        )
 
 
 # ============================================================
-# FAILED JOBS
+# FAILED ADDRESSES
 # ============================================================
 
 if (
-    "unrouted_df" in st.session_state
-    and not st.session_state.unrouted_df.empty
+    "failed_jobs" in st.session_state
+    and not st.session_state.failed_jobs.empty
 ):
 
     st.markdown("---")
 
     st.error(
-        f"{len(st.session_state.unrouted_df)} "
-        "job(s) could not be located."
+        f"{len(st.session_state.failed_jobs)} "
+        "customer(s) could not be located."
     )
 
     st.caption(
-        "These jobs were NOT placed at the depot. "
-        "Please check their addresses/postcodes."
+        "These jobs were NOT included in the route."
     )
 
     with st.expander(
-        "View unlocated jobs"
+        "View unlocated customers"
     ):
 
         st.dataframe(
-            st.session_state.unrouted_df,
+            st.session_state.failed_jobs,
             use_container_width=True
         )
 
 
 # ============================================================
-# SIDEBAR NAVIGATION
+# SIDEBAR NEXT STOP
 # ============================================================
 
 if (
@@ -1896,7 +1945,7 @@ if (
 
     st.sidebar.markdown("---")
 
-    st.sidebar.title(
+    st.sidebar.subheader(
         "🧭 Route Navigation"
     )
 
@@ -1904,23 +1953,23 @@ if (
         st.session_state.master_df
     )
 
-    customer_df = route_df[
+    customers = route_df[
         route_df["Status"]
         .astype(str)
         .str.lower()
         != "depot"
     ]
 
-    pending_df = customer_df[
-        customer_df["Status"]
+    pending = customers[
+        customers["Status"]
         .astype(str)
         .str.lower()
         == "pending"
     ]
 
-    if not pending_df.empty:
+    if not pending.empty:
 
-        next_row = pending_df.iloc[0]
+        next_row = pending.iloc[0]
 
         destination = (
             get_destination(
@@ -1941,18 +1990,18 @@ if (
         )
 
         st.sidebar.caption(
-            f"{len(pending_df)} stops remaining"
+            f"{len(pending)} stops remaining"
         )
 
     else:
 
         st.sidebar.success(
-            "✅ All customer stops completed!"
+            "🎉 All customer stops completed!"
         )
 
 
 # ============================================================
-# ROUTE DISPLAY
+# ROUTE LIST
 # ============================================================
 
 st.markdown("---")
@@ -1969,7 +2018,7 @@ route_df = (
 for idx, row in route_df.iterrows():
 
     # --------------------------------------------------------
-    # DEPOT
+    # START DEPOT
     # --------------------------------------------------------
 
     if idx == 0:
@@ -1989,7 +2038,7 @@ for idx, row in route_df.iterrows():
         continue
 
     # --------------------------------------------------------
-    # RETURN
+    # RETURN DEPOT
     # --------------------------------------------------------
 
     if idx == len(route_df) - 1:
@@ -2058,19 +2107,19 @@ for idx, row in route_df.iterrows():
 
     if status == "completed":
 
-        status_icon = "✅"
-        status_text = "Completed"
+        icon = "✅"
+        text = "Completed"
 
     else:
 
-        status_icon = "⏳"
-        status_text = "Pending"
+        icon = "⏳"
+        text = "Pending"
 
     # --------------------------------------------------------
-    # EXTRA DATA
+    # EXTRA COLUMNS
     # --------------------------------------------------------
 
-    extra_info = []
+    extra = []
 
     for column in route_df.columns:
 
@@ -2092,43 +2141,31 @@ for idx, row in route_df.iterrows():
 
         if value:
 
-            extra_info.append(
+            extra.append(
                 f"**{column}:** {value}"
             )
-
-    # --------------------------------------------------------
-    # CARD
-    # --------------------------------------------------------
 
     with st.container(
         border=True
     ):
 
         st.write(
-            f"### {status_icon} STOP {idx} — {postcode}"
+            f"### {icon} STOP {idx} — {postcode}"
         )
 
-        if extra_info:
+        if extra:
 
             st.write(
-                " | ".join(
-                    extra_info
-                )
+                " | ".join(extra)
             )
 
         st.write(
             f"**Price:** £{price:.2f}"
-            f" | "
-            f"**Status:** {status_text}"
-            f" | "
-            f"**Payment:** {payment}"
+            f" | **Status:** {text}"
+            f" | **Payment:** {payment}"
         )
 
         col1, col2 = st.columns(2)
-
-        # ----------------------------------------------------
-        # COMPLETE
-        # ----------------------------------------------------
 
         with col1:
 
@@ -2165,7 +2202,7 @@ for idx, row in route_df.iterrows():
                         "Thank you!"
                     )
 
-                    whatsapp_url = (
+                    whatsapp = (
                         "https://wa.me/"
                         f"{quote(phone)}"
                         "?text="
@@ -2174,13 +2211,9 @@ for idx, row in route_df.iterrows():
 
                     st.link_button(
                         "💬 Send WhatsApp",
-                        whatsapp_url,
+                        whatsapp,
                         use_container_width=True
                     )
-
-        # ----------------------------------------------------
-        # NAVIGATION
-        # ----------------------------------------------------
 
         with col2:
 
@@ -2192,10 +2225,6 @@ for idx, row in route_df.iterrows():
                 key=f"nav_{idx}",
                 use_container_width=True
             )
-
-        # ----------------------------------------------------
-        # PAYMENT
-        # ----------------------------------------------------
 
         pay1, pay2 = st.columns(2)
 
@@ -2231,12 +2260,12 @@ for idx, row in route_df.iterrows():
 
 
 # ============================================================
-# EXCEL EXPORT
+# EXPORT
 # ============================================================
 
 st.sidebar.markdown("---")
 
-st.sidebar.title(
+st.sidebar.subheader(
     "📊 Export Records"
 )
 
@@ -2249,17 +2278,13 @@ if (
         st.session_state.master_df.copy()
     )
 
-    # Remove depot rows.
-    if "Status" in export_df.columns:
+    export_df = export_df[
+        export_df["Status"]
+        .astype(str)
+        .str.lower()
+        != "depot"
+    ].copy()
 
-        export_df = export_df[
-            export_df["Status"]
-            .astype(str)
-            .str.lower()
-            != "depot"
-        ].copy()
-
-    # Remove technical columns.
     for column in [
         "latitude",
         "longitude",
@@ -2311,12 +2336,11 @@ if (
             horizontal="center"
         )
 
-    # Auto-size columns.
     for column_cells in worksheet.columns:
 
         max_length = 0
 
-        column_letter = (
+        letter = (
             column_cells[0]
             .column_letter
         )
@@ -2338,7 +2362,7 @@ if (
                 pass
 
         worksheet.column_dimensions[
-            column_letter
+            letter
         ].width = min(
             max_length + 2,
             50
@@ -2349,7 +2373,7 @@ if (
     )
 
     st.sidebar.download_button(
-        "⬇️ Download Professional Report",
+        "⬇️ Download Excel Report",
         output.getvalue(),
         "DanCleanUK_Records.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
