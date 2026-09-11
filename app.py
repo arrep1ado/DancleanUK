@@ -44,7 +44,7 @@ if 'master_df' in st.session_state and not st.session_state.master_df.empty:
     export_df = st.session_state.master_df.copy()
     if 'Status' in export_df.columns:
         export_df = export_df[export_df['Status'] != 'depot'].copy()
-    for col in ['latitude', 'longitude', 'Status']:
+    for col in ['latitude', 'longitude', 'Status', 'geo_query']:
         if col in export_df.columns:
             export_df = export_df.drop(columns=[col])
             
@@ -84,12 +84,31 @@ if uploaded_file and 'master_df' not in st.session_state:
     except Exception as e:
         st.error(f"Error loading file: {e}")
 
-# --- FOOLPROOF MULTI-SOURCE GEOCODER (POSTCODES.IO ACTIVE + TERMINATED + NOMINATIM) ---
-def get_coords(postcode):
-    cleaned_pc = postcode.upper().strip()
-    pc_no_space = cleaned_pc.replace(" ", "")
-    
-    # 1. Try postcodes.io (Active postcodes)
+# --- FOOLPROOF MULTI-SOURCE GEOCODER (HANDLES DUPLICATE POSTCODES VIA FULL ADDRESS) ---
+def get_coords(query_string, postcode_fallback):
+    # Clean up query string to search accurately via Nominatim first if street info is provided
+    query = str(query_string).strip()
+    if not query or query.lower() == 'nan':
+        query = f"{postcode_fallback}, United Kingdom"
+    else:
+        if "uk" not in query.lower() and "united kingdom" not in query.lower():
+            query = f"{query}, United Kingdom"
+
+    # 1. Try OpenStreetMap Nominatim API with full address (Handles duplicate postcodes with different street names brilliantly)
+    url_nom = "https://nominatim.openstreetmap.org/search"
+    headers = {'User-Agent': 'DanCleanUKOptimizer/1.0'}
+    params = {'q': query, 'format': 'json', 'limit': 1}
+    try:
+        res = requests.get(url_nom, params=params, headers=headers, timeout=5)
+        if res.status_code == 200:
+            results = res.json()
+            if results:
+                return float(results[0]['lat']), float(results[0]['lon'])
+    except Exception:
+        pass
+
+    # 2. Fallback to Postcodes.io using just the postcode if Nominatim fails
+    pc_no_space = postcode_fallback.upper().replace(" ", "")
     try:
         res = requests.get(f"https://api.postcodes.io/postcodes/{pc_no_space}", timeout=4)
         if res.status_code == 200:
@@ -100,33 +119,8 @@ def get_coords(postcode):
     except Exception:
         pass
 
-    # 2. Try postcodes.io (Terminated/historical postcodes)
-    try:
-        res = requests.get(f"https://api.postcodes.io/terminated_postcodes/{pc_no_space}", timeout=4)
-        if res.status_code == 200:
-            data = res.json().get("result", {})
-            lat, lon = data.get("latitude"), data.get("longitude")
-            if lat is not None and lon is not None:
-                return lat, lon
-    except Exception:
-        pass
+    return None, f"Location not found or invalid ({query_string})."
 
-    # 3. Fallback to OpenStreetMap Nominatim API
-    url_nom = "https://nominatim.openstreetmap.org/search"
-    headers = {'User-Agent': 'DanCleanUKOptimizer/1.0'}
-    params = {'q': f"{cleaned_pc}, United Kingdom", 'format': 'json', 'limit': 1}
-    try:
-        res = requests.get(url_nom, params=params, headers=headers, timeout=5)
-        if res.status_code == 200:
-            results = res.json()
-            if results:
-                return float(results[0]['lat']), float(results[0]['lon'])
-    except Exception:
-        pass
-
-    return None, f"Postcode not found or invalid ({postcode})."
-
-# --- HELPER TO CLEAN VALUES (e.g. remove trailing .0 from Excel numbers) ---
 def clean_val(val):
     if pd.isna(val):
         return ""
@@ -138,13 +132,11 @@ def clean_val(val):
             pass
     return s
 
-# --- HAVERSINE DISTANCE CALCULATOR (LOCAL FALLBACK FOR API QUOTA LIMITS) ---
 def calculate_haversine_matrix(locations):
-    # locations is a list of [lon, lat]
     n = len(locations)
     matrix = [[0.0 * n for _ in range(n)] for _ in range(n)]
-    R = 6371.0 # Earth radius in km
-    ROAD_FACTOR = 1.3 # Standard multiplier to convert straight-line to estimated road driving distance in UK
+    R = 6371.0 
+    ROAD_FACTOR = 1.3 
     
     for i in range(n):
         lon1, lat1 = locations[i]
@@ -157,16 +149,32 @@ def calculate_haversine_matrix(locations):
                 dlon = math.radians(lon2 - lon1)
                 a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
                 c = 2 * math.asin(math.sqrt(a))
-                # Distance in meters, multiplied by road factor
                 matrix[i][j] = R * c * 1000 * ROAD_FACTOR
     return matrix
+
+# --- HELPER TO BUILD FULL GEO QUERY ---
+def build_geo_query(row_data, default_postcode):
+    parts = []
+    for col_name in row_data.index:
+        if col_name.lower() in ['address', 'street', 'location', 'name', 'house']:
+            val = clean_val(row_data[col_name])
+            if val != '':
+                parts.append(val)
+    pc = str(row_data.get('Postcode', default_postcode))
+    parts.append(pc)
+    return ", ".join(parts)
 
 # --- ROUTING & OPTIMIZATION ---
 if 'master_df' in st.session_state:
     if st.button("Optimize Route"):
+        # Build list of queries for Depot + all rows
+        depot_query = DEPOT_FULL_ADDRESS
+        row_queries = [build_geo_query(row, DEPOT_POSTCODE) for _, row in st.session_state.master_df.iterrows()]
+        all_queries = [depot_query] + row_queries
+        
         all_postcodes = [DEPOT_POSTCODE.upper().strip()] + st.session_state.master_df['Postcode'].tolist()
         
-        extra_cols = [col for col in st.session_state.master_df.columns if col not in ['Postcode', 'Price', 'Phone', 'Status', 'Payment', 'latitude', 'longitude']]
+        extra_cols = [col for col in st.session_state.master_df.columns if col not in ['Postcode', 'Price', 'Phone', 'Status', 'Payment', 'latitude', 'longitude', 'geo_query']]
         
         routing_data = []
         error_occurred = False
@@ -178,18 +186,20 @@ if 'master_df' in st.session_state:
         for col in extra_cols:
             extra_data_lists[col] = [''] + st.session_state.master_df[col].tolist()
 
-        with st.spinner("Geocoding UK postcodes..."):
-            for i, pc in enumerate(all_postcodes):
-                lat, lon_or_err = get_coords(pc)
+        with st.spinner("Geocoding addresses & postcodes..."):
+            for i, q in enumerate(all_queries):
+                pc_fallback = all_postcodes[i]
+                lat, lon_or_err = get_coords(q, pc_fallback)
                 if lat is None:
-                    st.error(f"Could not find coordinates for postcode '{pc}'. Reason: {lon_or_err}")
+                    st.error(f"Could not find coordinates for stop '{q}'. Reason: {lon_or_err}")
                     error_occurred = True
                     break
                 
                 row_dict = {
-                    'Postcode': pc,
+                    'Postcode': pc_fallback,
                     'Price': prices[i],
                     'Phone': phones[i],
+                    'geo_query': q,
                     'latitude': lat,
                     'longitude': lon_or_err
                 }
@@ -205,7 +215,6 @@ if 'master_df' in st.session_state:
             
             dist_matrix = None
             with st.spinner("Calculating optimal route matrix..."):
-                # Try OpenRouteService First
                 try:
                     body = {"locations": locations, "metrics": ["distance"], "units": "km"}
                     response = requests.post('https://api.openrouteservice.org/v2/matrix/driving-car', json=body, headers={'Authorization': API_KEY, 'Content-Type': 'application/json'}, timeout=10)
@@ -213,11 +222,10 @@ if 'master_df' in st.session_state:
                     if response.status_code == 200:
                         dist_matrix = response.json()['distances']
                     else:
-                        st.warning(f"Routing API limit reached ({response.status_code}). Switching to offline smart routing fallback...")
+                        st.warning("Routing API limit reached. Using offline smart routing fallback...")
                 except Exception:
                     pass
                 
-                # Fallback to local Haversine matrix if API failed or exceeded quota
                 if dist_matrix is None:
                     dist_matrix = calculate_haversine_matrix(locations)
             
@@ -264,10 +272,11 @@ if 'master_df' in st.session_state:
         st.write(f"### Planned Daily Take-Home Profit: £{st.session_state.route_data.get('locked_profit', 0):.2f}")
         st.write(f"### Estimated Total Distance: {st.session_state.route_data.get('initial_miles', 0):.2f} miles")
     
-    # --- HELPER FUNCTION TO BUILD CLEAN MAP URL ---
     def get_map_destination_string(row_data, is_depot=False):
         if is_depot:
             return DEPOT_FULL_ADDRESS
+        if 'geo_query' in row_data and pd.notna(row_data['geo_query']) and str(row_data['geo_query']).strip() != '':
+            return str(row_data['geo_query'])
         
         parts = []
         for col_name in st.session_state.master_df.columns:
@@ -278,25 +287,28 @@ if 'master_df' in st.session_state:
         parts.append(str(row_data['Postcode']))
         return ", ".join(parts)
 
-    # --- OPTIMIZED SIDEBAR NAVIGATION (NEXT STOP EXCLUDING DEPOT) ---
-    st.sidebar.markdown("---")
-    st.sidebar.title("Route Navigation")
-    
-    pending_df = st.session_state.master_df[
-        (st.session_state.master_df['Status'].str.lower() == 'pending') & 
-        (st.session_state.master_df['Status'].str.lower() != 'depot')
-    ]
-    
-    if not pending_df.empty:
-        next_row = pending_df.iloc[0]
-        next_dest = get_map_destination_string(next_row, is_depot=False)
-        gmaps_url = f"https://www.google.com/maps/dir/?api=1&destination={next_dest}&travelmode=driving"
-        st.sidebar.link_button("🚗 Navigate to Next Stop", gmaps_url)
-        st.sidebar.caption(f"Next in sequence: {next_dest} ({len(pending_df)} stops remaining)")
-    else:
-        st.sidebar.success("All customer stops completed for today!")
+    # --- OPTIMIZED SIDEBAR NAVIGATION ---
+    if 'route_data' in st.session_state:
+        st.sidebar.markdown("---")
+        st.sidebar.title("Route Navigation")
+        
+        max_idx = len(st.session_state.master_df) - 1
+        pending_df = st.session_state.master_df.loc[
+            (st.session_state.master_df['Status'].str.lower() == 'pending') & 
+            (st.session_state.master_df.index > 0) & 
+            (st.session_state.master_df.index < max_idx)
+        ]
+        
+        if not pending_df.empty:
+            next_row = pending_df.iloc[0]
+            next_dest = get_map_destination_string(next_row, is_depot=False)
+            gmaps_url = f"https://www.google.com/maps/dir/?api=1&destination={next_dest}&travelmode=driving"
+            st.sidebar.link_button("🚗 Navigate to Next Stop", gmaps_url)
+            st.sidebar.caption(f"Next in sequence: {next_dest} ({len(pending_df)} stops remaining)")
+        else:
+            st.sidebar.success("All customer stops completed for today!")
 
-    # --- MAIN DISPLAY & ADDRESS CARDS WITH EMBEDDED NAVIGATION ---
+    # --- MAIN DISPLAY & ADDRESS CARDS ---
     for idx, row in st.session_state.master_df.iterrows():
         postcode = str(row['Postcode'])
         status = str(row['Status'])
@@ -304,10 +316,9 @@ if 'master_df' in st.session_state:
         phone = row.get('Phone', '')
         payment = str(row.get('Payment', 'waiting'))
         
-        # Build extra info text for display cards (excluding dates/times)
         extra_info_parts = []
         for col_name in st.session_state.master_df.columns:
-            if col_name.lower() in ['postcode', 'price', 'phone', 'status', 'payment', 'latitude', 'longitude']:
+            if col_name.lower() in ['postcode', 'price', 'phone', 'status', 'payment', 'latitude', 'longitude', 'geo_query']:
                 continue
             if 'date' in col_name.lower() or 'time' in col_name.lower():
                 continue  
@@ -370,3 +381,4 @@ if 'master_df' in st.session_state:
                     st.link_button("🚗 Navigate Here", map_url, key=f"nav_{idx}")
 else:
     st.info("Upload your day's file to begin.")
+                           
