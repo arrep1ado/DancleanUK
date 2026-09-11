@@ -75,11 +75,24 @@ if uploaded_file and 'master_df' not in st.session_state:
     try:
         df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('.xlsx') else pd.read_csv(uploaded_file)
         df.columns = df.columns.str.strip()
-        df = df.dropna(subset=['Postcode', 'Price', 'Phone'])
+        
+        # Strict cleaning to eliminate ghost/blank rows and empty postcodes/values
+        df = df.dropna(subset=['Postcode'])
         df['Postcode'] = df['Postcode'].astype(str).str.upper().str.strip()
+        df = df[(df['Postcode'] != '') & (df['Postcode'] != 'NAN') & (df['Postcode'].dropna())]
+        
+        # Ensure Price is numeric and valid (drops rows with missing or blank prices)
+        df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
+        df = df.dropna(subset=['Price'])
+        df = df[df['Price'] > 0]
+        
+        # Ensure Phone exists and is valid
+        df['Phone'] = df['Phone'].astype(str).str.strip()
+        df = df[(df['Phone'] != '') & (df['Phone'].lower() != 'nan')]
+        
         df['Status'] = 'pending'
         df['Payment'] = 'waiting'
-        st.session_state.master_df = df
+        st.session_state.master_df = df.reset_index(drop=True)
         st.rerun()
     except Exception as e:
         st.error(f"Error loading file: {e}")
