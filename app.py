@@ -31,6 +31,7 @@ if st.sidebar.button("Start New Day / Reset"):
 # --- SIDEBAR SETTINGS ---
 st.sidebar.title("Settings")
 DEPOT_POSTCODE = st.sidebar.text_input("Depot Postcode (Grantham)", value="NG31 9RA")
+DEPOT_FULL_ADDRESS = "192 Queensway, Grantham NG31 9RA"
 FUEL_PRICE = st.sidebar.number_input("Fuel Price (£/liter)", value=1.50, step=0.01)
 MPG = st.sidebar.number_input("Vehicle MPG", value=30.0, step=0.1)
 TAX_RATE = st.sidebar.slider("Tax Deduction (%)", 0, 50, 20) / 100
@@ -229,19 +230,14 @@ if 'master_df' in st.session_state:
         st.write(f"### Planned Daily Take-Home Profit: £{st.session_state.route_data.get('locked_profit', 0):.2f}")
         st.write(f"### Estimated Total Distance: {st.session_state.route_data.get('initial_miles', 0):.2f} miles")
     
-    # --- HELPER FUNCTION TO BUILD MAP URL CLEANLY FOR GOOGLE MAPS ---
-    def get_map_destination_string(row_data):
+    # --- HELPER FUNCTION TO BUILD CLEAN MAP URL ---
+    def get_map_destination_string(row_data, is_depot=False):
+        if is_depot:
+            return DEPOT_FULL_ADDRESS
+        
         parts = []
         for col_name in st.session_state.master_df.columns:
-            if col_name.lower() in ['door', 'door no', 'door number', 'unit']:
-                val = clean_val(row_data.get(col_name))
-                if val != '':
-                    # Prevent Google Maps confusion by prefixing raw numbers with 'Unit'
-                    if val.isdigit():
-                        parts.append(f"Unit {val}")
-                    else:
-                        parts.append(val)
-            elif col_name.lower() in ['address', 'street', 'name']:
+            if col_name.lower() in ['address', 'street', 'location', 'name']:
                 val = clean_val(row_data.get(col_name))
                 if val != '':
                     parts.append(val)
@@ -259,7 +255,7 @@ if 'master_df' in st.session_state:
     
     if not pending_df.empty:
         next_row = pending_df.iloc[0]
-        next_dest = get_map_destination_string(next_row)
+        next_dest = get_map_destination_string(next_row, is_depot=False)
         gmaps_url = f"https://www.google.com/maps/dir/?api=1&destination={next_dest}&travelmode=driving"
         st.sidebar.link_button("🚗 Navigate to Next Stop", gmaps_url)
         st.sidebar.caption(f"Next in sequence: {next_dest} ({len(pending_df)} stops remaining)")
@@ -280,7 +276,7 @@ if 'master_df' in st.session_state:
             if col_name.lower() in ['postcode', 'price', 'phone', 'status', 'payment', 'latitude', 'longitude']:
                 continue
             if 'date' in col_name.lower() or 'time' in col_name.lower():
-                continue  # Skip displaying date and time columns
+                continue  
             
             val = clean_val(row.get(col_name))
             if val != '':
@@ -293,15 +289,16 @@ if 'master_df' in st.session_state:
         is_start_depot = (idx == 0)
         is_return_depot = (idx == len(st.session_state.master_df) - 1)
         
-        dest_string = get_map_destination_string(row)
+        is_depot_row = is_start_depot or is_return_depot
+        dest_string = get_map_destination_string(row, is_depot=is_depot_row)
         map_url = f"https://www.google.com/maps/dir/?api=1&destination={dest_string}&travelmode=driving"
 
         if is_start_depot:
             with st.container(border=True):
-                st.write(f"**📍 Start Depot (Grantham)** ({postcode})")
+                st.write(f"**📍 Start Depot:** {DEPOT_FULL_ADDRESS}")
         elif is_return_depot:
             with st.container(border=True):
-                st.write(f"**🏁 Return to Depot (Grantham)** ({postcode})")
+                st.write(f"**🏁 Return to Depot:** {DEPOT_FULL_ADDRESS}")
                 st.link_button("🚗 Navigate Here", map_url, key=f"nav_{idx}")
         else:
             status_icon = "✅" if status.lower() == 'completed' else "⏳"
