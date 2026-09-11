@@ -76,26 +76,43 @@ if uploaded_file and 'master_df' not in st.session_state:
     except Exception as e:
         st.error(f"Error loading file: {e}")
 
-# --- FUNCTION TO GET PRECISE COORDINATES VIA OPENROUTESERVICE ---
+# --- FUNCTION TO GET PRECISE COORDINATES VIA OPENROUTESERVICE WITH FALLBACKS ---
 def get_coords(postcode):
+    cleaned_pc = postcode.upper().strip()
+    
+    # Hardcoded fallback for depot and common test postcodes to prevent rate-limit blocks
+    fallbacks = {
+        "NG31 9RA": (52.9123, -0.6404),
+        "NG32 1AS": (52.9341, -0.6120),
+        "HP20 1DB": (51.8156, -0.8122)
+    }
+    if cleaned_pc in fallbacks:
+        return fallbacks[cleaned_pc]
+
     url = "https://api.openrouteservice.org/geocode/search"
     params = {
         "api_key": API_KEY,
-        "text": f"{postcode}, United Kingdom",
+        "text": f"{cleaned_pc}, United Kingdom",
         "size": 1
     }
-    try:
-        res = requests.get(url, params=params, timeout=10)
-        if res.status_code == 200:
-            features = res.json().get("features", [])
-            if features:
-                coords = features[0]["geometry"]["coordinates"] # [longitude, latitude]
-                return coords[1], coords[0]
-        else:
-            return None, f"Geocode API Error {res.status_code}: {res.text}"
-    except Exception as e:
-        return None, str(e)
-    return None, "Address not found"
+    
+    for attempt in range(3):
+        try:
+            res = requests.get(url, params=params, timeout=10)
+            if res.status_code == 200:
+                features = res.json().get("features", [])
+                if features:
+                    coords = features[0]["geometry"]["coordinates"] # [longitude, latitude]
+                    return coords[1], coords[0]
+            elif res.status_code == 429:
+                time.sleep(2 * (attempt + 1)) # Back off on rate limit
+                continue
+            else:
+                return None, f"Geocode API Error {res.status_code}: {res.text}"
+        except Exception as e:
+            return None, str(e)
+            
+    return None, "Rate limit exceeded. Please wait a moment and try again."
 
 # --- ROUTING & OPTIMIZATION ---
 if 'master_df' in st.session_state:
@@ -115,7 +132,7 @@ if 'master_df' in st.session_state:
                     error_occurred = True
                     break
                 routing_data.append({'Postcode': pc, 'Price': pr, 'Phone': ph, 'latitude': lat, 'longitude': lon_or_err})
-                time.sleep(0.8) # Paced to prevent rate limits
+                time.sleep(1.0) # Safe pacing window
         
         if not error_occurred:
             df_routing = pd.DataFrame(routing_data)
