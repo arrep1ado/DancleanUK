@@ -40,7 +40,6 @@ st.sidebar.markdown("---")
 st.sidebar.title("Export Monthly Records")
 if 'master_df' in st.session_state and not st.session_state.master_df.empty:
     export_df = st.session_state.master_df.copy()
-    # Exclude depot rows and lat/long from professional report
     if 'Status' in export_df.columns:
         export_df = export_df[export_df['Status'] != 'depot'].copy()
     for col in ['latitude', 'longitude', 'Status']:
@@ -224,12 +223,13 @@ if 'master_df' in st.session_state:
         
         is_start_depot = (idx == 0)
         is_return_depot = (idx == len(st.session_state.master_df) - 1)
-        is_depot = is_start_depot or is_return_depot
         
-        if is_depot:
-            card_label = "📍 Start Depot (Grantham)" if is_start_depot else "🏁 Return to Depot (Grantham)"
+        if is_start_depot:
             with st.container(border=True):
-                st.write(f"**{card_label}** ({postcode})")
+                st.write(f"**📍 Start Depot (Grantham)** ({postcode})")
+        elif is_return_depot:
+            with st.container(border=True):
+                st.write(f"**🏁 Return to Depot (Grantham)** ({postcode})")
                 map_url = f"https://www.google.com/maps/dir/?api=1&destination={postcode}&travelmode=driving"
                 st.link_button("🚗 Navigate Here", map_url, key=f"nav_{idx}")
         else:
