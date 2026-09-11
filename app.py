@@ -40,6 +40,10 @@ st.sidebar.markdown("---")
 st.sidebar.title("Export Monthly Records")
 if 'master_df' in st.session_state and not st.session_state.master_df.empty:
     export_df = st.session_state.master_df.copy()
+    for col in ['latitude', 'longitude']:
+        if col in export_df.columns:
+            export_df = export_df.drop(columns=[col])
+            
     output = io.BytesIO()
     wb = Workbook()
     ws = wb.active
