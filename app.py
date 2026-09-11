@@ -76,36 +76,35 @@ if uploaded_file and 'master_df' not in st.session_state:
         df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('.xlsx') else pd.read_csv(uploaded_file)
         df.columns = df.columns.str.strip()
         
-        # Completely drop blank/empty rows imported from Excel trailing cells
-        df = df.dropna(how='all')
-        
         # Ensure mandatory columns exist
         for col in ['Postcode', 'Price', 'Phone']:
             if col not in df.columns:
                 st.error(f"Missing mandatory column in uploaded file: '{col}'")
                 st.stop()
 
-        # Clean columns and coerce types safely
-        df['Postcode'] = df['Postcode'].fillna('').astype(str).str.upper().str.strip()
-        df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
-        df['Phone'] = df['Phone'].fillna('').astype(str).str.strip()
+        # Clean string columns and convert empty/whitespace cells to true NaN
+        for col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+            df[col] = df[col].replace({
+                '': pd.NA, 'nan': pd.NA, 'NAN': pd.NA, 'NaN': pd.NA, 
+                'None': pd.NA, 'NAT': pd.NA, 'nat': pd.NA, '<NA>': pd.NA
+            })
+
+        # Drop rows where Postcode, Price, or Phone are missing/null
+        df = df.dropna(subset=['Postcode', 'Price', 'Phone']).copy()
         
-        # STRICT FILTER: Drop any row missing Postcode, Price, or Phone, or containing dummy/blank values
-        valid_mask = (
-            (df['Postcode'] != '') & 
-            (df['Postcode'] != 'NAN') & 
-            (df['Postcode'] != 'NAT') & 
-            (df['Price'].notna()) & 
-            (df['Price'] > 0) & 
-            (df['Phone'] != '') & 
-            (df['Phone'].str.lower() != 'nan') & 
-            (df['Phone'].str.lower() != 'nat')
-        )
-        df = df[valid_mask].reset_index(drop=True)
+        # Coerce Price to numeric and drop invalid/zero/negative values
+        df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
+        df = df.dropna(subset=['Price'])
+        df = df[df['Price'] > 0].copy()
+        
+        # Final cleanup pass on Postcode and Phone strings
+        df['Postcode'] = df['Postcode'].str.upper()
+        df['Phone'] = df['Phone'].astype(str).str.replace(r'\.0$', '', regex=True)
         
         df['Status'] = 'pending'
         df['Payment'] = 'waiting'
-        st.session_state.master_df = df
+        st.session_state.master_df = df.reset_index(drop=True)
         st.rerun()
     except Exception as e:
         st.error(f"Error loading file: {e}")
@@ -115,7 +114,7 @@ def get_coords(query_string, postcode_fallback):
     headers = {'User-Agent': 'DanCleanUKOptimizer/1.0'}
     
     query = str(query_string).strip()
-    if query and query.lower() != 'nan':
+    if query and query.lower() not in ['nan', 'none', '']:
         full_q = query if ("uk" in query.lower() or "united kingdom" in query.lower()) else f"{query}, United Kingdom"
         try:
             res = requests.get("https://nominatim.openstreetmap.org/search", params={'q': full_q, 'format': 'json', 'limit': 1}, headers=headers, timeout=4)
@@ -213,7 +212,7 @@ def build_geo_query(row_data):
             if val != '':
                 parts.append(val)
     pc = str(row_data.get('Postcode', '')).strip()
-    if pc and pc.upper() not in ['', 'NAN', 'NAT']:
+    if pc and pc.upper() not in ['', 'NAN', 'NAT', 'NONE']:
         parts.append(pc)
     return ", ".join(parts)
 
@@ -275,7 +274,6 @@ if 'master_df' in st.session_state:
                 dist_matrix = calculate_haversine_matrix(locations)
         
         if dist_matrix is not None:
-            # TRUE NEAREST-NEIGHBOR CHAINING: Always pick the absolute closest next stop from current location
             unvisited = set(range(1, len(locations)))
             current_node = 0  
             route_indices = [0]
@@ -288,7 +286,6 @@ if 'master_df' in st.session_state:
             
             route_indices.append(0)  
             
-            # Polish route using 2-opt
             route_indices = optimize_route_2opt(route_indices, dist_matrix)
             
             total_meters = sum(dist_matrix[route_indices[k]][route_indices[k+1]] for k in range(len(route_indices) - 1))
@@ -379,7 +376,6 @@ if 'master_df' in st.session_state:
                 st.link_button("🚗 Navigate Here", map_url, key=f"nav_{idx}")
             continue
 
-        # Regular Customer Stops Only Below
         extra_info_parts = []
         for col_name in st.session_state.master_df.columns:
             if col_name.lower() in ['postcode', 'price', 'phone', 'status', 'payment', 'latitude', 'longitude', 'geo_query']:
