@@ -229,11 +229,19 @@ if 'master_df' in st.session_state:
         st.write(f"### Planned Daily Take-Home Profit: £{st.session_state.route_data.get('locked_profit', 0):.2f}")
         st.write(f"### Estimated Total Distance: {st.session_state.route_data.get('initial_miles', 0):.2f} miles")
     
-    # --- HELPER FUNCTION TO BUILD MAP URL WITH CLEANED DOOR/ADDRESS ---
+    # --- HELPER FUNCTION TO BUILD MAP URL CLEANLY FOR GOOGLE MAPS ---
     def get_map_destination_string(row_data):
         parts = []
         for col_name in st.session_state.master_df.columns:
-            if col_name.lower() in ['door', 'door no', 'door number', 'address', 'street', 'name']:
+            if col_name.lower() in ['door', 'door no', 'door number', 'unit']:
+                val = clean_val(row_data.get(col_name))
+                if val != '':
+                    # Prevent Google Maps confusion by prefixing raw numbers with 'Unit'
+                    if val.isdigit():
+                        parts.append(f"Unit {val}")
+                    else:
+                        parts.append(val)
+            elif col_name.lower() in ['address', 'street', 'name']:
                 val = clean_val(row_data.get(col_name))
                 if val != '':
                     parts.append(val)
