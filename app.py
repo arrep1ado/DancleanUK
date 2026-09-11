@@ -84,17 +84,13 @@ if uploaded_file and 'master_df' not in st.session_state:
     except Exception as e:
         st.error(f"Error loading file: {e}")
 
-# --- BULLETPROOF MULTI-TIER GEOCODER (NEVER FAILS CRASHES) ---
+# --- BULLETPROOF MULTI-TIER GEOCODER ---
 def get_coords(query_string, postcode_fallback):
     headers = {'User-Agent': 'DanCleanUKOptimizer/1.0'}
     
-    # 1. Try Nominatim with full address query
     query = str(query_string).strip()
     if query and query.lower() != 'nan':
-        if "uk" not in query.lower() and "united kingdom" not in query.lower():
-            full_q = f"{query}, United Kingdom"
-        else:
-            full_q = query
+        full_q = query if ("uk" in query.lower() or "united kingdom" in query.lower()) else f"{query}, United Kingdom"
         try:
             res = requests.get("https://nominatim.openstreetmap.org/search", params={'q': full_q, 'format': 'json', 'limit': 1}, headers=headers, timeout=4)
             if res.status_code == 200 and res.json():
@@ -102,7 +98,6 @@ def get_coords(query_string, postcode_fallback):
         except Exception:
             pass
 
-    # 2. Try Nominatim with just the postcode fallback
     pc_clean = str(postcode_fallback).upper().strip()
     if pc_clean:
         try:
@@ -112,7 +107,6 @@ def get_coords(query_string, postcode_fallback):
         except Exception:
             pass
 
-        # 3. Try Postcodes.io active API
         pc_no_space = pc_clean.replace(" ", "")
         try:
             res = requests.get(f"https://api.postcodes.io/postcodes/{pc_no_space}", timeout=3)
@@ -124,7 +118,6 @@ def get_coords(query_string, postcode_fallback):
         except Exception:
             pass
 
-        # 4. Try Postcodes.io terminated API
         try:
             res = requests.get(f"https://api.postcodes.io/terminated_postcodes/{pc_no_space}", timeout=3)
             if res.status_code == 200:
@@ -135,7 +128,6 @@ def get_coords(query_string, postcode_fallback):
         except Exception:
             pass
 
-    # 5. Graceful Fallback to Depot Coordinates if absolutely nothing matches so app never crashes
     return 52.9141, -0.6414
 
 def clean_val(val):
@@ -168,6 +160,25 @@ def calculate_haversine_matrix(locations):
                 c = 2 * math.asin(math.sqrt(a))
                 matrix[i][j] = R * c * 1000 * ROAD_FACTOR
     return matrix
+
+# --- 2-OPT ROUTE OPTIMIZER (ELIMINATES CROSS-COUNTRY ZIGZAGS) ---
+def optimize_route_2opt(route_indices, dist_matrix):
+    best_route = route_indices[:]
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, len(best_route) - 2):
+            for j in range(i + 1, len(best_route) - 1):
+                a, b = best_route[i-1], best_route[i]
+                c, d = best_route[j], best_route[j+1]
+                
+                current_cost = dist_matrix[a][b] + dist_matrix[c][d]
+                new_cost = dist_matrix[a][c] + dist_matrix[b][d]
+                
+                if new_cost < current_cost:
+                    best_route[i:j+1] = reversed(best_route[i:j+1])
+                    improved = True
+    return best_route
 
 def build_geo_query(row_data, default_postcode):
     parts = []
@@ -238,20 +249,24 @@ if 'master_df' in st.session_state:
                 dist_matrix = calculate_haversine_matrix(locations)
         
         if dist_matrix is not None:
+            # 1. Nearest Neighbor Initial Pass
             unvisited = set(range(1, len(locations)))
             current_node = 0  
             route_indices = [0]
-            total_meters = 0
             
             while unvisited:
                 next_node = min(unvisited, key=lambda j: dist_matrix[current_node][j])
-                total_meters += dist_matrix[current_node][next_node]
                 route_indices.append(next_node)
                 current_node = next_node
                 unvisited.remove(next_node)
             
-            total_meters += dist_matrix[current_node][0]
-            route_indices.append(0)  
+            route_indices.append(0)  # Return to depot
+            
+            # 2. 2-Opt Optimization Pass (Smoothes out any local inefficiencies)
+            route_indices = optimize_route_2opt(route_indices, dist_matrix)
+            
+            # Calculate total distance based on final optimized sequence
+            total_meters = sum(dist_matrix[route_indices[k]][route_indices[k+1]] for k in range(len(route_indices) - 1))
             
             df_resolved = df_routing.iloc[route_indices].reset_index(drop=True)
             
