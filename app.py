@@ -67,7 +67,7 @@ if "API_KEY" not in st.secrets:
     st.stop()
 
 API_KEY = st.secrets["API_KEY"]
-uploaded_file = st.file_uploader("Upload your Day's File (Headers: Postcode, Price, Phone)", type=["csv", "xlsx"])
+uploaded_file = st.file_uploader("Upload your Day's File (Headers: Postcode, Price, Phone, Name/Address)", type=["csv", "xlsx"])
 
 if uploaded_file and 'master_df' not in st.session_state:
     try:
@@ -128,20 +128,40 @@ def get_coords(postcode):
 if 'master_df' in st.session_state:
     if st.button("Optimize Route"):
         all_postcodes = [DEPOT_POSTCODE.upper().strip()] + st.session_state.master_df['Postcode'].tolist()
-        prices = [0.0] + st.session_state.master_df['Price'].tolist()
-        phones = [''] + st.session_state.master_df['Phone'].tolist()
+        
+        # Preserve extra columns dynamically if they exist in the dataframe
+        extra_cols = [col for col in st.session_state.master_df.columns if col not in ['Postcode', 'Price', 'Phone', 'Status', 'Payment', 'latitude', 'longitude']]
         
         routing_data = []
         error_occurred = False
         
+        # Build base lists aligned with all_postcodes (depot gets empty/default values for job-specific fields)
+        prices = [0.0] + st.session_state.master_df['Price'].tolist()
+        phones = [''] + st.session_state.master_df['Phone'].tolist()
+        
+        extra_data_lists = {}
+        for col in extra_cols:
+            extra_data_lists[col] = [''] + st.session_state.master_df[col].tolist()
+
         with st.spinner("Geocoding UK postcodes..."):
-            for pc, pr, ph in zip(all_postcodes, prices, phones):
+            for i, pc in enumerate(all_postcodes):
                 lat, lon_or_err = get_coords(pc)
                 if lat is None:
                     st.error(f"Could not find coordinates for postcode '{pc}'. Reason: {lon_or_err}")
                     error_occurred = True
                     break
-                routing_data.append({'Postcode': pc, 'Price': pr, 'Phone': ph, 'latitude': lat, 'longitude': lon_or_err})
+                
+                row_dict = {
+                    'Postcode': pc,
+                    'Price': prices[i],
+                    'Phone': phones[i],
+                    'latitude': lat,
+                    'longitude': lon_or_err
+                }
+                for col in extra_cols:
+                    row_dict[col] = extra_data_lists[col][i]
+                
+                routing_data.append(row_dict)
                 time.sleep(0.2)
         
         if not error_occurred:
@@ -204,7 +224,6 @@ if 'master_df' in st.session_state:
     st.sidebar.markdown("---")
     st.sidebar.title("Route Navigation")
     
-    # Filter pending stops, but explicitly skip any row where Status is 'depot'
     pending_df = st.session_state.master_df[
         (st.session_state.master_df['Status'].str.lower() == 'pending') & 
         (st.session_state.master_df['Status'].str.lower() != 'depot')
@@ -226,6 +245,18 @@ if 'master_df' in st.session_state:
         phone = row.get('Phone', '')
         payment = str(row.get('Payment', 'waiting'))
         
+        # Dynamically extract any additional info columns like Name, Address, etc. if present
+        extra_info_parts = []
+        for col_name in st.session_state.master_df.columns:
+            if col_name not in ['Postcode', 'Price', 'Phone', 'Status', 'Payment', 'latitude', 'longitude']:
+                val = row.get(col_name)
+                if pd.notna(val) and str(val).strip() != '':
+                    extra_info_parts.append(f"**{col_name}:** {val}")
+        
+        extra_text = " | ".join(extra_info_parts)
+        if extra_text:
+            extra_text = f" | {extra_text}"
+        
         is_start_depot = (idx == 0)
         is_return_depot = (idx == len(st.session_state.master_df) - 1)
         
@@ -243,7 +274,7 @@ if 'master_df' in st.session_state:
             payment_display = f" | **Payment:** {payment}"
             
             with st.container(border=True):
-                st.write(f"**{status_icon} Postcode: {postcode}** | **Price:** £{price} | **Status:** {status_text}{payment_display}")
+                st.write(f"**{status_icon} Postcode: {postcode}**{extra_text} | **Price:** £{price} | **Status:** {status_text}{payment_display}")
                 
                 col1, col2 = st.columns(2)
                 
@@ -256,15 +287,18 @@ if 'master_df' in st.session_state:
                         st.success("Completed")
                         if phone:
                             msg = f"Hi from DanCleanUK! Your service is complete today. Total: £{price}. Please pay via bank transfer to Mettle - Sort Code: 04-03-33 | Account: 72515806. Thank you!"
-                            wa_url = f"https://wa.me/{phone}?text={msg.replace('','%20')}"
+                            wa_url = f"https://wa.me/{phone}?text={msg.replace(' ', '%20')}"
                             st.link_button("Send WhatsApp", wa_url, key=f"wa_{idx}")
                     
-                    if payment.lower() == 'waiting':
+                    c_col1, c_col2 = st.columns(2)
+                    with c_col1:
                         if st.button("💵 Cash Paid", key=f"cash_{idx}"):
                             st.session_state.master_df.at[idx, 'Payment'] = 'Cash'
                             st.rerun()
-                    else:
-                        st.caption(f"Payment Status: {payment}")
+                    with c_col2:
+                        if st.button("❌ Not Paid", key=f"not_paid_{idx}"):
+                            st.session_state.master_df.at[idx, 'Payment'] = 'Not Paid'
+                            st.rerun()
                         
                 with col2:
                     map_url = f"https://www.google.com/maps/dir/?api=1&destination={postcode}&travelmode=driving"
