@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import io
 import time
+import math
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -137,6 +138,29 @@ def clean_val(val):
             pass
     return s
 
+# --- HAVERSINE DISTANCE CALCULATOR (LOCAL FALLBACK FOR API QUOTA LIMITS) ---
+def calculate_haversine_matrix(locations):
+    # locations is a list of [lon, lat]
+    n = len(locations)
+    matrix = [[0.0 * n for _ in range(n)] for _ in range(n)]
+    R = 6371.0 # Earth radius in km
+    ROAD_FACTOR = 1.3 # Standard multiplier to convert straight-line to estimated road driving distance in UK
+    
+    for i in range(n):
+        lon1, lat1 = locations[i]
+        for j in range(n):
+            lon2, lat2 = locations[j]
+            if i == j:
+                matrix[i][j] = 0.0
+            else:
+                dlat = math.radians(lat2 - lat1)
+                dlon = math.radians(lon2 - lon1)
+                a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+                c = 2 * math.asin(math.sqrt(a))
+                # Distance in meters, multiplied by road factor
+                matrix[i][j] = R * c * 1000 * ROAD_FACTOR
+    return matrix
+
 # --- ROUTING & OPTIMIZATION ---
 if 'master_df' in st.session_state:
     if st.button("Optimize Route"):
@@ -179,51 +203,61 @@ if 'master_df' in st.session_state:
             df_routing = pd.DataFrame(routing_data)
             locations = [[float(row['longitude']), float(row['latitude'])] for _, row in df_routing.iterrows()]
             
+            dist_matrix = None
             with st.spinner("Calculating optimal route matrix..."):
-                body = {"locations": locations, "metrics": ["distance"], "units": "km"}
-                response = requests.post('https://api.openrouteservice.org/v2/matrix/driving-car', json=body, headers={'Authorization': API_KEY, 'Content-Type': 'application/json'}, timeout=15)
+                # Try OpenRouteService First
+                try:
+                    body = {"locations": locations, "metrics": ["distance"], "units": "km"}
+                    response = requests.post('https://api.openrouteservice.org/v2/matrix/driving-car', json=body, headers={'Authorization': API_KEY, 'Content-Type': 'application/json'}, timeout=10)
+                    
+                    if response.status_code == 200:
+                        dist_matrix = response.json()['distances']
+                    else:
+                        st.warning(f"Routing API limit reached ({response.status_code}). Switching to offline smart routing fallback...")
+                except Exception:
+                    pass
                 
-                if response.status_code == 200:
-                    dist_matrix = response.json()['distances']
-                    
-                    unvisited = set(range(1, len(locations)))
-                    current_node = 0  
-                    route_indices = [0]
-                    total_meters = 0
-                    
-                    while unvisited:
-                        next_node = min(unvisited, key=lambda j: dist_matrix[current_node][j])
-                        total_meters += dist_matrix[current_node][next_node]
-                        route_indices.append(next_node)
-                        current_node = next_node
-                        unvisited.remove(next_node)
-                    
-                    total_meters += dist_matrix[current_node][0]
-                    route_indices.append(0)  
-                    
-                    df_resolved = df_routing.iloc[route_indices].reset_index(drop=True)
-                    
-                    start_depot = df_resolved.iloc[[0]].copy()
-                    active_jobs = df_resolved[df_resolved.index > 0].iloc[:-1].copy()
-                    return_depot = df_resolved.iloc[[-1]].copy()
-                    
-                    new_master = pd.concat([start_depot, active_jobs, return_depot]).reset_index(drop=True)
-                    new_master['Status'] = 'pending'
-                    new_master['Payment'] = 'waiting'
-                    
-                    new_master.loc[0, 'Status'] = 'depot'
-                    new_master.loc[len(new_master) - 1, 'Status'] = 'depot'
-                    
-                    st.session_state.master_df = new_master
-                    
-                    total_km = total_meters / 1000
-                    total_miles = total_km * 0.621371
-                    total_fuel_cost = ((total_miles / MPG) * 4.54609) * FUEL_PRICE
-                    locked_profit = (st.session_state.master_df['Price'].sum() - total_fuel_cost) * (1 - TAX_RATE)
-                    st.session_state.route_data = {"initial_miles": total_miles, "locked_profit": locked_profit}
-                    st.rerun()
-                else:
-                    st.error(f"Matrix Routing API Error {response.status_code}: {response.text}")
+                # Fallback to local Haversine matrix if API failed or exceeded quota
+                if dist_matrix is None:
+                    dist_matrix = calculate_haversine_matrix(locations)
+            
+            if dist_matrix is not None:
+                unvisited = set(range(1, len(locations)))
+                current_node = 0  
+                route_indices = [0]
+                total_meters = 0
+                
+                while unvisited:
+                    next_node = min(unvisited, key=lambda j: dist_matrix[current_node][j])
+                    total_meters += dist_matrix[current_node][next_node]
+                    route_indices.append(next_node)
+                    current_node = next_node
+                    unvisited.remove(next_node)
+                
+                total_meters += dist_matrix[current_node][0]
+                route_indices.append(0)  
+                
+                df_resolved = df_routing.iloc[route_indices].reset_index(drop=True)
+                
+                start_depot = df_resolved.iloc[[0]].copy()
+                active_jobs = df_resolved[df_resolved.index > 0].iloc[:-1].copy()
+                return_depot = df_resolved.iloc[[-1]].copy()
+                
+                new_master = pd.concat([start_depot, active_jobs, return_depot]).reset_index(drop=True)
+                new_master['Status'] = 'pending'
+                new_master['Payment'] = 'waiting'
+                
+                new_master.loc[0, 'Status'] = 'depot'
+                new_master.loc[len(new_master) - 1, 'Status'] = 'depot'
+                
+                st.session_state.master_df = new_master
+                
+                total_km = total_meters / 1000
+                total_miles = total_km * 0.621371
+                total_fuel_cost = ((total_miles / MPG) * 4.54609) * FUEL_PRICE
+                locked_profit = (st.session_state.master_df['Price'].sum() - total_fuel_cost) * (1 - TAX_RATE)
+                st.session_state.route_data = {"initial_miles": total_miles, "locked_profit": locked_profit}
+                st.rerun()
 
     # --- DASHBOARD DISPLAY ---
     if 'route_data' in st.session_state:
