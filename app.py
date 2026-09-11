@@ -161,7 +161,6 @@ def calculate_haversine_matrix(locations):
                 matrix[i][j] = R * c * 1000 * ROAD_FACTOR
     return matrix
 
-# --- SMART CORRIDOR-AWARE 2-OPT OPTIMIZER ---
 def optimize_route_2opt(route_indices, dist_matrix):
     best_route = route_indices[:]
     improved = True
@@ -249,27 +248,20 @@ if 'master_df' in st.session_state:
                 dist_matrix = calculate_haversine_matrix(locations)
         
         if dist_matrix is not None:
-            # Smart Initialization: Sort unvisited nodes primarily by Longitude/East-West corridor and Southward progression 
-            # to prevent western outliers like Aylesbury from hijacking the start of a southbound run.
-            unvisited = list(range(1, len(locations)))
-            
-            # Sort initial nodes so eastern/central corridor stops (St Albans, Watford) are prioritized before western jumps
-            # Longitude ascending (moving east-to-west) or sorting by how far south they are relative to longitude corridor
-            unvisited.sort(key=lambda idx: (locations[idx][0], -locations[idx][1])) # Prioritize longitude bands
-            
+            # Clean standard nearest-neighbor starting from depot
+            unvisited = set(range(1, len(locations)))
             current_node = 0  
             route_indices = [0]
             
             while unvisited:
-                # Find the closest valid node from the sorted directional preference
                 next_node = min(unvisited, key=lambda j: dist_matrix[current_node][j])
                 route_indices.append(next_node)
                 current_node = next_node
                 unvisited.remove(next_node)
             
-            route_indices.append(0)  # Return to depot
+            route_indices.append(0)  
             
-            # Run 2-Opt pass to polish out any final inefficiencies
+            # Polish out crossings
             route_indices = optimize_route_2opt(route_indices, dist_matrix)
             
             total_meters = sum(dist_matrix[route_indices[k]][route_indices[k+1]] for k in range(len(route_indices) - 1))
