@@ -5,6 +5,8 @@ import io
 import time
 import math
 from urllib.parse import quote
+from functools import lru_cache
+
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -14,7 +16,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # APP VERSION
 # ============================================================
 
-APP_VERSION = "4.0"
+APP_VERSION = "5.0"
 
 
 # ============================================================
@@ -31,7 +33,7 @@ st.title("🚗 Daily Route & Profit Optimizer")
 
 
 # ============================================================
-# MOBILE / UI CSS
+# CSS
 # ============================================================
 
 st.markdown(
@@ -41,14 +43,15 @@ st.markdown(
         overscroll-behavior-y: none;
     }
 
-    .route-stop {
-        font-size: 1.15rem;
+    .route-number {
+        font-size: 1.25rem;
         font-weight: 700;
     }
 
-    .small-muted {
-        color: #777;
-        font-size: 0.85rem;
+    .route-summary {
+        padding: 10px;
+        border-radius: 8px;
+        background-color: #f5f5f5;
     }
     </style>
     """,
@@ -57,12 +60,11 @@ st.markdown(
 
 
 # ============================================================
-# SESSION STATE VERSION CONTROL
+# SESSION STATE VERSION
 # ============================================================
 
 if st.session_state.get("app_version") != APP_VERSION:
 
-    # Old versions may contain incompatible route_data.
     st.session_state.pop("route_data", None)
     st.session_state.pop("master_df", None)
     st.session_state.pop("unrouted_df", None)
@@ -129,6 +131,20 @@ TAX_RATE = (
     ) / 100
 )
 
+# NEW:
+# This gives the optimiser a financial value for your time.
+TIME_VALUE = st.sidebar.number_input(
+    "Value of Driving Time (£/hour)",
+    min_value=0.0,
+    value=20.0,
+    step=1.0,
+    help=(
+        "Used to balance driving time against fuel cost. "
+        "Example: £20 means every hour spent driving "
+        "is treated as costing £20."
+    )
+)
+
 
 # ============================================================
 # API KEY
@@ -151,9 +167,6 @@ API_KEY = st.secrets["API_KEY"]
 # ============================================================
 
 def clean_val(value):
-    """
-    Safely convert Excel/CSV values into clean strings.
-    """
 
     if pd.isna(value):
         return ""
@@ -163,9 +176,7 @@ def clean_val(value):
     if value.endswith(".0"):
 
         try:
-            value = str(
-                int(float(value))
-            )
+            value = str(int(float(value)))
         except ValueError:
             pass
 
@@ -173,12 +184,6 @@ def clean_val(value):
 
 
 def format_duration(seconds):
-    """
-    Convert seconds into a readable duration.
-    """
-
-    if seconds is None:
-        return "0m"
 
     try:
         seconds = float(seconds)
@@ -193,7 +198,7 @@ def format_duration(seconds):
     hours = minutes // 60
     mins = minutes % 60
 
-    if hours > 0:
+    if hours:
         return f"{hours}h {mins}m"
 
     return f"{mins}m"
@@ -210,7 +215,7 @@ def google_maps_url(destination):
 
 
 # ============================================================
-# BUILD BEST GEOCODING QUERY
+# BUILD ADDRESS QUERY
 # ============================================================
 
 def build_geo_query(row, default_postcode):
@@ -231,9 +236,7 @@ def build_geo_query(row, default_postcode):
 
         if column.lower() in useful_columns:
 
-            value = clean_val(
-                row[column]
-            )
+            value = clean_val(row[column])
 
             if value:
                 parts.append(value)
@@ -251,19 +254,22 @@ def build_geo_query(row, default_postcode):
 
 
 # ============================================================
-# GEOCODER
+# GEOCODING
 # ============================================================
 
 def get_coords(query_string, postcode_fallback):
 
     """
-    Multi-level geocoder.
+    Attempts:
 
-    IMPORTANT:
+    1. Full address through Nominatim
+    2. Postcode through Nominatim
+    3. postcodes.io
+
     Failed addresses return None.
 
-    We NEVER pretend that an unknown customer
-    is located at the depot.
+    IMPORTANT:
+    We never pretend a failed customer is at the depot.
     """
 
     query = str(
@@ -280,10 +286,6 @@ def get_coords(query_string, postcode_fallback):
         + postcode
     ).lower()
 
-    # --------------------------------------------------------
-    # CACHE
-    # --------------------------------------------------------
-
     if cache_key in st.session_state.geocode_cache:
 
         return st.session_state.geocode_cache[
@@ -292,11 +294,11 @@ def get_coords(query_string, postcode_fallback):
 
     headers = {
         "User-Agent":
-            "DanCleanUKOptimizer/4.0"
+            "DanCleanUKOptimizer/5.0"
     }
 
     # --------------------------------------------------------
-    # 1. FULL ADDRESS VIA NOMINATIM
+    # FULL ADDRESS
     # --------------------------------------------------------
 
     if query and query.lower() != "nan":
@@ -308,6 +310,7 @@ def get_coords(query_string, postcode_fallback):
             not in query.lower()
             and not query.lower().endswith("uk")
         ):
+
             full_query = (
                 f"{query}, United Kingdom"
             )
@@ -323,7 +326,7 @@ def get_coords(query_string, postcode_fallback):
                     "countrycodes": "gb"
                 },
                 headers=headers,
-                timeout=5
+                timeout=6
             )
 
             if (
@@ -348,7 +351,7 @@ def get_coords(query_string, postcode_fallback):
             pass
 
     # --------------------------------------------------------
-    # 2. POSTCODE VIA NOMINATIM
+    # POSTCODE NOMINATIM
     # --------------------------------------------------------
 
     if postcode:
@@ -365,7 +368,7 @@ def get_coords(query_string, postcode_fallback):
                     "countrycodes": "gb"
                 },
                 headers=headers,
-                timeout=5
+                timeout=6
             )
 
             if (
@@ -390,7 +393,7 @@ def get_coords(query_string, postcode_fallback):
             pass
 
     # --------------------------------------------------------
-    # 3. POSTCODES.IO
+    # POSTCODES.IO
     # --------------------------------------------------------
 
     if postcode:
@@ -405,7 +408,7 @@ def get_coords(query_string, postcode_fallback):
             response = requests.get(
                 "https://api.postcodes.io/postcodes/"
                 f"{postcode_clean}",
-                timeout=4
+                timeout=5
             )
 
             if response.status_code == 200:
@@ -443,10 +446,6 @@ def get_coords(query_string, postcode_fallback):
 
         except Exception:
             pass
-
-    # --------------------------------------------------------
-    # FAILED
-    # --------------------------------------------------------
 
     return None
 
@@ -498,20 +497,10 @@ def haversine_km(
 
 
 # ============================================================
-# OFFLINE ROUTING FALLBACK
+# OFFLINE MATRIX
 # ============================================================
 
 def build_offline_matrix(locations):
-
-    """
-    Offline fallback.
-
-    locations format:
-        [longitude, latitude]
-
-    This is less accurate than real road routing,
-    but is better than failing completely.
-    """
 
     count = len(locations)
 
@@ -525,7 +514,7 @@ def build_offline_matrix(locations):
         for _ in range(count)
     ]
 
-    # Approximate road multiplier.
+    # Approximate road distance from straight-line distance.
     ROAD_FACTOR = 1.30
 
     # Conservative average speed.
@@ -577,14 +566,10 @@ def build_offline_matrix(locations):
 def get_route_matrix(locations):
 
     """
-    Gets REAL road distance and driving duration
-    from OpenRouteService.
+    Returns:
 
-    distances:
-        metres
-
-    durations:
-        seconds
+        distance matrix in metres
+        duration matrix in seconds
     """
 
     try:
@@ -605,10 +590,11 @@ def get_route_matrix(locations):
                 "Authorization": API_KEY,
                 "Content-Type": "application/json"
             },
-            timeout=20
+            timeout=30
         )
 
         if response.status_code != 200:
+
             return None, None
 
         data = response.json()
@@ -621,7 +607,11 @@ def get_route_matrix(locations):
             "durations"
         )
 
-        if not distances or not durations:
+        if (
+            not distances
+            or not durations
+        ):
+
             return None, None
 
         return (
@@ -630,120 +620,21 @@ def get_route_matrix(locations):
         )
 
     except Exception:
+
         return None, None
 
 
 # ============================================================
-# NEAREST-FIRST ROUTE
+# ROUTE OBJECTIVE
 # ============================================================
 
-def build_nearest_first_route(
-    distance_matrix,
-    duration_matrix
-):
-
-    """
-    MAIN ROUTING RULE.
-
-    Starting at the depot:
-
-        1. Find every unvisited customer.
-        2. Choose the customer with the shortest
-           REAL driving distance.
-        3. If distances are effectively tied,
-           use driving time as the tie-breaker.
-        4. Repeat from the new location.
-
-    IMPORTANT:
-
-    There is NO 2-opt afterwards.
-
-    Therefore the route produced here remains
-    nearest-first all the way through.
-    """
-
-    count = len(
-        distance_matrix
-    )
-
-    unvisited = set(
-        range(1, count)
-    )
-
-    route = [0]
-
-    current = 0
-
-    while unvisited:
-
-        candidates = []
-
-        for candidate in unvisited:
-
-            distance = float(
-                distance_matrix[
-                    current
-                ][candidate]
-            )
-
-            duration = float(
-                duration_matrix[
-                    current
-                ][candidate]
-            )
-
-            candidates.append(
-                (
-                    distance,
-                    duration,
-                    candidate
-                )
-            )
-
-        # ----------------------------------------------------
-        # SORT BY:
-        #
-        # 1. REAL DRIVING DISTANCE
-        # 2. REAL DRIVING TIME
-        #
-        # This guarantees nearest address first.
-        # ----------------------------------------------------
-
-        candidates.sort(
-            key=lambda item: (
-                item[0],
-                item[1]
-            )
-        )
-
-        next_customer = (
-            candidates[0][2]
-        )
-
-        route.append(
-            next_customer
-        )
-
-        unvisited.remove(
-            next_customer
-        )
-
-        current = next_customer
-
-    # Return to depot.
-    route.append(0)
-
-    return route
-
-
-# ============================================================
-# ROUTE TOTALS
-# ============================================================
-
-def calculate_route_totals(
+def route_totals(
     route,
     distance_matrix,
-    duration_matrix
+    duration_matrix,
+    fuel_price,
+    mpg,
+    time_value
 ):
 
     total_distance = 0.0
@@ -753,29 +644,784 @@ def calculate_route_totals(
         len(route) - 1
     ):
 
-        start = route[i]
-        end = route[i + 1]
+        a = route[i]
+        b = route[i + 1]
 
         total_distance += float(
-            distance_matrix[
-                start
-            ][end]
+            distance_matrix[a][b]
         )
 
         total_duration += float(
-            duration_matrix[
-                start
-            ][end]
+            duration_matrix[a][b]
         )
 
-    return (
-        total_distance,
-        total_duration
+    miles = (
+        total_distance
+        / 1000
+        * 0.621371
     )
+
+    fuel_litres = (
+        miles
+        / mpg
+        * 4.54609
+    )
+
+    fuel_cost = (
+        fuel_litres
+        * fuel_price
+    )
+
+    driving_time_cost = (
+        total_duration
+        / 3600
+        * time_value
+    )
+
+    total_operating_cost = (
+        fuel_cost
+        + driving_time_cost
+    )
+
+    return {
+        "meters":
+            total_distance,
+
+        "seconds":
+            total_duration,
+
+        "miles":
+            miles,
+
+        "fuel_litres":
+            fuel_litres,
+
+        "fuel_cost":
+            fuel_cost,
+
+        "driving_time_cost":
+            driving_time_cost,
+
+        "operating_cost":
+            total_operating_cost
+    }
+
+
+def route_score(
+    route,
+    distance_matrix,
+    duration_matrix,
+    fuel_price,
+    mpg,
+    time_value
+):
+
+    totals = route_totals(
+        route,
+        distance_matrix,
+        duration_matrix,
+        fuel_price,
+        mpg,
+        time_value
+    )
+
+    return totals["operating_cost"]
 
 
 # ============================================================
-# DESTINATION FOR MAPS
+# NEAREST NEIGHBOUR INITIAL ROUTE
+# ============================================================
+
+def nearest_neighbour_route(
+    start_customer,
+    distance_matrix
+):
+
+    count = len(
+        distance_matrix
+    )
+
+    customers = set(
+        range(1, count)
+    )
+
+    route = [0]
+
+    current = 0
+
+    # Optionally force a particular first customer.
+    if (
+        start_customer is not None
+        and start_customer in customers
+    ):
+
+        route.append(
+            start_customer
+        )
+
+        customers.remove(
+            start_customer
+        )
+
+        current = start_customer
+
+    while customers:
+
+        next_node = min(
+            customers,
+            key=lambda x:
+                distance_matrix[current][x]
+        )
+
+        route.append(
+            next_node
+        )
+
+        customers.remove(
+            next_node
+        )
+
+        current = next_node
+
+    route.append(0)
+
+    return route
+
+
+# ============================================================
+# CHEAPEST INSERTION
+# ============================================================
+
+def cheapest_insertion_route(
+    distance_matrix,
+    duration_matrix,
+    fuel_price,
+    mpg,
+    time_value
+):
+
+    """
+    Builds a sensible initial route by repeatedly inserting
+    the customer where it adds the least total route cost.
+    """
+
+    count = len(
+        distance_matrix
+    )
+
+    if count <= 1:
+        return [0, 0]
+
+    customers = list(
+        range(1, count)
+    )
+
+    # Start with customer having the cheapest
+    # round trip from depot.
+    first = min(
+        customers,
+        key=lambda x:
+            distance_matrix[0][x]
+            +
+            distance_matrix[x][0]
+    )
+
+    route = [
+        0,
+        first,
+        0
+    ]
+
+    customers.remove(first)
+
+    while customers:
+
+        best_customer = None
+        best_position = None
+        best_increase = float("inf")
+
+        for customer in customers:
+
+            for position in range(
+                1,
+                len(route)
+            ):
+
+                a = route[position - 1]
+                b = route[position]
+
+                old_route = (
+                    distance_matrix[a][b]
+                )
+
+                new_route = (
+                    distance_matrix[a][customer]
+                    +
+                    distance_matrix[customer][b]
+                )
+
+                distance_increase = (
+                    new_route
+                    - old_route
+                )
+
+                old_time = (
+                    duration_matrix[a][b]
+                )
+
+                new_time = (
+                    duration_matrix[a][customer]
+                    +
+                    duration_matrix[customer][b]
+                )
+
+                time_increase = (
+                    new_time
+                    - old_time
+                )
+
+                # Convert distance to fuel cost.
+                miles_added = (
+                    distance_increase
+                    / 1000
+                    * 0.621371
+                )
+
+                litres_added = (
+                    miles_added
+                    / mpg
+                    * 4.54609
+                )
+
+                fuel_added = (
+                    litres_added
+                    * fuel_price
+                )
+
+                time_added = (
+                    time_increase
+                    / 3600
+                    * time_value
+                )
+
+                increase = (
+                    fuel_added
+                    + time_added
+                )
+
+                if increase < best_increase:
+
+                    best_increase = increase
+                    best_customer = customer
+                    best_position = position
+
+        route.insert(
+            best_position,
+            best_customer
+        )
+
+        customers.remove(
+            best_customer
+        )
+
+    return route
+
+
+# ============================================================
+# 2-OPT
+# ============================================================
+
+def two_opt(
+    route,
+    distance_matrix,
+    duration_matrix,
+    fuel_price,
+    mpg,
+    time_value
+):
+
+    """
+    Improves the COMPLETE route.
+
+    Unlike the previous version, this is intentional:
+    we are NOT preserving nearest-neighbour order.
+
+    We are trying to minimise the whole journey including
+    the return to Grantham.
+    """
+
+    best_route = route[:]
+
+    best_score = route_score(
+        best_route,
+        distance_matrix,
+        duration_matrix,
+        fuel_price,
+        mpg,
+        time_value
+    )
+
+    improved = True
+
+    while improved:
+
+        improved = False
+
+        # Don't reverse depot.
+        for i in range(
+            1,
+            len(best_route) - 2
+        ):
+
+            for j in range(
+                i + 1,
+                len(best_route) - 1
+            ):
+
+                candidate = (
+                    best_route[:i]
+                    +
+                    best_route[i:j + 1][::-1]
+                    +
+                    best_route[j + 1:]
+                )
+
+                candidate_score = route_score(
+                    candidate,
+                    distance_matrix,
+                    duration_matrix,
+                    fuel_price,
+                    mpg,
+                    time_value
+                )
+
+                if (
+                    candidate_score
+                    <
+                    best_score - 0.0001
+                ):
+
+                    best_route = candidate
+                    best_score = candidate_score
+                    improved = True
+
+                    break
+
+            if improved:
+                break
+
+    return best_route
+
+
+# ============================================================
+# EXACT OPTIMISATION FOR SMALL ROUTES
+# ============================================================
+
+def exact_route_dynamic_programming(
+    distance_matrix,
+    duration_matrix,
+    fuel_price,
+    mpg,
+    time_value
+):
+
+    """
+    Exact travelling-salesman style optimisation.
+
+    Used for smaller days.
+
+    State:
+        (visited_customers, current_customer)
+
+    It evaluates every possible customer sequence
+    without blindly following nearest-neighbour.
+
+    This guarantees the best route according to the
+    operating-cost objective for the given matrix.
+    """
+
+    n = len(
+        distance_matrix
+    ) - 1
+
+    if n == 0:
+        return [0, 0]
+
+    # Customers are represented by bits.
+    full_mask = (
+        (1 << n) - 1
+    )
+
+    # dp[(mask, current)] = (cost, previous)
+    dp = {}
+
+    # Start from depot.
+    for customer_index in range(n):
+
+        node = customer_index + 1
+
+        route = [
+            0,
+            node
+        ]
+
+        cost = route_score(
+            route,
+            distance_matrix,
+            duration_matrix,
+            fuel_price,
+            mpg,
+            time_value
+        )
+
+        # We don't actually want the incomplete route's
+        # return-to-depot cost here.
+        # So calculate only the first leg.
+        first_leg = route_totals(
+            [0, node],
+            distance_matrix,
+            duration_matrix,
+            fuel_price,
+            mpg,
+            time_value
+        )["operating_cost"]
+
+        mask = (
+            1 << customer_index
+        )
+
+        dp[
+            (mask, node)
+        ] = (
+            first_leg,
+            0
+        )
+
+    # --------------------------------------------------------
+    # BUILD STATES
+    # --------------------------------------------------------
+
+    for mask in range(
+        1,
+        full_mask + 1
+    ):
+
+        for current_customer in range(
+            1,
+            n + 1
+        ):
+
+            state = (
+                mask,
+                current_customer
+            )
+
+            if state not in dp:
+                continue
+
+            current_cost, _ = dp[state]
+
+            for next_customer in range(
+                1,
+                n + 1
+            ):
+
+                bit = (
+                    1
+                    <<
+                    (next_customer - 1)
+                )
+
+                if mask & bit:
+                    continue
+
+                new_mask = (
+                    mask | bit
+                )
+
+                a = current_customer
+                b = next_customer
+
+                # Incremental operating cost.
+                distance_m = (
+                    distance_matrix[a][b]
+                )
+
+                duration_s = (
+                    duration_matrix[a][b]
+                )
+
+                miles = (
+                    distance_m
+                    / 1000
+                    * 0.621371
+                )
+
+                fuel_litres = (
+                    miles
+                    / mpg
+                    * 4.54609
+                )
+
+                fuel_cost = (
+                    fuel_litres
+                    * fuel_price
+                )
+
+                time_cost = (
+                    duration_s
+                    / 3600
+                    * time_value
+                )
+
+                increment = (
+                    fuel_cost
+                    + time_cost
+                )
+
+                new_cost = (
+                    current_cost
+                    + increment
+                )
+
+                new_state = (
+                    new_mask,
+                    next_customer
+                )
+
+                if (
+                    new_state not in dp
+                    or
+                    new_cost
+                    <
+                    dp[new_state][0]
+                ):
+
+                    dp[new_state] = (
+                        new_cost,
+                        current_customer
+                    )
+
+    # --------------------------------------------------------
+    # CLOSE ROUTE BACK TO DEPOT
+    # --------------------------------------------------------
+
+    best_cost = float("inf")
+    best_last = None
+
+    for current in range(
+        1,
+        n + 1
+    ):
+
+        state = (
+            full_mask,
+            current
+        )
+
+        if state not in dp:
+            continue
+
+        current_cost = (
+            dp[state][0]
+        )
+
+        distance_m = (
+            distance_matrix[current][0]
+        )
+
+        duration_s = (
+            duration_matrix[current][0]
+        )
+
+        miles = (
+            distance_m
+            / 1000
+            * 0.621371
+        )
+
+        fuel_litres = (
+            miles
+            / mpg
+            * 4.54609
+        )
+
+        fuel_cost = (
+            fuel_litres
+            * fuel_price
+        )
+
+        time_cost = (
+            duration_s
+            / 3600
+            * time_value
+        )
+
+        final_cost = (
+            current_cost
+            + fuel_cost
+            + time_cost
+        )
+
+        if final_cost < best_cost:
+
+            best_cost = final_cost
+            best_last = current
+
+    # --------------------------------------------------------
+    # RECONSTRUCT ROUTE
+    # --------------------------------------------------------
+
+    route_reversed = []
+
+    mask = full_mask
+    current = best_last
+
+    while current != 0:
+
+        route_reversed.append(
+            current
+        )
+
+        previous = dp[
+            (mask, current)
+        ][1]
+
+        mask ^= (
+            1
+            <<
+            (current - 1)
+        )
+
+        current = previous
+
+    route = [
+        0
+    ] + list(
+        reversed(
+            route_reversed
+        )
+    ) + [
+        0
+    ]
+
+    return route
+
+
+# ============================================================
+# MAIN OPTIMISER
+# ============================================================
+
+def optimise_complete_route(
+    distance_matrix,
+    duration_matrix,
+    fuel_price,
+    mpg,
+    time_value
+):
+
+    customer_count = (
+        len(distance_matrix) - 1
+    )
+
+    # --------------------------------------------------------
+    # SMALL ROUTES
+    #
+    # Exact optimisation.
+    #
+    # 11 customers is already computationally significant,
+    # so exact mode is limited to 10.
+    # --------------------------------------------------------
+
+    if customer_count <= 10:
+
+        return exact_route_dynamic_programming(
+            distance_matrix,
+            duration_matrix,
+            fuel_price,
+            mpg,
+            time_value
+        )
+
+    # --------------------------------------------------------
+    # LARGER ROUTES
+    #
+    # Generate several different starting routes.
+    # Improve each with 2-opt.
+    # Keep the best COMPLETE route.
+    # --------------------------------------------------------
+
+    candidates = []
+
+    # --------------------------------------------------------
+    # 1. Nearest-neighbour from every customer
+    # --------------------------------------------------------
+
+    for first_customer in range(
+        1,
+        customer_count + 1
+    ):
+
+        route = nearest_neighbour_route(
+            first_customer,
+            distance_matrix
+        )
+
+        candidates.append(
+            route
+        )
+
+    # --------------------------------------------------------
+    # 2. Cheapest insertion
+    # --------------------------------------------------------
+
+    candidates.append(
+        cheapest_insertion_route(
+            distance_matrix,
+            duration_matrix,
+            fuel_price,
+            mpg,
+            time_value
+        )
+    )
+
+    # --------------------------------------------------------
+    # IMPROVE ALL CANDIDATES
+    # --------------------------------------------------------
+
+    best_route = None
+    best_score = float("inf")
+
+    for route in candidates:
+
+        improved = two_opt(
+            route,
+            distance_matrix,
+            duration_matrix,
+            fuel_price,
+            mpg,
+            time_value
+        )
+
+        score = route_score(
+            improved,
+            distance_matrix,
+            duration_matrix,
+            fuel_price,
+            mpg,
+            time_value
+        )
+
+        if score < best_score:
+
+            best_score = score
+            best_route = improved
+
+    return best_route
+
+
+# ============================================================
+# MAP DESTINATION
 # ============================================================
 
 def get_map_destination(row):
@@ -844,10 +1490,6 @@ if (
 
     try:
 
-        # ----------------------------------------------------
-        # LOAD FILE
-        # ----------------------------------------------------
-
         if uploaded_file.name.lower().endswith(
             ".xlsx"
         ):
@@ -862,7 +1504,6 @@ if (
                 uploaded_file
             )
 
-        # Clean column names.
         df.columns = (
             df.columns
             .astype(str)
@@ -870,7 +1511,7 @@ if (
         )
 
         # ----------------------------------------------------
-        # VALIDATE REQUIRED COLUMNS
+        # REQUIRED COLUMNS
         # ----------------------------------------------------
 
         required_columns = [
@@ -895,7 +1536,7 @@ if (
             st.stop()
 
         # ----------------------------------------------------
-        # REMOVE COMPLETELY EMPTY ROWS
+        # CLEAN EMPTY ROWS
         # ----------------------------------------------------
 
         df = (
@@ -917,17 +1558,12 @@ if (
         )
 
         df = df[
-            (
-                df["Postcode"] != ""
-            )
-            &
-            (
-                df["Postcode"] != "NAN"
-            )
-            &
-            (
-                df["Postcode"] != "NAT"
-            )
+            ~df["Postcode"]
+            .isin([
+                "",
+                "NAN",
+                "NAT"
+            ])
         ].copy()
 
         # ----------------------------------------------------
@@ -969,7 +1605,7 @@ if (
         ].copy()
 
         # ----------------------------------------------------
-        # INITIAL STATUS
+        # STATUS
         # ----------------------------------------------------
 
         df["Status"] = "pending"
@@ -992,7 +1628,7 @@ if (
 
 
 # ============================================================
-# MAIN APP
+# MAIN APPLICATION
 # ============================================================
 
 if "master_df" in st.session_state:
@@ -1001,7 +1637,7 @@ if "master_df" in st.session_state:
 
 
     # ========================================================
-    # PLAN ROUTE BUTTON
+    # PLAN ROUTE
     # ========================================================
 
     if st.button(
@@ -1019,7 +1655,7 @@ if "master_df" in st.session_state:
             st.stop()
 
         # ----------------------------------------------------
-        # DEPOT LOCATION
+        # LOCATE DEPOT
         # ----------------------------------------------------
 
         with st.spinner(
@@ -1034,83 +1670,87 @@ if "master_df" in st.session_state:
         if depot_coords is None:
 
             st.error(
-                "Could not locate the depot. "
-                "Please check the depot address/postcode."
+                "Could not locate the depot."
             )
 
             st.stop()
 
         # ----------------------------------------------------
-        # CUSTOMER GEOCODING
+        # LOCATE CUSTOMERS
         # ----------------------------------------------------
 
         valid_rows = []
         failed_rows = []
 
-        coordinates = [
-            [
-                depot_coords[1],
-                depot_coords[0]
-            ]
-        ]
+        customer_coordinates = {}
 
-        geo_queries = []
+        progress = st.progress(
+            0,
+            text="Locating customer addresses..."
+        )
 
-        with st.spinner(
-            "📍 Finding every customer address..."
+        total_customers = len(df)
+
+        for position, (original_index, row) in enumerate(
+            df.iterrows()
         ):
 
-            for original_index, row in df.iterrows():
+            query = build_geo_query(
+                row,
+                DEPOT_POSTCODE
+            )
 
-                query = build_geo_query(
-                    row,
-                    DEPOT_POSTCODE
+            postcode = clean_val(
+                row["Postcode"]
+            )
+
+            coords = get_coords(
+                query,
+                postcode
+            )
+
+            if coords is None:
+
+                failed_rows.append(
+                    {
+                        "index":
+                            original_index,
+
+                        "postcode":
+                            postcode,
+
+                        "query":
+                            query
+                    }
                 )
 
-                postcode = clean_val(
-                    row["Postcode"]
+            else:
+
+                valid_rows.append(
+                    original_index
                 )
 
-                coords = get_coords(
-                    query,
-                    postcode
+                customer_coordinates[
+                    original_index
+                ] = coords
+
+            progress.progress(
+                (position + 1)
+                / total_customers,
+                text=(
+                    f"Locating address "
+                    f"{position + 1} of "
+                    f"{total_customers}"
                 )
+            )
 
-                if coords is None:
+            # Respect public geocoder.
+            time.sleep(1.0)
 
-                    failed_rows.append(
-                        {
-                            "index":
-                                original_index,
-                            "postcode":
-                                postcode,
-                            "query":
-                                query
-                        }
-                    )
-
-                else:
-
-                    valid_rows.append(
-                        original_index
-                    )
-
-                    geo_queries.append(
-                        query
-                    )
-
-                    coordinates.append(
-                        [
-                            coords[1],
-                            coords[0]
-                        ]
-                    )
-
-                # Polite geocoder delay.
-                time.sleep(0.10)
+        progress.empty()
 
         # ----------------------------------------------------
-        # FAILED JOBS
+        # FAILED ADDRESSES
         # ----------------------------------------------------
 
         if failed_rows:
@@ -1138,47 +1778,60 @@ if "master_df" in st.session_state:
             )
 
         # ----------------------------------------------------
-        # NO VALID CUSTOMERS
+        # CHECK
         # ----------------------------------------------------
 
         if not valid_rows:
 
             st.error(
-                "None of the customer addresses "
-                "could be located."
+                "No customer addresses could be located."
             )
 
             st.stop()
 
         # ----------------------------------------------------
-        # CREATE ROUTING DATAFRAME
+        # BUILD ROUTING DATA
         # ----------------------------------------------------
 
         routing_rows = []
 
-        # Depot row.
+        coordinates = [
+            [
+                depot_coords[1],
+                depot_coords[0]
+            ]
+        ]
+
+        # Depot.
         routing_rows.append(
             {
                 "Postcode":
                     DEPOT_POSTCODE,
+
                 "Price":
                     0.0,
+
                 "Phone":
                     "",
+
                 "Status":
                     "depot",
+
                 "Payment":
                     "waiting",
+
                 "geo_query":
                     DEPOT_FULL_ADDRESS,
+
                 "latitude":
                     depot_coords[0],
+
                 "longitude":
                     depot_coords[1]
             }
         )
 
-        # Customer rows.
+        # Customers.
         for original_index in valid_rows:
 
             original_row = (
@@ -1187,18 +1840,15 @@ if "master_df" in st.session_state:
                 ].copy()
             )
 
+            coords = (
+                customer_coordinates[
+                    original_index
+                ]
+            )
+
             query = build_geo_query(
                 original_row,
                 DEPOT_POSTCODE
-            )
-
-            postcode = clean_val(
-                original_row["Postcode"]
-            )
-
-            coords = get_coords(
-                query,
-                postcode
             )
 
             row_dict = (
@@ -1221,22 +1871,30 @@ if "master_df" in st.session_state:
                 row_dict
             )
 
+            coordinates.append(
+                [
+                    coords[1],
+                    coords[0]
+                ]
+            )
+
         routing_df = pd.DataFrame(
             routing_rows
         )
 
         # ----------------------------------------------------
-        # REAL ROAD MATRIX
+        # ROUTING MATRIX
         # ----------------------------------------------------
 
         with st.spinner(
             "🛣️ Calculating real road distances and driving times..."
         ):
 
-            distance_matrix, duration_matrix = (
-                get_route_matrix(
-                    coordinates
-                )
+            (
+                distance_matrix,
+                duration_matrix
+            ) = get_route_matrix(
+                coordinates
             )
 
         using_offline = False
@@ -1249,8 +1907,8 @@ if "master_df" in st.session_state:
             using_offline = True
 
             st.warning(
-                "⚠️ Live routing was unavailable. "
-                "Using the offline distance/time fallback."
+                "⚠️ Live road routing was unavailable. "
+                "Using the offline fallback."
             )
 
             (
@@ -1261,72 +1919,96 @@ if "master_df" in st.session_state:
             )
 
         # ----------------------------------------------------
-        # BUILD STRICT NEAREST-FIRST ROUTE
+        # OPTIMISE COMPLETE ROUTE
         # ----------------------------------------------------
 
-        route_indices = (
-            build_nearest_first_route(
-                distance_matrix,
-                duration_matrix
-            )
+        customer_count = (
+            len(routing_df) - 1
         )
 
+        if customer_count <= 10:
+
+            optimisation_text = (
+                "🔬 Searching the complete set of "
+                "possible routes..."
+            )
+
+        else:
+
+            optimisation_text = (
+                "🧠 Testing multiple route patterns "
+                "and improving the complete journey..."
+            )
+
+        with st.spinner(
+            optimisation_text
+        ):
+
+            route_indices = (
+                optimise_complete_route(
+                    distance_matrix,
+                    duration_matrix,
+                    FUEL_PRICE,
+                    MPG,
+                    TIME_VALUE
+                )
+            )
+
         # ----------------------------------------------------
-        # CALCULATE TOTAL ROUTE
+        # TOTALS
         # ----------------------------------------------------
 
-        (
-            total_meters,
-            total_seconds
-        ) = calculate_route_totals(
+        totals = route_totals(
             route_indices,
             distance_matrix,
-            duration_matrix
+            duration_matrix,
+            FUEL_PRICE,
+            MPG,
+            TIME_VALUE
         )
 
-        total_km = (
-            total_meters / 1000
-        )
+        total_miles = totals[
+            "miles"
+        ]
 
-        total_miles = (
-            total_km * 0.621371
-        )
+        total_seconds = totals[
+            "seconds"
+        ]
 
-        # ----------------------------------------------------
-        # FUEL
-        # ----------------------------------------------------
+        fuel_litres = totals[
+            "fuel_litres"
+        ]
 
-        fuel_litres = (
-            total_miles
-            / MPG
-            * 4.54609
-        )
+        fuel_cost = totals[
+            "fuel_cost"
+        ]
 
-        fuel_cost = (
-            fuel_litres
-            * FUEL_PRICE
-        )
+        driving_time_cost = totals[
+            "driving_time_cost"
+        ]
+
+        operating_cost = totals[
+            "operating_cost"
+        ]
 
         # ----------------------------------------------------
         # REVENUE
         # ----------------------------------------------------
 
-        customer_revenue = (
-            routing_df["Price"].sum()
+        revenue = (
+            routing_df["Price"]
+            .sum()
         )
 
         pre_tax_profit = (
-            customer_revenue
+            revenue
             - fuel_cost
         )
 
         take_home_profit = (
             pre_tax_profit
-            * (1 - TAX_RATE)
-        )
-
-        customer_count = (
-            len(route_indices) - 2
+            *
+            (1 - TAX_RATE)
         )
 
         # ----------------------------------------------------
@@ -1335,16 +2017,23 @@ if "master_df" in st.session_state:
 
         route_df = (
             routing_df
-            .iloc[route_indices]
+            .iloc[
+                route_indices
+            ]
             .copy()
             .reset_index(drop=True)
         )
 
         route_df["route_index"] = (
-            range(len(route_df))
+            range(
+                len(route_df)
+            )
         )
 
-        # First and last rows are depot.
+        # ----------------------------------------------------
+        # DEPOT STATUS
+        # ----------------------------------------------------
+
         route_df.loc[
             0,
             "Status"
@@ -1356,7 +2045,7 @@ if "master_df" in st.session_state:
         ] = "depot"
 
         # ----------------------------------------------------
-        # SAVE ROUTE
+        # SAVE
         # ----------------------------------------------------
 
         st.session_state.master_df = (
@@ -1369,7 +2058,10 @@ if "master_df" in st.session_state:
                 float(total_miles),
 
             "total_km":
-                float(total_km),
+                float(
+                    total_miles
+                    / 0.621371
+                ),
 
             "total_seconds":
                 float(total_seconds),
@@ -1380,8 +2072,14 @@ if "master_df" in st.session_state:
             "fuel_cost":
                 float(fuel_cost),
 
+            "driving_time_cost":
+                float(driving_time_cost),
+
+            "operating_cost":
+                float(operating_cost),
+
             "revenue":
-                float(customer_revenue),
+                float(revenue),
 
             "pre_tax_profit":
                 float(pre_tax_profit),
@@ -1392,6 +2090,9 @@ if "master_df" in st.session_state:
             "customer_count":
                 int(customer_count),
 
+            "time_value":
+                float(TIME_VALUE),
+
             "offline":
                 bool(using_offline)
         }
@@ -1400,7 +2101,7 @@ if "master_df" in st.session_state:
 
 
     # ========================================================
-    # ROUTE ECONOMICS
+    # ECONOMICS DASHBOARD
     # ========================================================
 
     if "route_data" in st.session_state:
@@ -1409,10 +2110,6 @@ if "master_df" in st.session_state:
             "route_data",
             {}
         )
-
-        # ----------------------------------------------------
-        # SAFE VALUES
-        # ----------------------------------------------------
 
         take_home_profit = float(
             data.get(
@@ -1456,10 +2153,31 @@ if "master_df" in st.session_state:
             )
         )
 
+        driving_time_cost = float(
+            data.get(
+                "driving_time_cost",
+                0
+            )
+        )
+
+        operating_cost = float(
+            data.get(
+                "operating_cost",
+                0
+            )
+        )
+
         customer_count = int(
             data.get(
                 "customer_count",
                 0
+            )
+        )
+
+        time_value = float(
+            data.get(
+                "time_value",
+                TIME_VALUE
             )
         )
 
@@ -1471,7 +2189,7 @@ if "master_df" in st.session_state:
         )
 
         # ----------------------------------------------------
-        # DASHBOARD
+        # HEADER
         # ----------------------------------------------------
 
         st.markdown("---")
@@ -1479,6 +2197,10 @@ if "master_df" in st.session_state:
         st.subheader(
             "💰 Today's Route Economics"
         )
+
+        # ----------------------------------------------------
+        # PRIMARY FIGURES
+        # ----------------------------------------------------
 
         col1, col2 = st.columns(2)
 
@@ -1530,32 +2252,61 @@ if "master_df" in st.session_state:
                 f"{fuel_litres:.1f} L"
             )
 
-        st.caption(
-            f"{customer_count} customer stops"
-        )
+        # ----------------------------------------------------
+        # OPTIMISATION INFORMATION
+        # ----------------------------------------------------
+
+        with st.expander(
+            "💡 How the route was optimised"
+        ):
+
+            st.write(
+                f"""
+                The optimiser considers the **complete journey**,
+                including the return to the Grantham depot.
+
+                **Value of your driving time:** £{time_value:.2f}/hour
+
+                **Fuel cost:** £{fuel_cost:.2f}
+
+                **Time cost:** £{driving_time_cost:.2f}
+
+                **Combined operating cost used by optimiser:**
+                £{operating_cost:.2f}
+
+                The route is therefore not simply:
+                "go to whichever address is nearest."
+
+                It asks:
+                **"Which complete sequence of jobs gives the
+                lowest overall driving cost?"**
+                """
+            )
+
+            if customer_count <= 10:
+
+                st.success(
+                    "🔬 This route used exact optimisation "
+                    "for the available customer sequence."
+                )
+
+            else:
+
+                st.info(
+                    "🧠 This route used multiple starting "
+                    "patterns followed by route improvement."
+                )
 
         if offline:
 
             st.warning(
-                "⚠️ These route figures use the "
-                "offline routing fallback."
+                "⚠️ Live road routing was unavailable. "
+                "Distance and time are estimates."
             )
-
-        # ----------------------------------------------------
-        # ROUTING RULE
-        # ----------------------------------------------------
-
-        st.info(
-            "🧭 **Routing rule:** Starting from the "
-            "depot, the app always chooses the "
-            "**nearest remaining customer by real "
-            "driving distance**. Driving time breaks "
-            "ties. The route is not rearranged afterwards."
-        )
 
 
     # ========================================================
-    # UNROUTED CUSTOMERS
+    # UNROUTED JOBS
     # ========================================================
 
     if (
@@ -1566,28 +2317,29 @@ if "master_df" in st.session_state:
         st.markdown("---")
 
         st.error(
-            f"⚠️ {len(st.session_state.unrouted_df)} "
+            f"⚠️ "
+            f"{len(st.session_state.unrouted_df)} "
             "customer(s) could not be located."
         )
 
         with st.expander(
-            "View customers needing address checking"
+            "View addresses needing checking"
         ):
 
-            for _, failed_row in (
+            for _, row in (
                 st.session_state
                 .unrouted_df
                 .iterrows()
             ):
 
                 postcode = clean_val(
-                    failed_row.get(
+                    row.get(
                         "Postcode"
                     )
                 )
 
                 geo_error = clean_val(
-                    failed_row.get(
+                    row.get(
                         "Geo Error"
                     )
                 )
@@ -1597,13 +2349,14 @@ if "master_df" in st.session_state:
                 )
 
             st.caption(
-                "These customers have NOT been "
-                "silently placed at the depot."
+                "These jobs were NOT included in the "
+                "optimised route and were NOT placed "
+                "at the depot."
             )
 
 
     # ========================================================
-    # SIDEBAR ROUTE NAVIGATION
+    # SIDEBAR NAVIGATION
     # ========================================================
 
     if (
@@ -1612,6 +2365,7 @@ if "master_df" in st.session_state:
     ):
 
         st.sidebar.markdown("---")
+
         st.sidebar.title(
             "🧭 Route Navigation"
         )
@@ -1620,7 +2374,6 @@ if "master_df" in st.session_state:
             st.session_state.master_df
         )
 
-        # Customer rows only.
         customer_df = route_df[
             route_df["Status"]
             .astype(str)
@@ -1641,26 +2394,26 @@ if "master_df" in st.session_state:
                 pending_df.iloc[0]
             )
 
-            next_destination = (
+            destination = (
                 get_map_destination(
                     next_row
                 )
             )
 
-            next_url = (
+            nav_url = (
                 google_maps_url(
-                    next_destination
+                    destination
                 )
             )
 
             st.sidebar.link_button(
                 "🚗 Navigate to Next Stop",
-                next_url,
+                nav_url,
                 use_container_width=True
             )
 
             st.sidebar.caption(
-                f"Next: {next_destination}"
+                f"Next: {destination}"
             )
 
             st.sidebar.caption(
@@ -1675,13 +2428,13 @@ if "master_df" in st.session_state:
 
 
     # ========================================================
-    # MAIN ROUTE CARDS
+    # ROUTE DISPLAY
     # ========================================================
 
     st.markdown("---")
 
     st.subheader(
-        "📍 Planned Route"
+        "📍 Optimised Route"
     )
 
     for idx, row in (
@@ -1690,7 +2443,7 @@ if "master_df" in st.session_state:
     ):
 
         # ----------------------------------------------------
-        # DEPOT START
+        # START DEPOT
         # ----------------------------------------------------
 
         if idx == 0:
@@ -1700,7 +2453,7 @@ if "master_df" in st.session_state:
             ):
 
                 st.write(
-                    "### 🏠 START — DEPOT"
+                    "### 🏠 START — GRANtham DEPOT"
                 )
 
                 st.write(
@@ -1710,7 +2463,7 @@ if "master_df" in st.session_state:
             continue
 
         # ----------------------------------------------------
-        # DEPOT RETURN
+        # RETURN DEPOT
         # ----------------------------------------------------
 
         if (
@@ -1742,14 +2495,14 @@ if "master_df" in st.session_state:
                 st.link_button(
                     "🚗 Navigate Back to Depot",
                     return_url,
-                    key=f"return_depot_{idx}",
+                    key=f"return_{idx}",
                     use_container_width=True
                 )
 
             continue
 
         # ----------------------------------------------------
-        # CUSTOMER DATA
+        # CUSTOMER
         # ----------------------------------------------------
 
         postcode = clean_val(
@@ -1758,9 +2511,11 @@ if "master_df" in st.session_state:
             )
         )
 
-        price = row.get(
-            "Price",
-            0
+        price = float(
+            row.get(
+                "Price",
+                0
+            )
         )
 
         phone = clean_val(
@@ -1796,7 +2551,7 @@ if "master_df" in st.session_state:
         )
 
         # ----------------------------------------------------
-        # EXTRA CUSTOMER INFORMATION
+        # EXTRA DATA
         # ----------------------------------------------------
 
         extra_parts = []
@@ -1877,17 +2632,17 @@ if "master_df" in st.session_state:
                 )
 
             st.write(
-                f"**Price:** £{float(price):.2f}"
-                f"  |  "
+                f"**Price:** £{price:.2f}"
+                f" | "
                 f"**Status:** {status_text}"
-                f"  |  "
+                f" | "
                 f"**Payment:** {payment}"
             )
 
             col1, col2 = st.columns(2)
 
             # ------------------------------------------------
-            # COMPLETE / WHATSAPP
+            # COMPLETE
             # ------------------------------------------------
 
             with col1:
@@ -1918,7 +2673,7 @@ if "master_df" in st.session_state:
                         message = (
                             "Hi from DanCleanUK! "
                             "Your service is complete today. "
-                            f"Total: £{price}. "
+                            f"Total: £{price:.2f}. "
                             "Please pay via bank transfer "
                             "to Mettle - Sort Code: 04-03-33 "
                             "Account: 72515806. "
@@ -1939,7 +2694,7 @@ if "master_df" in st.session_state:
                         )
 
             # ------------------------------------------------
-            # NAVIGATION
+            # NAVIGATE
             # ------------------------------------------------
 
             with col2:
@@ -1993,6 +2748,7 @@ if "master_df" in st.session_state:
 # ============================================================
 
 st.sidebar.markdown("---")
+
 st.sidebar.title(
     "📊 Export Monthly Records"
 )
@@ -2003,12 +2759,10 @@ if (
 ):
 
     export_df = (
-        st.session_state
-        .master_df
-        .copy()
+        st.session_state.master_df.copy()
     )
 
-    # Remove depot rows.
+    # Remove depot.
     if "Status" in export_df.columns:
 
         export_df = export_df[
@@ -2018,7 +2772,7 @@ if (
             != "depot"
         ].copy()
 
-    # Remove technical columns.
+    # Remove technical fields.
     for column in [
         "latitude",
         "longitude",
@@ -2030,11 +2784,13 @@ if (
 
             export_df = (
                 export_df
-                .drop(columns=[column])
+                .drop(
+                    columns=[column]
+                )
             )
 
     # --------------------------------------------------------
-    # CREATE XLSX
+    # EXCEL
     # --------------------------------------------------------
 
     output = io.BytesIO()
@@ -2068,19 +2824,14 @@ if (
 
     for cell in worksheet[1]:
 
-        cell.fill = (
-            header_fill
-        )
-
-        cell.font = (
-            header_font
-        )
+        cell.fill = header_fill
+        cell.font = header_font
 
         cell.alignment = Alignment(
             horizontal="center"
         )
 
-    # Auto-width columns.
+    # Auto-size.
     for column_cells in worksheet.columns:
 
         max_length = 0
@@ -2094,13 +2845,13 @@ if (
 
             try:
 
-                cell_length = len(
-                    str(cell.value)
-                )
-
                 max_length = max(
                     max_length,
-                    cell_length
+                    len(
+                        str(
+                            cell.value
+                        )
+                    )
                 )
 
             except Exception:
