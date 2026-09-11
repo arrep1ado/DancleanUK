@@ -248,32 +248,16 @@ if 'master_df' in st.session_state:
                 dist_matrix = calculate_haversine_matrix(locations)
         
         if dist_matrix is not None:
-            # Separate local Grantham/nearby stops from distant out-of-town stops to prevent erratic backtracking
-            local_nodes = []
-            distant_nodes = []
-            
-            for idx in range(1, len(locations)):
-                if dist_matrix[0][idx] < 50000:  # Within ~31 miles
-                    local_nodes.append(idx)
-                else:
-                    distant_nodes.append(idx)
-            
-            current_node = 0
+            # TRUE NEAREST-NEIGHBOR CHAINING: Always pick the absolute closest next stop from current location
+            unvisited = set(range(1, len(locations)))
+            current_node = 0  
             route_indices = [0]
             
-            unvisited_local = set(local_nodes)
-            while unvisited_local:
-                next_node = min(unvisited_local, key=lambda j: dist_matrix[current_node][j])
+            while unvisited:
+                next_node = min(unvisited, key=lambda j: dist_matrix[current_node][j])
                 route_indices.append(next_node)
                 current_node = next_node
-                unvisited_local.remove(next_node)
-                
-            unvisited_distant = set(distant_nodes)
-            while unvisited_distant:
-                next_node = min(unvisited_distant, key=lambda j: dist_matrix[current_node][j])
-                route_indices.append(next_node)
-                current_node = next_node
-                unvisited_distant.remove(next_node)
+                unvisited.remove(next_node)
             
             route_indices.append(0)  
             
