@@ -124,12 +124,23 @@ def get_coords(postcode):
 
     return None, f"Postcode not found or invalid ({postcode})."
 
+# --- HELPER TO CLEAN VALUES (e.g. remove trailing .0 from Excel numbers) ---
+def clean_val(val):
+    if pd.isna(val):
+        return ""
+    s = str(val).strip()
+    if s.endswith('.0'):
+        try:
+            s = str(int(float(s)))
+        except ValueError:
+            pass
+    return s
+
 # --- ROUTING & OPTIMIZATION ---
 if 'master_df' in st.session_state:
     if st.button("Optimize Route"):
         all_postcodes = [DEPOT_POSTCODE.upper().strip()] + st.session_state.master_df['Postcode'].tolist()
         
-        # Capture any extra columns dynamically (e.g. Door No, Address, Name)
         extra_cols = [col for col in st.session_state.master_df.columns if col not in ['Postcode', 'Price', 'Phone', 'Status', 'Payment', 'latitude', 'longitude']]
         
         routing_data = []
@@ -218,14 +229,14 @@ if 'master_df' in st.session_state:
         st.write(f"### Planned Daily Take-Home Profit: £{st.session_state.route_data.get('locked_profit', 0):.2f}")
         st.write(f"### Estimated Total Distance: {st.session_state.route_data.get('initial_miles', 0):.2f} miles")
     
-    # --- HELPER FUNCTION TO BUILD MAP URL WITH DOOR/ADDRESS ---
+    # --- HELPER FUNCTION TO BUILD MAP URL WITH CLEANED DOOR/ADDRESS ---
     def get_map_destination_string(row_data):
         parts = []
         for col_name in st.session_state.master_df.columns:
             if col_name.lower() in ['door', 'door no', 'door number', 'address', 'street', 'name']:
-                val = row_data.get(col_name)
-                if pd.notna(val) and str(val).strip() != '':
-                    parts.append(str(val).strip())
+                val = clean_val(row_data.get(col_name))
+                if val != '':
+                    parts.append(val)
         parts.append(str(row_data['Postcode']))
         return ", ".join(parts)
 
@@ -255,13 +266,17 @@ if 'master_df' in st.session_state:
         phone = row.get('Phone', '')
         payment = str(row.get('Payment', 'waiting'))
         
-        # Build extra info text for display cards
+        # Build extra info text for display cards (excluding dates/times)
         extra_info_parts = []
         for col_name in st.session_state.master_df.columns:
-            if col_name not in ['Postcode', 'Price', 'Phone', 'Status', 'Payment', 'latitude', 'longitude']:
-                val = row.get(col_name)
-                if pd.notna(val) and str(val).strip() != '':
-                    extra_info_parts.append(f"**{col_name}:** {val}")
+            if col_name.lower() in ['postcode', 'price', 'phone', 'status', 'payment', 'latitude', 'longitude']:
+                continue
+            if 'date' in col_name.lower() or 'time' in col_name.lower():
+                continue  # Skip displaying date and time columns
+            
+            val = clean_val(row.get(col_name))
+            if val != '':
+                extra_info_parts.append(f"**{col_name}:** {val}")
         
         extra_text = " | ".join(extra_info_parts)
         if extra_text:
