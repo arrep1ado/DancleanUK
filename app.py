@@ -76,19 +76,22 @@ if uploaded_file and 'master_df' not in st.session_state:
         df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('.xlsx') else pd.read_csv(uploaded_file)
         df.columns = df.columns.str.strip()
         
-        # Strict cleaning to eliminate ghost/blank rows and empty postcodes/values
+        # Completely drop blank/empty rows imported from Excel trailing cells
+        df = df.dropna(how='all')
+        
+        # Strict validation: Drop rows where Postcode is missing, blank, or NaN
         df = df.dropna(subset=['Postcode'])
         df['Postcode'] = df['Postcode'].astype(str).str.upper().str.strip()
-        df = df[(df['Postcode'] != '') & (df['Postcode'] != 'NAN') & (df['Postcode'].dropna())]
+        df = df[(df['Postcode'] != '') & (df['Postcode'] != 'NAN') & (df['Postcode'] != 'NAT')]
         
-        # Ensure Price is numeric and valid (drops rows with missing or blank prices)
+        # Strict validation: Drop rows without a valid positive Price
         df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
         df = df.dropna(subset=['Price'])
         df = df[df['Price'] > 0]
         
-        # Ensure Phone exists and is valid
+        # Strict validation: Drop rows without a valid Phone number
         df['Phone'] = df['Phone'].astype(str).str.strip()
-        df = df[(df['Phone'] != '') & (df['Phone'].lower() != 'nan')]
+        df = df[(df['Phone'] != '') & (df['Phone'].lower() != 'nan') & (df['Phone'].lower() != 'nat')]
         
         df['Status'] = 'pending'
         df['Payment'] = 'waiting'
@@ -199,8 +202,11 @@ def build_geo_query(row_data, default_postcode):
             val = clean_val(row_data[col_name])
             if val != '':
                 parts.append(val)
-    pc = str(row_data.get('Postcode', default_postcode))
-    parts.append(pc)
+    pc = str(row_data.get('Postcode', '')).strip()
+    if pc and pc.upper() != 'NAN':
+        parts.append(pc)
+    else:
+        parts.append(default_postcode)
     return ", ".join(parts)
 
 # --- ROUTING & OPTIMIZATION ---
