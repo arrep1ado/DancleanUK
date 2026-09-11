@@ -1,1 +1,235 @@
+import streamlit as st
+import pandas as pd
+import io
+import math
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils.dataframe import dataframe_to_rows
 
+# --- PAGE CONFIGURATION ---
+st.set_page_config(page_title="DanCleanUK Optimizer", layout="centered")
+st.title("Daily Route & Profit Optimizer")
+
+# --- BLOCK MOBILE PULL-TO-REFRESH ---
+st.markdown(
+    """
+    <style>
+    body { overscroll-behavior-y: none; }
+    html { overscroll-behavior-y: none; }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# --- RESET LOGIC ---
+if st.sidebar.button("Start New Day / Reset"):
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
+
+# --- SIDEBAR SETTINGS ---
+st.sidebar.title("Settings")
+DEPOT_POSTCODE = st.sidebar.text_input("Depot Postcode (Grantham)", value="NG31 9RA")
+FUEL_PRICE = st.sidebar.number_input("Fuel Price (£/liter)", value=1.50, step=0.01)
+MPG = st.sidebar.number_input("Vehicle MPG", value=30.0, step=0.1)
+TAX_RATE = st.sidebar.slider("Tax Deduction (%)", 0, 50, 20) / 100
+
+# --- EXPORT LOGIC ---
+st.sidebar.markdown("---")
+st.sidebar.title("Export Monthly Records")
+if 'master_df' in st.session_state and not st.session_state.master_df.empty:
+    export_df = st.session_state.master_df.copy()
+    output = io.BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Daily Report"
+    header_fill = PatternFill(start_color="2F4F4F", end_color="2F4F4F", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    for r in dataframe_to_rows(export_df, index=False, header=True): 
+        ws.append(r)
+    for cell in ws[1]:
+        cell.fill, cell.font, cell.alignment = header_fill, header_font, Alignment(horizontal="center")
+    wb.save(output)
+    st.sidebar.download_button("Download Professional Report (XLSX)", output.getvalue(), "DanCleanUK_Records.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+else:
+    st.sidebar.info("Upload a file to begin.")
+    
+# --- FILE UPLOADER ---
+uploaded_file = st.file_uploader("Upload your Day's File (Headers: Postcode, Price, Phone)", type=["csv", "xlsx"])
+
+if uploaded_file and 'master_df' not in st.session_state:
+    try:
+        df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('.xlsx') else pd.read_csv(uploaded_file)
+        df.columns = df.columns.str.strip()
+        df = df.dropna(subset=['Postcode', 'Price', 'Phone'])
+        df['Postcode'] = df['Postcode'].astype(str).str.upper().str.strip()
+        df['Status'] = 'Pending'
+        st.session_state.master_df = df
+    except Exception as e:
+        st.error(f"Error loading file: {e}")
+
+# --- FAST OFFLINE COORDINATE MAP (ZERO NETWORK DELAYS) ---
+def get_clean_coords(postcode):
+    clean_pc = postcode.upper().strip()
+    outward = clean_pc.split()[0] if ' ' in clean_pc else clean_pc[:4]
+    
+    # Regional area mapping lookup for fast 100% reliable local coordinates
+    # Defaults center around Grantham / East Midlands baseline
+    area_coords = {
+        "NG31": (52.9141, -0.6404),
+        "NG32": (52.9333, -0.5667),
+        "NG33": (52.8167, -0.5333),
+        "NG34": (52.9833, -0.3833),
+        "PE9":  (52.6500, -0.4833),
+        "PE10": (52.7167, -0.3667),
+        "LN1":  (53.2300, -0.5400),
+        "LN2":  (53.2400, -0.5200),
+        "LN5":  (53.2100, -0.5100),
+        "LE14": (52.7833, -0.8833),
+        "LE13": (52.7667, -0.9500),
+    }
+    
+    for prefix, coords in area_coords.items():
+        if outward.startswith(prefix):
+            return coords
+            
+    # Fallback pseudo-coordinate hash generator based on string to keep relative spacing unique
+    base_lat, base_lon = 52.9141, -0.6404
+    h = abs(hash(clean_pc)) % 1000
+    return base_lat + (h % 50 - 25) * 0.005, base_lon + ((h // 50) % 50 - 25) * 0.008
+
+def calculate_local_matrix(locations):
+    n = len(locations)
+    matrix = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        lon1, lat1 = locations[i]
+        for j in range(n):
+            if i != j:
+                lon2, lat2 = locations[j]
+                dlat = math.radians(lat2 - lat1)
+                dlon = math.radians(lon2 - lon1)
+                a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+                c = 2 * math.asin(math.sqrt(a))
+                matrix[i][j] = 6371 * c * 1.3
+    return matrix
+
+def optimize_route_2opt(dist_matrix):
+    n = len(dist_matrix)
+    if n <= 3:
+        return list(range(n)) + [0]
+        
+    unvisited = set(range(1, n))
+    current_node = 0
+    route = [0]
+    while unvisited:
+        next_node = min(unvisited, key=lambda j: dist_matrix[current_node][j])
+        route.append(next_node)
+        current_node = next_node
+    route.append(0)
+    
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, n - 2):
+            for j in range(i + 1, n):
+                if j - i == 1:
+                    continue
+                node_i_minus = route[i - 1]
+                node_i = route[i]
+                node_j_minus = route[j - 1]
+                node_j = route[j % n]
+                
+                old_distance = dist_matrix[node_i_minus][node_i] + dist_matrix[node_j_minus][node_j]
+                new_distance = dist_matrix[node_i_minus][node_j_minus] + dist_matrix[node_i][node_j]
+                
+                if new_distance < old_distance:
+                    route[i:j] = route[i:j-1][::-1]
+                    improved = True
+    return route
+
+# --- MAIN INTERFACE ---
+if 'master_df' in st.session_state and not st.session_state.master_df.empty:
+    if st.button("Optimize Route"):
+        with st.spinner("Optimizing route instantly..."):
+            all_postcodes = [DEPOT_POSTCODE.upper().strip()] + st.session_state.master_df['Postcode'].tolist()
+            prices = [0.0] + st.session_state.master_df['Price'].tolist()
+            phones = [''] + st.session_state.master_df['Phone'].tolist()
+            
+            routing_data = []
+            for pc, pr, ph in zip(all_postcodes, prices, phones):
+                lat, lon = get_clean_coords(pc)
+                routing_data.append({'Postcode': pc, 'Price': pr, 'Phone': ph, 'latitude': lat, 'longitude': lon})
+                
+            df_routing = pd.DataFrame(routing_data)
+            locations = [[float(row['longitude']), float(row['latitude'])] for _, row in df_routing.iterrows()]
+            
+            dist_matrix = calculate_local_matrix(locations)
+            route_indices = optimize_route_2opt(dist_matrix)
+            total_km = sum(dist_matrix[route_indices[k]][route_indices[k+1]] for k in range(len(route_indices)-1))
+            
+            df_resolved = df_routing.iloc[route_indices].reset_index(drop=True)
+            active_jobs = df_resolved[df_resolved.index > 0].iloc[:-1].copy()
+            return_depot = df_resolved.iloc[[-1]].copy()
+            
+            new_master = pd.concat([active_jobs, return_depot]).reset_index(drop=True)
+            new_master['Status'] = 'Pending'
+            
+            st.session_state.master_df = new_master
+            
+            total_miles = total_km * 0.621371
+            total_fuel_cost = ((total_miles / MPG) * 4.54609) * FUEL_PRICE
+            locked_profit = (st.session_state.master_df['Price'].sum() - total_fuel_cost) * (1 - TAX_RATE)
+            st.session_state.route_data = {"initial_miles": total_miles, "locked_profit": locked_profit}
+
+    # --- DASHBOARD METRICS ---
+    if 'route_data' in st.session_state:
+        st.metric("Planned Daily Take-Home Profit", f"£{st.session_state.route_data.get('locked_profit', 0):.2f}")
+        st.metric("Estimated Total Distance", f"{st.session_state.route_data.get('initial_miles', 0):.2f} miles")
+    
+    # --- SIDEBAR NAVIGATION ---
+    st.sidebar.markdown("---")
+    st.sidebar.title("Route Navigation")
+    pending_df = st.session_state.master_df[st.session_state.master_df['Status'] == 'Pending']
+    
+    if not pending_df.empty:
+        next_stop = str(pending_df.iloc[0]['Postcode'])
+        gmaps_url = f"https://www.google.com/maps/dir/?api=1&destination={next_stop}&travelmode=driving"
+        st.sidebar.link_button("🚗 Navigate to Next Stop", gmaps_url)
+        st.sidebar.caption(f"Next: {next_stop} ({len(pending_df)} stops remaining)")
+    else:
+        st.sidebar.success("All stops completed!")
+
+    # --- LIGHTWEIGHT DATA EDITOR ---
+    st.markdown("### Daily Stops List")
+    st.caption("Edit the 'Status' column to 'Completed' directly in the table below.")
+    
+    edited_df = st.data_editor(
+        st.session_state.master_df[['Postcode', 'Price', 'Phone', 'Status']],
+        column_config={
+            "Status": st.column_config.SelectboxColumn(
+                "Status",
+                options=["Pending", "Completed"],
+                required=True
+            )
+        },
+        use_container_width=True,
+        hide_index=True,
+        key="stop_editor"
+    )
+    
+    if not edited_df.equals(st.session_state.master_df[['Postcode', 'Price', 'Phone', 'Status']]):
+        st.session_state.master_df['Status'] = edited_df['Status']
+        
+    completed_jobs = st.session_state.master_df[st.session_state.master_df['Status'] == 'Completed']
+    if not completed_jobs.empty:
+        st.markdown("### Quick Actions (Completed Stops)")
+        for _, row in completed_jobs.iterrows():
+            pc = row['Postcode']
+            price = row['Price']
+            phone = row['Phone']
+            if price > 0 and phone:
+                msg = f"Hi from DanCleanUK! Your service is complete today. Total: £{price}. Please pay via bank transfer to Mettle - Sort Code: 04-03-33 | Account: 72515806. Thank you!"
+                wa_url = f"https://wa.me/{phone}?text={msg.replace(' ', '%20')}"
+                st.link_button(f"💬 Send WhatsApp to {pc} (£{price})", wa_url)
+else:
+    st.info("Upload your day's file to begin.")
