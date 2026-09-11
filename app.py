@@ -200,10 +200,15 @@ if 'master_df' in st.session_state:
         st.write(f"### Planned Daily Take-Home Profit: £{st.session_state.route_data.get('locked_profit', 0):.2f}")
         st.write(f"### Estimated Total Distance: {st.session_state.route_data.get('initial_miles', 0):.2f} miles")
     
-    # --- OPTIMIZED SIDEBAR NAVIGATION (NEXT STOP) ---
+    # --- OPTIMIZED SIDEBAR NAVIGATION (NEXT STOP EXCLUDING DEPOT) ---
     st.sidebar.markdown("---")
     st.sidebar.title("Route Navigation")
-    pending_df = st.session_state.master_df[st.session_state.master_df['Status'].str.lower() == 'pending']
+    
+    # Filter pending stops, but explicitly skip any row where Status is 'depot'
+    pending_df = st.session_state.master_df[
+        (st.session_state.master_df['Status'].str.lower() == 'pending') & 
+        (st.session_state.master_df['Status'].str.lower() != 'depot')
+    ]
     
     if not pending_df.empty:
         next_stop = str(pending_df.iloc[0]['Postcode'])
@@ -211,7 +216,7 @@ if 'master_df' in st.session_state:
         st.sidebar.link_button("🚗 Navigate to Next Stop", gmaps_url)
         st.sidebar.caption(f"Next in sequence: {next_stop} ({len(pending_df)} stops remaining)")
     else:
-        st.sidebar.success("All stops completed for today!")
+        st.sidebar.success("All customer stops completed for today!")
 
     # --- MAIN DISPLAY & ADDRESS CARDS WITH EMBEDDED NAVIGATION ---
     for idx, row in st.session_state.master_df.iterrows():
@@ -251,7 +256,7 @@ if 'master_df' in st.session_state:
                         st.success("Completed")
                         if phone:
                             msg = f"Hi from DanCleanUK! Your service is complete today. Total: £{price}. Please pay via bank transfer to Mettle - Sort Code: 04-03-33 | Account: 72515806. Thank you!"
-                            wa_url = f"https://wa.me/{phone}?text={msg.replace(' ', '%20')}"
+                            wa_url = f"https://wa.me/{phone}?text={msg.replace('','%20')}"
                             st.link_button("Send WhatsApp", wa_url, key=f"wa_{idx}")
                     
                     if payment.lower() == 'waiting':
