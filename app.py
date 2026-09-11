@@ -79,23 +79,33 @@ if uploaded_file and 'master_df' not in st.session_state:
         # Completely drop blank/empty rows imported from Excel trailing cells
         df = df.dropna(how='all')
         
-        # Strict validation: Drop rows where Postcode is missing, blank, or NaN
-        df = df.dropna(subset=['Postcode'])
-        df['Postcode'] = df['Postcode'].astype(str).str.upper().str.strip()
-        df = df[(df['Postcode'] != '') & (df['Postcode'] != 'NAN') & (df['Postcode'] != 'NAT')]
-        
-        # Strict validation: Drop rows without a valid positive Price
+        # Ensure mandatory columns exist
+        for col in ['Postcode', 'Price', 'Phone']:
+            if col not in df.columns:
+                st.error(f"Missing mandatory column in uploaded file: '{col}'")
+                st.stop()
+
+        # Clean columns and coerce types safely
+        df['Postcode'] = df['Postcode'].fillna('').astype(str).str.upper().str.strip()
         df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
-        df = df.dropna(subset=['Price'])
-        df = df[df['Price'] > 0]
+        df['Phone'] = df['Phone'].fillna('').astype(str).str.strip()
         
-        # Strict validation: Drop rows without a valid Phone number
-        df['Phone'] = df['Phone'].astype(str).str.strip()
-        df = df[(df['Phone'] != '') & (df['Phone'].lower() != 'nan') & (df['Phone'].lower() != 'nat')]
+        # STRICT FILTER: Drop any row missing Postcode, Price, or Phone, or containing dummy/blank values
+        valid_mask = (
+            (df['Postcode'] != '') & 
+            (df['Postcode'] != 'NAN') & 
+            (df['Postcode'] != 'NAT') & 
+            (df['Price'].notna()) & 
+            (df['Price'] > 0) & 
+            (df['Phone'] != '') & 
+            (df['Phone'].str.lower() != 'nan') & 
+            (df['Phone'].str.lower() != 'nat')
+        )
+        df = df[valid_mask].reset_index(drop=True)
         
         df['Status'] = 'pending'
         df['Payment'] = 'waiting'
-        st.session_state.master_df = df.reset_index(drop=True)
+        st.session_state.master_df = df
         st.rerun()
     except Exception as e:
         st.error(f"Error loading file: {e}")
@@ -195,7 +205,7 @@ def optimize_route_2opt(route_indices, dist_matrix):
                     improved = True
     return best_route
 
-def build_geo_query(row_data, default_postcode):
+def build_geo_query(row_data):
     parts = []
     for col_name in row_data.index:
         if col_name.lower() in ['address', 'street', 'location', 'name', 'house']:
@@ -203,17 +213,15 @@ def build_geo_query(row_data, default_postcode):
             if val != '':
                 parts.append(val)
     pc = str(row_data.get('Postcode', '')).strip()
-    if pc and pc.upper() != 'NAN':
+    if pc and pc.upper() not in ['', 'NAN', 'NAT']:
         parts.append(pc)
-    else:
-        parts.append(default_postcode)
     return ", ".join(parts)
 
 # --- ROUTING & OPTIMIZATION ---
 if 'master_df' in st.session_state:
     if st.button("Optimize Route"):
         depot_query = DEPOT_FULL_ADDRESS
-        row_queries = [build_geo_query(row, DEPOT_POSTCODE) for _, row in st.session_state.master_df.iterrows()]
+        row_queries = [build_geo_query(row) for _, row in st.session_state.master_df.iterrows()]
         all_queries = [depot_query] + row_queries
         
         all_postcodes = [DEPOT_POSTCODE.upper().strip()] + st.session_state.master_df['Postcode'].tolist()
