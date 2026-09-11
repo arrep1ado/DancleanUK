@@ -248,7 +248,6 @@ if 'master_df' in st.session_state:
                 dist_matrix = calculate_haversine_matrix(locations)
         
         if dist_matrix is not None:
-            # Clean standard nearest-neighbor starting from depot
             unvisited = set(range(1, len(locations)))
             current_node = 0  
             route_indices = [0]
@@ -261,7 +260,7 @@ if 'master_df' in st.session_state:
             
             route_indices.append(0)  
             
-            # Polish out crossings
+            # Polish route using 2-opt
             route_indices = optimize_route_2opt(route_indices, dist_matrix)
             
             total_meters = sum(dist_matrix[route_indices[k]][route_indices[k+1]] for k in range(len(route_indices) - 1))
@@ -337,6 +336,22 @@ if 'master_df' in st.session_state:
         phone = row.get('Phone', '')
         payment = str(row.get('Payment', 'waiting'))
         
+        is_start_depot = (idx == 0)
+        is_return_depot = (idx == len(st.session_state.master_df) - 1)
+        
+        if is_start_depot:
+            with st.container(border=True):
+                st.write(f"**📍 Start Depot:** {DEPOT_FULL_ADDRESS}")
+            continue
+        elif is_return_depot:
+            dest_string = get_map_destination_string(row, is_depot=True)
+            map_url = f"https://www.google.com/maps/dir/?api=1&destination={dest_string}&travelmode=driving"
+            with st.container(border=True):
+                st.write(f"**🏁 Return to Depot:** {DEPOT_FULL_ADDRESS}")
+                st.link_button("🚗 Navigate Here", map_url, key=f"nav_{idx}")
+            continue
+
+        # Regular Customer Stops Only Below
         extra_info_parts = []
         for col_name in st.session_state.master_df.columns:
             if col_name.lower() in ['postcode', 'price', 'phone', 'status', 'payment', 'latitude', 'longitude', 'geo_query']:
@@ -352,53 +367,41 @@ if 'master_df' in st.session_state:
         if extra_text:
             extra_text = f" | {extra_text}"
         
-        is_start_depot = (idx == 0)
-        is_return_depot = (idx == len(st.session_state.master_df) - 1)
-        
-        is_depot_row = is_start_depot or is_return_depot
-        dest_string = get_map_destination_string(row, is_depot=is_depot_row)
+        dest_string = get_map_destination_string(row, is_depot=False)
         map_url = f"https://www.google.com/maps/dir/?api=1&destination={dest_string}&travelmode=driving"
 
-        if is_start_depot:
-            with st.container(border=True):
-                st.write(f"**📍 Start Depot:** {DEPOT_FULL_ADDRESS}")
-        elif is_return_depot:
-            with st.container(border=True):
-                st.write(f"**🏁 Return to Depot:** {DEPOT_FULL_ADDRESS}")
-                st.link_button("🚗 Navigate Here", map_url, key=f"nav_{idx}")
-        else:
-            status_icon = "✅" if status.lower() == 'completed' else "⏳"
-            status_text = "Completed" if status.lower() == 'completed' else "Pending"
-            payment_display = f" | **Payment:** {payment}"
+        status_icon = "✅" if status.lower() == 'completed' else "⏳"
+        status_text = "Completed" if status.lower() == 'completed' else "Pending"
+        payment_display = f" | **Payment:** {payment}"
+        
+        with st.container(border=True):
+            st.write(f"**{status_icon} Postcode: {postcode}**{extra_text} | **Price:** £{price} | **Status:** {status_text}{payment_display}")
             
-            with st.container(border=True):
-                st.write(f"**{status_icon} Postcode: {postcode}**{extra_text} | **Price:** £{price} | **Status:** {status_text}{payment_display}")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if status.lower() == 'pending':
+                    if st.button("Mark Complete", key=f"complete_{idx}"):
+                        st.session_state.master_df.at[idx, 'Status'] = 'completed'
+                        st.rerun()
+                else:
+                    st.success("Completed")
+                    if phone:
+                        msg = f"Hi from DanCleanUK! Your service is complete today. Total: £{price}. Please pay via bank transfer to Mettle - Sort Code: 04-03-33 | Account: 72515806. Thank you!"
+                        wa_url = f"https://wa.me/{phone}?text={msg.replace(' ', '%20')}"
+                        st.link_button("Send WhatsApp", wa_url, key=f"wa_{idx}")
                 
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    if status.lower() == 'pending':
-                        if st.button("Mark Complete", key=f"complete_{idx}"):
-                            st.session_state.master_df.at[idx, 'Status'] = 'completed'
-                            st.rerun()
-                    else:
-                        st.success("Completed")
-                        if phone:
-                            msg = f"Hi from DanCleanUK! Your service is complete today. Total: £{price}. Please pay via bank transfer to Mettle - Sort Code: 04-03-33 | Account: 72515806. Thank you!"
-                            wa_url = f"https://wa.me/{phone}?text={msg.replace(' ', '%20')}"
-                            st.link_button("Send WhatsApp", wa_url, key=f"wa_{idx}")
+                c_col1, c_col2 = st.columns(2)
+                with c_col1:
+                    if st.button("💵 Cash Paid", key=f"cash_{idx}"):
+                        st.session_state.master_df.at[idx, 'Payment'] = 'Cash'
+                        st.rerun()
+                with c_col2:
+                    if st.button("❌ Not Paid", key=f"not_paid_{idx}"):
+                        st.session_state.master_df.at[idx, 'Payment'] = 'Not Paid'
+                        st.rerun()
                     
-                    c_col1, c_col2 = st.columns(2)
-                    with c_col1:
-                        if st.button("💵 Cash Paid", key=f"cash_{idx}"):
-                            st.session_state.master_df.at[idx, 'Payment'] = 'Cash'
-                            st.rerun()
-                    with c_col2:
-                        if st.button("❌ Not Paid", key=f"not_paid_{idx}"):
-                            st.session_state.master_df.at[idx, 'Payment'] = 'Not Paid'
-                            st.rerun()
-                        
-                with col2:
-                    st.link_button("🚗 Navigate Here", map_url, key=f"nav_{idx}")
+            with col2:
+                st.link_button("🚗 Navigate Here", map_url, key=f"nav_{idx}")
 else:
     st.info("Upload your day's file to begin.")
