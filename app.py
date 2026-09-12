@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "15.0"
+APP_VERSION = "16.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -521,7 +521,7 @@ def get_coords(query_string, postcode):
     # --------------------------------------------------------
     headers = {
         "User-Agent":
-            "DanCleanUKRouteOptimizer/14.0"
+            "DanCleanUKRouteOptimizer/16.0"
     }
 
     if query:
@@ -743,22 +743,18 @@ def route_score(
         zone_penalty = calculate_zone_penalty(route, locations)
 
     shape_penalty = 0.0
+    backtrack_penalty = 0.0
     if locations is not None:
         shape_penalty = calculate_shape_penalty(route, locations)
-
-    zone_transition_penalty = 0.0
-    if locations is not None:
-        zone_transition_penalty = calculate_zone_transition_penalty(
-            route, locations
-        )
+        backtrack_penalty = calculate_geographic_backtracking_penalty(route, locations)
 
     return (
         driving_minutes * TIME_PRIORITY
         + driving_miles * DISTANCE_PRIORITY
         + continuity * CLUSTER_PRIORITY * 8.0
-        + zone_penalty * CLUSTER_PRIORITY * 2.5
-        + zone_transition_penalty * CLUSTER_PRIORITY * 18.0
-        + shape_penalty * CLUSTER_PRIORITY * 0.75
+        + zone_penalty * CLUSTER_PRIORITY * 0.70
+        + shape_penalty * CLUSTER_PRIORITY * 0.55
+        + backtrack_penalty * CLUSTER_PRIORITY * 1.15
     )
 
 
@@ -814,52 +810,6 @@ def calculate_continuity_penalty(route, distances):
     return penalty
 
 
-def calculate_zone_transition_penalty(route, locations):
-    """Strongly discourage leaving an area and later coming back to it.
-
-    V14 still allowed local-search moves to destroy an otherwise good
-    geographical sweep.  This penalty makes zone re-entry expensive enough
-    that a route normally clears a zone before moving on.
-    """
-    if len(route) < 4:
-        return 0.0
-
-    labels = geographic_zone_labels(location_cache_key(locations))
-    if not labels:
-        return 0.0
-
-    def zone(customer):
-        return labels[customer - 1]
-
-    sequence = [zone(customer) for customer in route[1:-1]]
-    if not sequence:
-        return 0.0
-
-    compressed = []
-    for zone_id in sequence:
-        if not compressed or compressed[-1] != zone_id:
-            compressed.append(zone_id)
-
-    penalty = 0.0
-
-    # Every re-entry means the same geographical area has been split into
-    # separate visits.  Make this very expensive.
-    seen = set()
-    for zone_id in compressed:
-        if zone_id in seen:
-            penalty += 12.0
-        seen.add(zone_id)
-
-    # Also penalise leaving a zone while customers in that same zone remain.
-    for pos in range(len(sequence) - 1):
-        if sequence[pos] != sequence[pos + 1]:
-            current_zone = sequence[pos]
-            if current_zone in sequence[pos + 1:]:
-                penalty += 8.0
-
-    return penalty
-
-
 def calculate_shape_penalty(route, locations):
     """
     Small geometric penalty for routes that repeatedly reverse direction.
@@ -894,6 +844,94 @@ def calculate_shape_penalty(route, locations):
         delta = min(delta, 360.0 - delta)
         if delta > 115:
             penalty += (delta - 115) / 45.0
+
+    return penalty
+
+
+def calculate_geographic_backtracking_penalty(route, locations):
+    """Apply a moderate penalty when the route moves back toward the depot
+    while useful work remains farther out in the same general direction.
+
+    This is intentionally softer than the old zone-transition logic. It uses
+    actual coordinates rather than postcode groups, so a road layout can still
+    justify a turn without the optimiser being forced into a rigid zone order.
+    """
+    if len(route) < 5:
+        return 0.0
+
+    depot = locations[0]
+
+    def bearing_from_depot(index):
+        lon, lat = locations[index]
+        dlon = (lon - depot[0]) * math.cos(math.radians(depot[1]))
+        dlat = lat - depot[1]
+        return (math.degrees(math.atan2(dlon, dlat)) + 360.0) % 360.0
+
+    def radius_from_depot(index):
+        return haversine_points(depot, locations[index])
+
+    penalty = 0.0
+
+    for pos in range(1, len(route) - 1):
+        current = route[pos]
+        nxt = route[pos + 1]
+        current_radius = radius_from_depot(current)
+        next_radius = radius_from_depot(nxt)
+
+        # Only consider a meaningful move back toward the depot.
+        radial_backtrack = current_radius - next_radius
+        if radial_backtrack < 1.5:
+            continue
+
+        current_bearing = bearing_from_depot(current)
+        next_bearing = bearing_from_depot(nxt)
+
+        # Is there still unvisited work farther out in roughly the same
+        # direction? If so, returning inward is more likely to be genuine
+        # route backtracking rather than a necessary local road turn.
+        remaining = route[pos + 1:-1]
+        for other in remaining:
+            if other == nxt:
+                continue
+            other_radius = radius_from_depot(other)
+            if other_radius <= current_radius + 2.0:
+                continue
+
+            other_bearing = bearing_from_depot(other)
+            delta = abs(other_bearing - next_bearing)
+            delta = min(delta, 360.0 - delta)
+
+            if delta <= 55.0:
+                # Scale gently: the optimiser should prefer progress, but
+                # real road time/distance still dominate.
+                penalty += min(radial_backtrack, 8.0) * 0.55
+                break
+
+        # Penalise a sharp reversal between consecutive legs, but only when
+        # it is also accompanied by radial backtracking.
+        if pos >= 2:
+            previous = route[pos - 1]
+            a = locations[previous]
+            b = locations[current]
+            c = locations[nxt]
+
+            def leg_bearing(p1, p2):
+                lon1, lat1 = p1
+                lon2, lat2 = p2
+                y = math.sin(math.radians(lon2 - lon1)) * math.cos(math.radians(lat2))
+                x = (
+                    math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
+                    - math.sin(math.radians(lat1)) * math.cos(math.radians(lat2))
+                    * math.cos(math.radians(lon2 - lon1))
+                )
+                return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+            first = leg_bearing(a, b)
+            second = leg_bearing(b, c)
+            turn = abs(second - first)
+            turn = min(turn, 360.0 - turn)
+            if turn > 120.0 and radial_backtrack > 2.0:
+                penalty += (turn - 120.0) / 35.0
 
     return penalty
 
@@ -1078,52 +1116,6 @@ def geographic_zone_routes(locations):
                         math.degrees(
                             math.atan2(
                                 (locations[i][0] - c_lon) * math.cos(math.radians(c_lat)),
-                                locations[i][1] - c_lat,
-                            )
-                        ) + 360.0
-                    ) % 360.0
-                )
-                sequence.extend(members)
-            routes.append([0] + sequence + [0])
-            routes.append([0] + list(reversed(sequence)) + [0])
-
-    # V15: add true geographic sweep orders.  These order zones by their
-    # bearing from the depot instead of repeatedly hopping to the nearest
-    # centroid.  Both directions are tested, with the zone nearest the depot
-    # allowed to lead the route.
-    def depot_bearing(point):
-        lon1, lat1 = depot
-        lon2, lat2 = point
-        y = math.sin(math.radians(lon2 - lon1)) * math.cos(math.radians(lat2))
-        x = (
-            math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
-            - math.sin(math.radians(lat1))
-            * math.cos(math.radians(lat2))
-            * math.cos(math.radians(lon2 - lon1))
-        )
-        return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
-
-    angular_zones = sorted(zone_ids, key=lambda z: depot_bearing(centroids[z]))
-    if angular_zones:
-        nearest_zone = min(
-            zone_ids,
-            key=lambda z: haversine_points(depot, centroids[z])
-        )
-        remaining = [z for z in angular_zones if z != nearest_zone]
-        for ordered_zones in (
-            [nearest_zone] + remaining,
-            [nearest_zone] + list(reversed(remaining)),
-        ):
-            sequence = []
-            for zone_id in ordered_zones:
-                members = zones[zone_id][:]
-                c_lon, c_lat = centroids[zone_id]
-                members.sort(
-                    key=lambda i: (
-                        math.degrees(
-                            math.atan2(
-                                (locations[i][0] - c_lon)
-                                * math.cos(math.radians(c_lat)),
                                 locations[i][1] - c_lat,
                             )
                         ) + 360.0
