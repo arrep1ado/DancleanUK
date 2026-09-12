@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "16.0"
+APP_VERSION = "17.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -751,8 +751,8 @@ def route_score(
     return (
         driving_minutes * TIME_PRIORITY
         + driving_miles * DISTANCE_PRIORITY
-        + continuity * CLUSTER_PRIORITY * 8.0
-        + zone_penalty * CLUSTER_PRIORITY * 0.70
+        + continuity * CLUSTER_PRIORITY * 8.5
+        + zone_penalty * CLUSTER_PRIORITY * 1.20
         + shape_penalty * CLUSTER_PRIORITY * 0.55
         + backtrack_penalty * CLUSTER_PRIORITY * 1.15
     )
