@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "17.0"
+APP_VERSION = "18.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -751,10 +751,10 @@ def route_score(
     return (
         driving_minutes * TIME_PRIORITY
         + driving_miles * DISTANCE_PRIORITY
-        + continuity * CLUSTER_PRIORITY * 8.5
-        + zone_penalty * CLUSTER_PRIORITY * 1.20
+        + continuity * CLUSTER_PRIORITY * 8.0
+        + zone_penalty * CLUSTER_PRIORITY * 0.70
         + shape_penalty * CLUSTER_PRIORITY * 0.55
-        + backtrack_penalty * CLUSTER_PRIORITY * 1.15
+        + backtrack_penalty * CLUSTER_PRIORITY * 1.00
     )
 
 
@@ -1240,6 +1240,126 @@ def angular_sweep_routes(locations):
     return routes
 
 
+def directional_sector_routes(locations, distances=None, durations=None):
+    """
+    Build routes as a real geographical sweep around the depot.
+
+    Instead of asking k-means to decide what a "zone" is, this uses the
+    actual bearing of every customer from the depot.  Customers are divided
+    into contiguous angular sectors, then those sectors are cleared in one
+    direction without deliberately jumping back to an earlier sector.
+
+    Road distance/time is used inside each sector when matrices are available,
+    so this is a geographical sweep guided by the road network rather than a
+    simple postcode sort.
+    """
+    customer_count = len(locations) - 1
+    if customer_count < 2:
+        return []
+
+    depot_lon, depot_lat = locations[0]
+    customers = list(range(1, customer_count + 1))
+
+    def bearing_radius(index):
+        lon, lat = locations[index]
+        dlon = (lon - depot_lon) * math.cos(math.radians(depot_lat))
+        dlat = lat - depot_lat
+        bearing = (math.degrees(math.atan2(dlon, dlat)) + 360.0) % 360.0
+        radius = math.hypot(dlon, dlat)
+        return bearing, radius
+
+    info = {i: bearing_radius(i) for i in customers}
+    ordered = sorted(customers, key=lambda i: (info[i][0], info[i][1]))
+    routes = []
+
+    # Four to six sectors works well for normal daily lists.  The sectors are
+    # balanced by number of jobs, which avoids one huge sector and many tiny
+    # ones when the jobs are unevenly distributed.
+    for sector_count in (4, 5, 6):
+        if customer_count < sector_count:
+            continue
+
+        base_size = customer_count // sector_count
+        remainder = customer_count % sector_count
+        sectors = []
+        pos = 0
+        for sector_id in range(sector_count):
+            size = base_size + (1 if sector_id < remainder else 0)
+            sectors.append(ordered[pos:pos + size])
+            pos += size
+
+        for direction in (1, -1):
+            sector_order = list(range(sector_count))
+            if direction == -1:
+                sector_order.reverse()
+
+            # Try every angular cut. This matters because the depot is not
+            # necessarily at the edge of the working area.
+            for cut in range(sector_count):
+                rotated = sector_order[cut:] + sector_order[:cut]
+                sequence = []
+                previous = 0
+
+                for sector_id in rotated:
+                    members = sectors[sector_id][:]
+                    if not members:
+                        continue
+
+                    # Primary order is angular.  For the second direction we
+                    # reverse it. This keeps the route moving through the
+                    # sector instead of zig-zagging across it.
+                    members.sort(key=lambda i: (info[i][0], info[i][1]),
+                                 reverse=(direction == -1))
+
+                    # Road-aware orientation: compare the cost of entering the
+                    # sector at either end and keep the cheaper end first.
+                    if distances is not None and len(members) > 1:
+                        forward_cost = distances[previous][members[0]]
+                        reverse_cost = distances[previous][members[-1]]
+                        if reverse_cost < forward_cost:
+                            members.reverse()
+
+                    sequence.extend(members)
+                    previous = members[-1]
+
+                if sequence:
+                    routes.append([0] + sequence + [0])
+                    routes.append([0] + list(reversed(sequence)) + [0])
+
+    # Also create a finer sweep by assigning jobs to angular bins from the
+    # actual bearing range. This catches cases where one balanced sector cuts
+    # through a natural road/settlement boundary.
+    for sector_count in (5, 6):
+        width = 360.0 / sector_count
+        for offset in (0.0, width / 2.0):
+            bins = [[] for _ in range(sector_count)]
+            for customer in customers:
+                angle = (info[customer][0] - offset) % 360.0
+                bucket = min(sector_count - 1, int(angle / width))
+                bins[bucket].append(customer)
+
+            for direction in (1, -1):
+                ids = list(range(sector_count))
+                if direction == -1:
+                    ids.reverse()
+                sequence = []
+                previous = 0
+                for bucket in ids:
+                    members = bins[bucket][:]
+                    members.sort(key=lambda i: (info[i][0], info[i][1]),
+                                 reverse=(direction == -1))
+                    if distances is not None and len(members) > 1:
+                        if distances[previous][members[-1]] < distances[previous][members[0]]:
+                            members.reverse()
+                    sequence.extend(members)
+                    if members:
+                        previous = members[-1]
+                if sequence:
+                    routes.append([0] + sequence + [0])
+
+    return routes
+
+
 def cheapest_insertion_route(
     distances,
     durations,
@@ -1421,6 +1541,11 @@ def generate_candidate_routes(distances, durations, locations=None):
     # 1. Dynamic geographic-zone routes. These are the backbone of v14:
     # clear one natural area before moving to the next.
     if locations is not None:
+        # The main geographical candidates are now true directional sweeps.
+        # Keep the older zone/angular candidates as fallbacks so a sweep is
+        # never forced when the road network makes another shape genuinely
+        # shorter.
+        candidates.extend(directional_sector_routes(locations, distances, durations))
         candidates.extend(geographic_zone_routes(locations))
         candidates.extend(angular_sweep_routes(locations))
 
