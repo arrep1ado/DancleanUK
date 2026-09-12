@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "18.0"
+APP_VERSION = "19.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -521,7 +521,7 @@ def get_coords(query_string, postcode):
     # --------------------------------------------------------
     headers = {
         "User-Agent":
-            "DanCleanUKRouteOptimizer/16.0"
+            "DanCleanUKRouteOptimizer/19.0"
     }
 
     if query:
@@ -1591,7 +1591,27 @@ def improve_route(
     fuel_price,
     mpg,
     locations=None,
+    preserve_structure=False,
 ):
+    """
+    Improve a route without destroying its geographical structure.
+
+    V19 deliberately treats a geographical sweep as a route structure, not
+    merely another score penalty.  Ordinary routes may use the full local
+    search. Sweep routes only receive safe local improvements, because an
+    unrestricted relocate/swap can undo the whole sweep and send the van back
+    into an area that was already cleared.
+    """
+    if preserve_structure:
+        return improve_sweep_route(
+            route,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+            locations,
+        )
+
     improved = two_opt(
         route, distances, durations, fuel_price, mpg, locations
     )
@@ -1607,6 +1627,66 @@ def improve_route(
     return improved
 
 
+def improve_sweep_route(
+    route,
+    distances,
+    durations,
+    fuel_price,
+    mpg,
+    locations,
+):
+    """
+    Safely improve a sweep route while preserving its geographical direction.
+
+    We do not perform unrestricted relocate/swap operations here.  Instead we
+    use adjacent swaps and short reversals only when they improve the route.
+    This keeps the broad order of geographical areas intact while allowing
+    the live road matrix to tidy up the order inside those areas.
+    """
+    if not route or locations is None or len(route) < 5:
+        return route[:]
+
+    best = route[:]
+    best_score = route_score(
+        best, distances, durations, fuel_price, mpg, locations
+    )
+
+    # A sweep should remain a sweep.  Only make local changes which involve
+    # neighbouring stops.  This can remove a bad local zig-zag without moving
+    # a customer across the entire route.
+    for _ in range(3):
+        changed = False
+
+        # Adjacent swaps.
+        for i in range(1, len(best) - 2):
+            candidate = best[:]
+            candidate[i], candidate[i + 1] = candidate[i + 1], candidate[i]
+            candidate_score = route_score(
+                candidate, distances, durations, fuel_price, mpg, locations
+            )
+            if candidate_score < best_score - 0.01:
+                best = candidate
+                best_score = candidate_score
+                changed = True
+
+        # Very short 2-stop reversals only.  Never reverse a large section.
+        for i in range(1, len(best) - 3):
+            candidate = best[:]
+            candidate[i:i + 2] = reversed(candidate[i:i + 2])
+            candidate_score = route_score(
+                candidate, distances, durations, fuel_price, mpg, locations
+            )
+            if candidate_score < best_score - 0.01:
+                best = candidate
+                best_score = candidate_score
+                changed = True
+
+        if not changed:
+            break
+
+    return best
+
+
 def optimise_route(
     distances,
     durations,
@@ -1614,25 +1694,54 @@ def optimise_route(
     mpg,
     locations=None,
 ):
-    candidates = generate_candidate_routes(distances, durations, locations)
+    """
+    V19 route optimiser.
 
-    best_route = None
-    best_score = float("inf")
+    The key change is structural:
 
-    # First keep the strongest raw candidates, then run expensive local search
-    # on them. This makes 30-40 stop routes much more practical while still
-    # exploring several very different route shapes.
-    scored_candidates = []
-    for candidate in candidates:
-        score = route_score(
-            candidate, distances, durations, fuel_price, mpg, locations
+    1. Build genuine directional sweep candidates.
+    2. Keep those candidates as protected sweep routes.
+    3. Improve sweep candidates only locally so their geographical order is
+       not destroyed.
+    4. Keep unrestricted routes as fallbacks for cases where the sweep would
+       genuinely be much worse on the road network.
+    5. Prefer a sweep when its road cost is reasonably close to the best
+       unrestricted route.  A slightly longer route that clears areas once is
+       often much more useful for a working day than a theoretically shorter
+       route that repeatedly returns to the same town.
+    """
+    customer_count = len(distances) - 1
+    if customer_count <= 0:
+        return [0, 0]
+
+    # Build the two families separately so we know which routes are protected.
+    sweep_candidates = []
+    fallback_candidates = []
+
+    if locations is not None:
+        sweep_candidates.extend(
+            directional_sector_routes(locations, distances, durations)
         )
-        scored_candidates.append((score, candidate))
 
-    scored_candidates.sort(key=lambda x: x[0])
-    limit = min(28, len(scored_candidates))
+    # Keep the older geographic candidates as additional structured fallbacks.
+    if locations is not None:
+        sweep_candidates.extend(geographic_zone_routes(locations))
+        sweep_candidates.extend(angular_sweep_routes(locations))
 
-    for _, candidate in scored_candidates[:limit]:
+    # Remove duplicate sweep routes.
+    unique_sweeps = []
+    seen = set()
+    for candidate in sweep_candidates:
+        key = tuple(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique_sweeps.append(candidate)
+
+    # Score all sweep routes before local improvement. This prevents an ugly
+    # unrestricted optimiser move from winning simply because it shaved a few
+    # minutes off the drive.
+    sweep_results = []
+    for candidate in unique_sweeps:
         improved = improve_route(
             candidate,
             distances,
@@ -1640,17 +1749,121 @@ def optimise_route(
             fuel_price,
             mpg,
             locations,
+            preserve_structure=True,
         )
-
         score = route_score(
             improved, distances, durations, fuel_price, mpg, locations
         )
+        metrics = route_metrics(
+            improved, distances, durations, fuel_price, mpg
+        )
+        sweep_results.append((score, metrics["time_s"], metrics["distance_m"], improved))
 
-        if score < best_score:
-            best_score = score
-            best_route = improved
+    sweep_results.sort(key=lambda item: item[0])
 
-    return best_route
+    # Generate the normal unrestricted candidates as a fallback family.
+    starts = list(range(1, customer_count + 1))
+    starts.sort(key=lambda x: durations[0][x])
+
+    if customer_count > 40:
+        selected = starts[:10]
+        selected += starts[-10:]
+        selected += starts[:: max(1, customer_count // 10)]
+        starts = list(dict.fromkeys(selected))
+
+    for first_customer in starts:
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "time")
+        )
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "balanced")
+        )
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "distance")
+        )
+
+    insertion = cheapest_insertion_route(distances, durations)
+    if insertion:
+        fallback_candidates.append(insertion)
+        if len(insertion) > 3:
+            fallback_candidates.append([0] + insertion[1:-1][::-1] + [0])
+
+    unique_fallbacks = []
+    seen = set()
+    for candidate in fallback_candidates:
+        key = tuple(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique_fallbacks.append(candidate)
+
+    fallback_scored = []
+    for candidate in unique_fallbacks:
+        score = route_score(
+            candidate, distances, durations, fuel_price, mpg, locations
+        )
+        fallback_scored.append((score, candidate))
+
+    fallback_scored.sort(key=lambda x: x[0])
+
+    # Improve only the strongest fallback candidates, as before.
+    fallback_results = []
+    for _, candidate in fallback_scored[:28]:
+        improved = improve_route(
+            candidate,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+            locations,
+            preserve_structure=False,
+        )
+        score = route_score(
+            improved, distances, durations, fuel_price, mpg, locations
+        )
+        metrics = route_metrics(
+            improved, distances, durations, fuel_price, mpg
+        )
+        fallback_results.append((score, metrics["time_s"], metrics["distance_m"], improved))
+
+    fallback_results.sort(key=lambda item: item[0])
+
+    if not sweep_results:
+        return fallback_results[0][3] if fallback_results else None
+
+    best_sweep = sweep_results[0]
+    best_fallback = fallback_results[0] if fallback_results else None
+
+    if best_fallback is None:
+        return best_sweep[3]
+
+    # V19 decision rule:
+    # A sweep wins when its driving time is within 12% of the best unrestricted
+    # route and its distance is within 12% too. This is intentionally a road
+    # cost guardrail, not another arbitrary route-shape score. It means we will
+    # accept a sensible sweep when the price of doing so is modest, but we will
+    # still use the road-efficient fallback when a sweep is genuinely bad.
+    sweep_time = best_sweep[1]
+    sweep_distance = best_sweep[2]
+    fallback_time = best_fallback[1]
+    fallback_distance = best_fallback[2]
+
+    time_ratio = sweep_time / max(fallback_time, 1.0)
+    distance_ratio = sweep_distance / max(fallback_distance, 1.0)
+
+    if time_ratio <= 1.12 and distance_ratio <= 1.12:
+        return best_sweep[3]
+
+    # If the sweep is slightly over one threshold but substantially better on
+    # the other metric, allow it when its combined road cost remains sensible.
+    combined_ratio = (
+        (sweep_time / max(fallback_time, 1.0)) * 0.60
+        + (sweep_distance / max(fallback_distance, 1.0)) * 0.40
+    )
+
+    if combined_ratio <= 1.10:
+        return best_sweep[3]
+
+    return best_fallback[3]
 
 
 # ============================================================
