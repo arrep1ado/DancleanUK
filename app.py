@@ -19,7 +19,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 11.0
 # ============================================================
 
-APP_VERSION = "12.1"
+APP_VERSION = "13.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -692,21 +692,22 @@ def route_score(
     durations,
     fuel_price,
     mpg,
+    locations=None,
 ):
     """
-    Score routes using real comparable units.
+    Score a complete route.
 
-    The old version multiplied raw metres by the distance priority,
-    which made distance dominate the score much more than intended.
+    The important change in v13 is that route shape is now treated as a
+    first-class objective.  The previous optimiser could find a route with
+    reasonable total mileage while still jumping out of one dense area and
+    then coming back later.  That is exactly the behaviour we want to avoid.
 
-    We now compare:
-        - driving minutes
-        - driving miles
-        - a backtracking / cluster penalty
-
-    This makes the sidebar priorities behave sensibly.
+    We therefore score:
+      1. real road driving time
+      2. real road driving distance
+      3. strong continuity / backtracking penalties
+      4. a small geographic-shape penalty when coordinates are available
     """
-
     metrics = route_metrics(
         route,
         distances,
@@ -718,71 +719,108 @@ def route_score(
     driving_minutes = metrics["time_s"] / 60.0
     driving_miles = metrics["miles"]
 
-    cluster_penalty = calculate_cluster_penalty(
-        route,
-        distances,
-    )
+    continuity = calculate_continuity_penalty(route, distances)
+
+    shape_penalty = 0.0
+    if locations is not None:
+        shape_penalty = calculate_shape_penalty(route, locations)
 
     return (
         driving_minutes * TIME_PRIORITY
         + driving_miles * DISTANCE_PRIORITY
-        + cluster_penalty * CLUSTER_PRIORITY
+        + continuity * CLUSTER_PRIORITY * 8.0
+        + shape_penalty * CLUSTER_PRIORITY * 0.75
     )
 
 
-def calculate_cluster_penalty(route, distances):
+def calculate_continuity_penalty(route, distances):
     """
-    Penalise obvious jumps away from nearby unvisited work.
+    Strongly discourage leaving a dense local group while nearby work remains.
 
-    This is intentionally a secondary factor. Real road time remains
-    the main objective.
+    The value returned is expressed in miles so the final route score remains
+    easy to reason about.
     """
-
     if len(route) <= 3:
         return 0.0
 
-    customers = route[1:-1]
-    penalty_miles = 0.0
+    customers = set(route[1:-1])
+    penalty = 0.0
 
-    for position in range(1, len(route) - 1):
-        current = route[position]
-
-        remaining = [
-            x
-            for x in customers
-            if x not in route[:position + 1]
-        ]
+    for pos in range(1, len(route) - 1):
+        current = route[pos]
+        next_stop = route[pos + 1]
+        remaining = customers.difference(route[:pos + 1])
 
         if not remaining:
             continue
 
-        next_stop = route[position + 1]
-
-        next_miles = (
-            distances[current][next_stop]
-            / 1609.344
-        )
-
-        nearby = [
-            distances[current][job] / 1609.344
+        next_miles = distances[current][next_stop] / 1609.344
+        remaining_miles = {
+            job: distances[current][job] / 1609.344
             for job in remaining
-            if distances[current][job] <= 16000
-        ]
+        }
 
-        if nearby:
-            nearest_local = min(nearby)
+        nearby_2 = [m for m in remaining_miles.values() if m <= 2.0]
+        nearby_4 = [m for m in remaining_miles.values() if m <= 4.0]
+        nearby_6 = [m for m in remaining_miles.values() if m <= 6.0]
 
-            # A jump of more than roughly 2.2 times the
-            # nearest remaining local job is suspicious.
-            if next_miles > max(
-                nearest_local * 2.2,
-                nearest_local + 2.0,
-            ):
-                penalty_miles += (
-                    next_miles - nearest_local
-                ) * 2.0
+        # If there are several genuinely nearby jobs, jumping away from them
+        # is a strong sign of a poor route shape.
+        if len(nearby_2) >= 1 and next_miles > 3.0:
+            penalty += (next_miles - 3.0) * (1.0 + 0.65 * len(nearby_2))
 
-    return penalty_miles
+        if len(nearby_4) >= 2 and next_miles > 5.0:
+            penalty += (next_miles - 5.0) * (1.5 + 0.45 * len(nearby_4))
+
+        if len(nearby_6) >= 3 and next_miles > 7.0:
+            penalty += (next_miles - 7.0) * (1.8 + 0.30 * len(nearby_6))
+
+        # More generally, compare the chosen next stop with the nearest
+        # remaining stop.  A very large ratio means we are skipping local work.
+        nearest = min(remaining_miles.values())
+        if next_miles > max(nearest * 1.75, nearest + 1.5):
+            excess = next_miles - max(nearest * 1.75, nearest + 1.5)
+            penalty += excess * 2.5
+
+    return penalty
+
+
+def calculate_shape_penalty(route, locations):
+    """
+    Small geometric penalty for routes that repeatedly reverse direction.
+
+    This is deliberately secondary to live road time.  It is only there to
+    prefer a natural sweep through the work area when two routes are otherwise
+    similar.
+    """
+    if len(route) < 5:
+        return 0.0
+
+    def bearing(a, b):
+        lon1, lat1 = locations[a]
+        lon2, lat2 = locations[b]
+        y = math.sin(math.radians(lon2 - lon1)) * math.cos(math.radians(lat2))
+        x = (
+            math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
+            - math.sin(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.cos(math.radians(lon2 - lon1))
+        )
+        angle = math.degrees(math.atan2(y, x))
+        return (angle + 360.0) % 360.0
+
+    bearings = []
+    for i in range(1, len(route) - 1):
+        bearings.append(bearing(route[i - 1], route[i]))
+
+    penalty = 0.0
+    for i in range(1, len(bearings)):
+        delta = abs(bearings[i] - bearings[i - 1])
+        delta = min(delta, 360.0 - delta)
+        if delta > 115:
+            penalty += (delta - 115) / 45.0
+
+    return penalty
 
 
 def build_greedy_route(
@@ -794,12 +832,8 @@ def build_greedy_route(
     customer_count = len(distances) - 1
 
     route = [0, first_customer]
-
-    remaining = set(
-        range(1, customer_count + 1)
-    )
+    remaining = set(range(1, customer_count + 1))
     remaining.discard(first_customer)
-
     current = first_customer
 
     while remaining:
@@ -809,145 +843,162 @@ def build_greedy_route(
             direct_time = durations[current][candidate]
             direct_distance = distances[current][candidate]
 
-            future = [
-                x
-                for x in remaining
-                if x != candidate
-            ]
-
+            future = [x for x in remaining if x != candidate]
             if future:
+                # Look one step ahead, but also reward candidates which sit
+                # inside a dense local group.
                 nearest_future = min(
                     future,
-                    key=lambda x: (
-                        durations[candidate][x]
-                        if mode != "distance"
-                        else distances[candidate][x]
-                    ),
+                    key=lambda x: durations[candidate][x]
                 )
+                future_time = durations[candidate][nearest_future]
+                future_distance = distances[candidate][nearest_future]
 
-                future_time = durations[candidate][
-                    nearest_future
-                ]
-
-                future_distance = distances[candidate][
-                    nearest_future
-                ]
+                local_count = sum(
+                    1
+                    for x in future
+                    if distances[candidate][x] <= 8000
+                )
             else:
                 future_time = durations[candidate][0]
                 future_distance = distances[candidate][0]
+                local_count = 0
 
             if mode == "distance":
                 score = (
                     direct_distance
                     + future_distance * 0.35
+                    - local_count * 1800.0
                 )
-
             elif mode == "balanced":
                 score = (
-                    direct_time * 0.65
-                    + (direct_distance / 10.0) * 0.35
-                    + future_time * 0.25
+                    direct_time * 0.60
+                    + (direct_distance / 10.0) * 0.25
+                    + future_time * 0.20
+                    - local_count * 900.0
                 )
-
             else:
                 score = (
-                    direct_time * 0.70
-                    + future_time * 0.30
+                    direct_time * 0.65
+                    + future_time * 0.25
+                    - local_count * 950.0
                 )
 
-            candidates.append(
-                (score, candidate)
-            )
+            candidates.append((score, candidate))
 
-        candidates.sort(
-            key=lambda x: x[0]
-        )
-
+        candidates.sort(key=lambda x: x[0])
         next_customer = candidates[0][1]
-
         route.append(next_customer)
         remaining.remove(next_customer)
         current = next_customer
 
     route.append(0)
-
     return route
+
+
+def angular_sweep_routes(locations):
+    """
+    Generate natural geographical sweeps around the depot.
+
+    We test several angular offsets and both clockwise and anticlockwise
+    directions.  This creates routes which stay in one geographical area
+    instead of bouncing between NG31/NG32/NG13 repeatedly.
+    """
+    customer_count = len(locations) - 1
+    if customer_count <= 0:
+        return []
+
+    depot_lon, depot_lat = locations[0]
+
+    def angle_and_radius(index):
+        lon, lat = locations[index]
+        dlon = (lon - depot_lon) * math.cos(math.radians(depot_lat))
+        dlat = lat - depot_lat
+        angle = (math.degrees(math.atan2(dlon, dlat)) + 360.0) % 360.0
+        radius = math.sqrt(dlon * dlon + dlat * dlat)
+        return angle, radius
+
+    ordered = list(range(1, customer_count + 1))
+    ordered.sort(key=angle_and_radius)
+
+    routes = []
+    n = len(ordered)
+
+    # Rotating the sweep is important because the depot is in the middle of
+    # the working area.  Test every possible cut, not just the first angle.
+    for direction in (1, -1):
+        base = ordered if direction == 1 else ordered[::-1]
+        for start in range(n):
+            sequence = base[start:] + base[:start]
+            routes.append([0] + sequence + [0])
+
+    return routes
 
 
 def cheapest_insertion_route(
     distances,
     durations,
 ):
-    """
-    Build a complete tour by inserting each remaining customer
-    where it causes the smallest increase in real travel time.
-    """
-
     customer_count = len(distances) - 1
 
     if customer_count <= 0:
         return [0, 0]
 
-    # Start with the customer furthest from the depot.
-    first = max(
+    # Try a few geographically extreme seeds rather than only the furthest.
+    seeds = sorted(
         range(1, customer_count + 1),
         key=lambda x: durations[0][x],
-    )
+        reverse=True,
+    )[: min(6, customer_count)]
 
-    route = [0, first, 0]
+    best_route = None
+    best_value = float("inf")
 
-    remaining = set(
-        range(1, customer_count + 1)
-    )
-    remaining.remove(first)
+    for first in seeds:
+        route = [0, first, 0]
+        remaining = set(range(1, customer_count + 1))
+        remaining.remove(first)
 
-    while remaining:
-        best_choice = None
+        while remaining:
+            best_choice = None
 
-        for customer in remaining:
-            for position in range(1, len(route)):
-                before = route[position - 1]
-                after = route[position]
+            for customer in remaining:
+                for position in range(1, len(route)):
+                    before = route[position - 1]
+                    after = route[position]
 
-                old_time = durations[before][after]
-                new_time = (
-                    durations[before][customer]
-                    + durations[customer][after]
-                )
+                    old_time = durations[before][after]
+                    new_time = durations[before][customer] + durations[customer][after]
+                    old_distance = distances[before][after]
+                    new_distance = distances[before][customer] + distances[customer][after]
 
-                old_distance = distances[before][after]
-                new_distance = (
-                    distances[before][customer]
-                    + distances[customer][after]
-                )
+                    # Reward inserting beside nearby unvisited work.
+                    neighbour_bonus = 0.0
+                    for other in remaining:
+                        if other == customer:
+                            continue
+                        if distances[customer][other] <= 8000:
+                            neighbour_bonus += 120.0
 
-                # Time is deliberately dominant.
-                increase = (
-                    (new_time - old_time)
-                    + (new_distance - old_distance)
-                    / 8.0
-                )
-
-                if (
-                    best_choice is None
-                    or increase < best_choice[0]
-                ):
-                    best_choice = (
-                        increase,
-                        customer,
-                        position,
+                    increase = (
+                        (new_time - old_time)
+                        + (new_distance - old_distance) / 8.0
+                        - neighbour_bonus
                     )
 
-        _, customer, position = best_choice
+                    if best_choice is None or increase < best_choice[0]:
+                        best_choice = (increase, customer, position)
 
-        route.insert(
-            position,
-            customer,
-        )
+            _, customer, position = best_choice
+            route.insert(position, customer)
+            remaining.remove(customer)
 
-        remaining.remove(customer)
+        value = sum(durations[route[i]][route[i + 1]] for i in range(len(route) - 1))
+        if value < best_value:
+            best_value = value
+            best_route = route
 
-    return route
+    return best_route
 
 
 def two_opt(
@@ -956,39 +1007,20 @@ def two_opt(
     durations,
     fuel_price,
     mpg,
+    locations=None,
 ):
     best = route[:]
-
-    best_score = route_score(
-        best,
-        distances,
-        durations,
-        fuel_price,
-        mpg,
-    )
+    best_score = route_score(best, distances, durations, fuel_price, mpg, locations)
 
     improved = True
-
     while improved:
         improved = False
 
         for i in range(1, len(best) - 2):
-            for j in range(
-                i + 1,
-                len(best) - 1,
-            ):
-                candidate = (
-                    best[:i]
-                    + best[i:j + 1][::-1]
-                    + best[j + 1:]
-                )
-
+            for j in range(i + 1, len(best) - 1):
+                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
                 candidate_score = route_score(
-                    candidate,
-                    distances,
-                    durations,
-                    fuel_price,
-                    mpg,
+                    candidate, distances, durations, fuel_price, mpg, locations
                 )
 
                 if candidate_score < best_score - 0.01:
@@ -996,7 +1028,6 @@ def two_opt(
                     best_score = candidate_score
                     improved = True
                     break
-
             if improved:
                 break
 
@@ -1009,46 +1040,23 @@ def relocate_improvement(
     durations,
     fuel_price,
     mpg,
+    locations=None,
 ):
     best = route[:]
-
-    best_score = route_score(
-        best,
-        distances,
-        durations,
-        fuel_price,
-        mpg,
-    )
+    best_score = route_score(best, distances, durations, fuel_price, mpg, locations)
 
     improved = True
-
     while improved:
         improved = False
 
         for i in range(1, len(best) - 1):
             customer = best[i]
+            shortened = best[:i] + best[i + 1:]
 
-            shortened = (
-                best[:i]
-                + best[i + 1:]
-            )
-
-            for j in range(
-                1,
-                len(shortened),
-            ):
-                candidate = (
-                    shortened[:j]
-                    + [customer]
-                    + shortened[j:]
-                )
-
+            for j in range(1, len(shortened)):
+                candidate = shortened[:j] + [customer] + shortened[j:]
                 candidate_score = route_score(
-                    candidate,
-                    distances,
-                    durations,
-                    fuel_price,
-                    mpg,
+                    candidate, distances, durations, fuel_price, mpg, locations
                 )
 
                 if candidate_score < best_score - 0.01:
@@ -1069,46 +1077,21 @@ def swap_improvement(
     durations,
     fuel_price,
     mpg,
+    locations=None,
 ):
-    """
-    Swap two customer positions.
-
-    This catches improvements that relocate and 2-opt can miss.
-    """
-
     best = route[:]
-
-    best_score = route_score(
-        best,
-        distances,
-        durations,
-        fuel_price,
-        mpg,
-    )
+    best_score = route_score(best, distances, durations, fuel_price, mpg, locations)
 
     improved = True
-
     while improved:
         improved = False
 
         for i in range(1, len(best) - 2):
-            for j in range(
-                i + 1,
-                len(best) - 1,
-            ):
+            for j in range(i + 1, len(best) - 1):
                 candidate = best[:]
-
-                candidate[i], candidate[j] = (
-                    candidate[j],
-                    candidate[i],
-                )
-
+                candidate[i], candidate[j] = candidate[j], candidate[i]
                 candidate_score = route_score(
-                    candidate,
-                    distances,
-                    durations,
-                    fuel_price,
-                    mpg,
+                    candidate, distances, durations, fuel_price, mpg, locations
                 )
 
                 if candidate_score < best_score - 0.01:
@@ -1123,82 +1106,50 @@ def swap_improvement(
     return best
 
 
-def generate_candidate_routes(
-    distances,
-    durations,
-):
+def generate_candidate_routes(distances, durations, locations=None):
     customer_count = len(distances) - 1
-
     if customer_count <= 0:
         return []
 
     candidates = []
 
-    # Test every customer as a possible first stop.
-    # This prevents the route being locked to the
-    # nearest depot customer.
-    starts = list(
-        range(1, customer_count + 1)
-    )
+    # 1. Geographical sweep candidates are now the backbone of the optimiser.
+    if locations is not None:
+        candidates.extend(angular_sweep_routes(locations))
 
-    # Sort starts by depot travel time, but keep all
-    # starts available for a complete multi-start search.
-    starts.sort(
-        key=lambda x: durations[0][x]
-    )
+    # 2. Multi-start greedy routes.  Test all starts for small lists and a
+    # useful spread of starts for larger lists.
+    starts = list(range(1, customer_count + 1))
+    starts.sort(key=lambda x: durations[0][x])
+
+    if customer_count > 40:
+        selected = starts[:10]
+        selected += starts[-10:]
+        selected += starts[:: max(1, customer_count // 10)]
+        starts = list(dict.fromkeys(selected))
 
     for first_customer in starts:
-        candidates.append(
-            build_greedy_route(
-                first_customer,
-                distances,
-                durations,
-                mode="time",
-            )
-        )
+        candidates.append(build_greedy_route(first_customer, distances, durations, "time"))
+        candidates.append(build_greedy_route(first_customer, distances, durations, "balanced"))
+        candidates.append(build_greedy_route(first_customer, distances, durations, "distance"))
 
-        candidates.append(
-            build_greedy_route(
-                first_customer,
-                distances,
-                durations,
-                mode="balanced",
-            )
-        )
+    # 3. Insertion construction.
+    insertion = cheapest_insertion_route(distances, durations)
+    if insertion:
+        candidates.append(insertion)
+        if len(insertion) > 3:
+            candidates.append([0] + insertion[1:-1][::-1] + [0])
 
-        # Distance-focused candidate is useful for
-        # reducing fuel and eliminating long detours.
-        candidates.append(
-            build_greedy_route(
-                first_customer,
-                distances,
-                durations,
-                mode="distance",
-            )
-        )
+    # Remove exact duplicates while keeping deterministic order.
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        key = tuple(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
 
-    # Strong global construction method.
-    candidates.append(
-        cheapest_insertion_route(
-            distances,
-            durations,
-        )
-    )
-
-    # Add the reverse of the insertion tour as another
-    # possible orientation.
-    insertion = candidates[-1]
-
-    if len(insertion) > 3:
-        candidates.append(
-            [0]
-            + insertion[1:-1][::-1]
-            + [0]
-        )
-
-    # Keep the candidate set manageable.
-    # The strongest depot starts are processed first.
-    return candidates
+    return unique
 
 
 def improve_route(
@@ -1207,39 +1158,20 @@ def improve_route(
     durations,
     fuel_price,
     mpg,
+    locations=None,
 ):
     improved = two_opt(
-        route,
-        distances,
-        durations,
-        fuel_price,
-        mpg,
+        route, distances, durations, fuel_price, mpg, locations
     )
-
     improved = relocate_improvement(
-        improved,
-        distances,
-        durations,
-        fuel_price,
-        mpg,
+        improved, distances, durations, fuel_price, mpg, locations
     )
-
     improved = swap_improvement(
-        improved,
-        distances,
-        durations,
-        fuel_price,
-        mpg,
+        improved, distances, durations, fuel_price, mpg, locations
     )
-
     improved = two_opt(
-        improved,
-        distances,
-        durations,
-        fuel_price,
-        mpg,
+        improved, distances, durations, fuel_price, mpg, locations
     )
-
     return improved
 
 
@@ -1248,30 +1180,38 @@ def optimise_route(
     durations,
     fuel_price,
     mpg,
+    locations=None,
 ):
-    candidates = generate_candidate_routes(
-        distances,
-        durations,
-    )
+    candidates = generate_candidate_routes(distances, durations, locations)
 
     best_route = None
     best_score = float("inf")
 
+    # First keep the strongest raw candidates, then run expensive local search
+    # on them. This makes 30-40 stop routes much more practical while still
+    # exploring several very different route shapes.
+    scored_candidates = []
     for candidate in candidates:
+        score = route_score(
+            candidate, distances, durations, fuel_price, mpg, locations
+        )
+        scored_candidates.append((score, candidate))
+
+    scored_candidates.sort(key=lambda x: x[0])
+    limit = min(28, len(scored_candidates))
+
+    for _, candidate in scored_candidates[:limit]:
         improved = improve_route(
             candidate,
             distances,
             durations,
             fuel_price,
             mpg,
+            locations,
         )
 
         score = route_score(
-            improved,
-            distances,
-            durations,
-            fuel_price,
-            mpg,
+            improved, distances, durations, fuel_price, mpg, locations
         )
 
         if score < best_score:
@@ -1703,6 +1643,7 @@ if st.button(
             durations,
             FUEL_PRICE,
             MPG,
+            locations,
         )
 
     if not route:
@@ -2379,4 +2320,3 @@ if not export_df.empty:
 
 st.sidebar.caption(
     f"DanCleanUK Route Optimizer v{APP_VERSION}"
-)
