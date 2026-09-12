@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "14.0"
+APP_VERSION = "15.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -746,11 +746,18 @@ def route_score(
     if locations is not None:
         shape_penalty = calculate_shape_penalty(route, locations)
 
+    zone_transition_penalty = 0.0
+    if locations is not None:
+        zone_transition_penalty = calculate_zone_transition_penalty(
+            route, locations
+        )
+
     return (
         driving_minutes * TIME_PRIORITY
         + driving_miles * DISTANCE_PRIORITY
         + continuity * CLUSTER_PRIORITY * 8.0
         + zone_penalty * CLUSTER_PRIORITY * 2.5
+        + zone_transition_penalty * CLUSTER_PRIORITY * 18.0
         + shape_penalty * CLUSTER_PRIORITY * 0.75
     )
 
@@ -803,6 +810,52 @@ def calculate_continuity_penalty(route, distances):
         if next_miles > max(nearest * 1.75, nearest + 1.5):
             excess = next_miles - max(nearest * 1.75, nearest + 1.5)
             penalty += excess * 2.5
+
+    return penalty
+
+
+def calculate_zone_transition_penalty(route, locations):
+    """Strongly discourage leaving an area and later coming back to it.
+
+    V14 still allowed local-search moves to destroy an otherwise good
+    geographical sweep.  This penalty makes zone re-entry expensive enough
+    that a route normally clears a zone before moving on.
+    """
+    if len(route) < 4:
+        return 0.0
+
+    labels = geographic_zone_labels(location_cache_key(locations))
+    if not labels:
+        return 0.0
+
+    def zone(customer):
+        return labels[customer - 1]
+
+    sequence = [zone(customer) for customer in route[1:-1]]
+    if not sequence:
+        return 0.0
+
+    compressed = []
+    for zone_id in sequence:
+        if not compressed or compressed[-1] != zone_id:
+            compressed.append(zone_id)
+
+    penalty = 0.0
+
+    # Every re-entry means the same geographical area has been split into
+    # separate visits.  Make this very expensive.
+    seen = set()
+    for zone_id in compressed:
+        if zone_id in seen:
+            penalty += 12.0
+        seen.add(zone_id)
+
+    # Also penalise leaving a zone while customers in that same zone remain.
+    for pos in range(len(sequence) - 1):
+        if sequence[pos] != sequence[pos + 1]:
+            current_zone = sequence[pos]
+            if current_zone in sequence[pos + 1:]:
+                penalty += 8.0
 
     return penalty
 
@@ -1025,6 +1078,52 @@ def geographic_zone_routes(locations):
                         math.degrees(
                             math.atan2(
                                 (locations[i][0] - c_lon) * math.cos(math.radians(c_lat)),
+                                locations[i][1] - c_lat,
+                            )
+                        ) + 360.0
+                    ) % 360.0
+                )
+                sequence.extend(members)
+            routes.append([0] + sequence + [0])
+            routes.append([0] + list(reversed(sequence)) + [0])
+
+    # V15: add true geographic sweep orders.  These order zones by their
+    # bearing from the depot instead of repeatedly hopping to the nearest
+    # centroid.  Both directions are tested, with the zone nearest the depot
+    # allowed to lead the route.
+    def depot_bearing(point):
+        lon1, lat1 = depot
+        lon2, lat2 = point
+        y = math.sin(math.radians(lon2 - lon1)) * math.cos(math.radians(lat2))
+        x = (
+            math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
+            - math.sin(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.cos(math.radians(lon2 - lon1))
+        )
+        return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+    angular_zones = sorted(zone_ids, key=lambda z: depot_bearing(centroids[z]))
+    if angular_zones:
+        nearest_zone = min(
+            zone_ids,
+            key=lambda z: haversine_points(depot, centroids[z])
+        )
+        remaining = [z for z in angular_zones if z != nearest_zone]
+        for ordered_zones in (
+            [nearest_zone] + remaining,
+            [nearest_zone] + list(reversed(remaining)),
+        ):
+            sequence = []
+            for zone_id in ordered_zones:
+                members = zones[zone_id][:]
+                c_lon, c_lat = centroids[zone_id]
+                members.sort(
+                    key=lambda i: (
+                        math.degrees(
+                            math.atan2(
+                                (locations[i][0] - c_lon)
+                                * math.cos(math.radians(c_lat)),
                                 locations[i][1] - c_lat,
                             )
                         ) + 360.0
