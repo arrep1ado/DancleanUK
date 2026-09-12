@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "21.0"
+APP_VERSION = "22.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -601,7 +601,7 @@ def get_coords(query_string, postcode):
     # 2-4. NOMINATIM CANDIDATES
     # --------------------------------------------------------
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/21.0"
+        "User-Agent": "DanCleanUKRouteOptimizer/22.0"
     }
 
     for candidate in geocode_candidates(query, postcode):
