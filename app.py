@@ -521,7 +521,7 @@ def get_coords(query_string, postcode):
     # --------------------------------------------------------
     headers = {
         "User-Agent":
-            "DanCleanUKRouteOptimizer/12.1"
+            "DanCleanUKRouteOptimizer/14.0"
     }
 
     if query:
@@ -605,6 +605,22 @@ def haversine_km(lat1, lon1, lat2, lon2):
     )
 
     return radius * 2 * math.asin(math.sqrt(a))
+
+
+def haversine_points(point_a, point_b):
+    """Calculate distance between two [longitude, latitude] points."""
+    return haversine_km(
+        point_a[1], point_a[0],
+        point_b[1], point_b[0],
+    )
+
+
+def location_cache_key(locations):
+    """Convert coordinate lists into a hashable cache key."""
+    return tuple(
+        (float(point[0]), float(point[1]))
+        for point in locations
+    )
 
 
 def offline_matrix(locations):
@@ -698,7 +714,7 @@ def route_score(
     """
     Score a complete route.
 
-    The important change in v13 is that route shape is now treated as a
+    The important change in v14 is that route shape is now treated as a
     first-class objective.  The previous optimiser could find a route with
     reasonable total mileage while still jumping out of one dense area and
     then coming back later.  That is exactly the behaviour we want to avoid.
@@ -861,7 +877,7 @@ def geographic_zone_labels(location_tuple):
             if idx in seeds:
                 continue
             nearest = min(
-                haversine_km(locations[idx], locations[s])
+                haversine_points(locations[idx], locations[s])
                 for s in seeds
             )
             if nearest > best_dist:
@@ -878,7 +894,7 @@ def geographic_zone_labels(location_tuple):
         changed = False
         for idx in range(1, customer_count + 1):
             distances_to_centroids = [
-                haversine_km(locations[idx], c) for c in centroids
+                haversine_points(locations[idx], c) for c in centroids
             ]
             label = min(range(len(centroids)), key=lambda x: distances_to_centroids[x])
             if labels[idx] != label + 1:
@@ -915,7 +931,7 @@ def calculate_zone_penalty(route, locations):
     if len(route) < 4:
         return 0.0
 
-    labels = geographic_zone_labels(tuple(locations))
+    labels = geographic_zone_labels(location_cache_key(locations))
     if not labels:
         return 0.0
 
@@ -959,7 +975,7 @@ def geographic_zone_routes(locations):
     if customer_count <= 0:
         return []
 
-    labels = geographic_zone_labels(tuple(locations))
+    labels = geographic_zone_labels(location_cache_key(locations))
     zones = {}
     for customer in range(1, customer_count + 1):
         zones.setdefault(labels[customer - 1], []).append(customer)
@@ -983,7 +999,7 @@ def geographic_zone_routes(locations):
 
     for start_zone in sorted(
         zone_ids,
-        key=lambda z: haversine_km(depot, centroids[z])
+        key=lambda z: haversine_points(depot, centroids[z])
     ):
         remaining = set(zone_ids)
         remaining.remove(start_zone)
@@ -992,7 +1008,7 @@ def geographic_zone_routes(locations):
         while remaining:
             next_zone = min(
                 remaining,
-                key=lambda z: haversine_km(centroids[current], centroids[z])
+                key=lambda z: haversine_points(centroids[current], centroids[z])
             )
             order.append(next_zone)
             remaining.remove(next_zone)
@@ -2520,3 +2536,4 @@ if not export_df.empty:
 
 st.sidebar.caption(
     f"DanCleanUK Route Optimizer v{APP_VERSION}"
+)
