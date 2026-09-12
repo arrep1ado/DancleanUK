@@ -9,60 +9,47 @@ from urllib.parse import quote
 import pandas as pd
 import requests
 import streamlit as st
+
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
 
 
 # ============================================================
-# DAN CLEAN UK - DAILY ROUTE OPTIMIZER
-# Version 11.0
+# APP CONFIG
 # ============================================================
 
-APP_VERSION = "11.0"
+APP_VERSION = "12.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
-    page_title="DanCleanUK Route Optimizer",
-    page_icon="🚗",
-    layout="centered",
-)
-
-st.title("🚗 DanCleanUK Daily Route Optimizer")
-
-st.markdown(
-    """
-    <style>
-        html, body { overscroll-behavior-y: none; }
-        .small-muted { color: #777; font-size: 0.9rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
+    page_title="DanCleanUK Daily Route Optimizer",
+    page_icon="🚐",
+    layout="wide",
 )
 
 
 # ============================================================
-# DATABASE / PERSISTENCE
+# DATABASE
 # ============================================================
 
 def db_connect():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return sqlite3.connect(DB_FILE)
 
 
 def init_db():
     conn = db_connect()
-    conn.execute(
-        """
+    cur = conn.cursor()
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             job_id TEXT PRIMARY KEY,
-            service_date TEXT NOT NULL,
-            postcode TEXT NOT NULL,
-            price REAL NOT NULL,
-            phone TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            payment TEXT NOT NULL DEFAULT 'Waiting',
+            service_date TEXT,
+            postcode TEXT,
+            price REAL,
+            phone TEXT,
+            status TEXT,
+            payment TEXT,
             payment_time TEXT,
             completed_time TEXT,
             route_order INTEGER,
@@ -70,97 +57,10 @@ def init_db():
             latitude REAL,
             longitude REAL,
             geo_query TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT
         )
-        """
-    )
-    conn.commit()
-    conn.close()
+    """)
 
-
-def save_job(row):
-    conn = db_connect()
-    conn.execute(
-        """
-        INSERT INTO jobs (
-            job_id, service_date, postcode, price, phone,
-            status, payment, payment_time, completed_time,
-            route_order, address_text, latitude, longitude,
-            geo_query, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(job_id) DO UPDATE SET
-            service_date=excluded.service_date,
-            postcode=excluded.postcode,
-            price=excluded.price,
-            phone=excluded.phone,
-            status=excluded.status,
-            payment=excluded.payment,
-            payment_time=excluded.payment_time,
-            completed_time=excluded.completed_time,
-            route_order=excluded.route_order,
-            address_text=excluded.address_text,
-            latitude=excluded.latitude,
-            longitude=excluded.longitude,
-            geo_query=excluded.geo_query
-        """,
-        (
-            str(row["job_id"]),
-            str(row["service_date"]),
-            str(row["Postcode"]),
-            float(row["Price"]),
-            str(row["Phone"]),
-            str(row["Status"]),
-            str(row["Payment"]),
-            clean_optional(row.get("PaymentTime")),
-            clean_optional(row.get("CompletedTime")),
-            clean_optional(row.get("route_order")),
-            str(row.get("address_text", "")),
-            safe_float(row.get("latitude")),
-            safe_float(row.get("longitude")),
-            str(row.get("geo_query", "")),
-            str(row.get("created_at", datetime.now().isoformat())),
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-
-def save_dataframe(df):
-    if df is None or df.empty:
-        return
-    for _, row in df.iterrows():
-        save_job(row)
-
-
-def load_day(service_date):
-    conn = db_connect()
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM jobs
-        WHERE service_date = ?
-        ORDER BY
-            CASE WHEN route_order IS NULL THEN 1 ELSE 0 END,
-            route_order,
-            created_at
-        """,
-        (service_date,),
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        return pd.DataFrame()
-
-    return pd.DataFrame([dict(row) for row in rows])
-
-
-def delete_day(service_date):
-    conn = db_connect()
-    conn.execute(
-        "DELETE FROM jobs WHERE service_date = ?",
-        (service_date,),
-    )
     conn.commit()
     conn.close()
 
@@ -172,203 +72,256 @@ init_db()
 # SESSION STATE
 # ============================================================
 
-if st.session_state.get("app_version") != APP_VERSION:
-    old_cache = st.session_state.get("geocode_cache", {})
-    st.session_state.clear()
+if "app_version" not in st.session_state:
     st.session_state.app_version = APP_VERSION
-    st.session_state.geocode_cache = old_cache
+
+if st.session_state.app_version != APP_VERSION:
+    for key in list(st.session_state.keys()):
+        if key != "geocode_cache":
+            del st.session_state[key]
+
+    st.session_state.app_version = APP_VERSION
+
 
 if "geocode_cache" not in st.session_state:
     st.session_state.geocode_cache = {}
 
-if "service_date" not in st.session_state:
-    st.session_state.service_date = date.today().isoformat()
-
 
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
 def clean_val(value):
-    if value is None:
+    if pd.isna(value):
         return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
 
-    text = str(value).strip()
-
-    if text.endswith(".0"):
-        try:
-            text = str(int(float(text)))
-        except Exception:
-            pass
-
-    return text
+    return str(value).strip()
 
 
 def clean_optional(value):
-    text = clean_val(value)
-    return text if text else None
+    value = clean_val(value)
+
+    if value.lower() in {
+        "",
+        "nan",
+        "none",
+        "null",
+    }:
+        return ""
+
+    return value
 
 
-def safe_float(value):
+def safe_float(value, default=0.0):
     try:
-        if value is None or pd.isna(value):
-            return None
+        if pd.isna(value):
+            return default
+
         return float(value)
+
     except Exception:
-        return None
+        return default
 
 
 def normalise_postcode(value):
-    return clean_val(value).upper().replace("  ", " ")
+    value = clean_val(value)
+
+    return " ".join(
+        value.upper().split()
+    )
 
 
 def normalise_phone(value):
-    text = clean_val(value)
-    if not text:
-        return ""
-    text = text.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-    if text.startswith("07"):
-        text = "44" + text[1:]
-    elif text.startswith("+44"):
-        text = text[1:]
-    return text
+    value = clean_val(value)
+
+    return value
 
 
-def maps_url(destination):
+def maps_url(address):
     return (
-        "https://www.google.com/maps/dir/?api=1"
-        f"&destination={quote(str(destination))}"
-        "&travelmode=driving"
+        "https://www.google.com/maps/search/?api=1&query="
+        + quote(address)
     )
 
 
 def format_duration(seconds):
-    minutes = max(0, round(float(seconds) / 60))
-    hours = minutes // 60
-    mins = minutes % 60
+    seconds = max(0, int(seconds))
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+
     if hours:
-        return f"{hours}h {mins}m"
-    return f"{mins}m"
+        return f"{hours}h {minutes:02d}m"
+
+    return f"{minutes}m"
 
 
-def make_job_id(service_date, row_number, postcode, phone):
-    raw = f"{service_date}|{row_number}|{postcode}|{phone}"
+def make_job_id(postcode, address="", service_date=""):
+    raw = (
+        f"{service_date}|"
+        f"{postcode}|"
+        f"{address}"
+    )
+
     import hashlib
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    return hashlib.sha1(
+        raw.encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def now_text():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 # ============================================================
-# SETTINGS
+# DATABASE FUNCTIONS
 # ============================================================
 
-st.sidebar.title("⚙️ Settings")
+def save_job(row):
+    conn = db_connect()
+    cur = conn.cursor()
 
-service_date = st.sidebar.date_input(
+    cur.execute("""
+        INSERT OR REPLACE INTO jobs (
+            job_id,
+            service_date,
+            postcode,
+            price,
+            phone,
+            status,
+            payment,
+            payment_time,
+            completed_time,
+            route_order,
+            address_text,
+            latitude,
+            longitude,
+            geo_query,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        row.get("job_id"),
+        row.get("service_date"),
+        row.get("postcode"),
+        safe_float(row.get("price")),
+        row.get("phone", ""),
+        row.get("status", "Pending"),
+        row.get("payment", "Unpaid"),
+        row.get("payment_time", ""),
+        row.get("completed_time", ""),
+        row.get("route_order"),
+        row.get("address_text", ""),
+        row.get("latitude"),
+        row.get("longitude"),
+        row.get("geo_query", ""),
+        row.get("created_at", now_text()),
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def save_dataframe(df):
+    if df is None or df.empty:
+        return
+
+    for _, row in df.iterrows():
+        save_job(row.to_dict())
+
+
+def load_day(service_date):
+    conn = db_connect()
+
+    df = pd.read_sql_query(
+        """
+        SELECT *
+        FROM jobs
+        WHERE service_date = ?
+        ORDER BY
+            CASE
+                WHEN route_order IS NULL THEN 999999
+                ELSE route_order
+            END,
+            postcode
+        """,
+        conn,
+        params=(service_date,),
+    )
+
+    conn.close()
+
+    return df
+
+
+def delete_day(service_date):
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        DELETE FROM jobs
+        WHERE service_date = ?
+        """,
+        (service_date,),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# SIDEBAR SETTINGS
+# ============================================================
+
+st.sidebar.title("⚙️ Route Settings")
+
+route_date = st.sidebar.date_input(
     "Route date",
-    value=date.fromisoformat(st.session_state.service_date),
+    value=date.today(),
 )
-service_date_str = service_date.isoformat()
 
-if service_date_str != st.session_state.service_date:
-    st.session_state.service_date = service_date_str
-    st.session_state.pop("master_df", None)
-    st.session_state.pop("route_data", None)
-    st.rerun()
+route_date_text = route_date.isoformat()
 
-DEPOT_POSTCODE = st.sidebar.text_input(
-    "Depot Postcode",
+depot_postcode = st.sidebar.text_input(
+    "Depot postcode",
     value="NG31 9RA",
 )
 
-DEPOT_FULL_ADDRESS = st.sidebar.text_input(
-    "Depot Address",
+depot_address = st.sidebar.text_input(
+    "Depot address",
     value="192 Queensway, Grantham NG31 9RA",
 )
 
-FUEL_PRICE = st.sidebar.number_input(
-    "Fuel Price (£/litre)",
+fuel_price = st.sidebar.number_input(
+    "Fuel price £/litre",
     min_value=0.01,
     value=1.50,
     step=0.01,
 )
 
-MPG = st.sidebar.number_input(
+mpg = st.sidebar.number_input(
     "Vehicle MPG",
     min_value=1.0,
     value=30.0,
-    step=0.1,
+    step=1.0,
 )
 
-TAX_RATE = (
-    st.sidebar.slider(
-        "Tax Deduction (%)",
-        0,
-        50,
-        20,
-    )
-    / 100
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🏦 Payment Settings")
-
-BUSINESS_NAME = st.sidebar.text_input(
-    "Business name",
-    value="DanCleanUK",
-)
-
-BANK_NAME = st.sidebar.text_input(
-    "Bank name",
-    value="Mettle",
-)
-
-SORT_CODE = st.sidebar.text_input(
-    "Sort code",
-    value="04-03-33",
-)
-
-ACCOUNT_NUMBER = st.sidebar.text_input(
-    "Account number",
-    value="72515806",
+tax_rate = st.sidebar.number_input(
+    "Tax rate %",
+    min_value=0.0,
+    max_value=100.0,
+    value=20.0,
+    step=1.0,
 )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🧠 Route Priorities")
-
-TIME_PRIORITY = st.sidebar.slider(
-    "Driving Time Priority",
-    1,
-    10,
-    10,
-)
-
-DISTANCE_PRIORITY = st.sidebar.slider(
-    "Distance/Fuel Priority",
-    1,
-    10,
-    7,
-)
-
-CLUSTER_PRIORITY = st.sidebar.slider(
-    "Stay Near Nearby Jobs",
-    1,
-    10,
-    9,
-)
 
 st.sidebar.caption(
-    "Higher values make that factor more important. "
-    "The optimiser considers multiple possible starting customers "
-    "instead of forcing the closest customer to be first."
+    f"Route Optimizer version {APP_VERSION}"
 )
 
 
@@ -376,172 +329,267 @@ st.sidebar.caption(
 # API KEY
 # ============================================================
 
-if "API_KEY" not in st.secrets:
-    st.error("API_KEY missing in Streamlit secrets.")
-    st.info("Add API_KEY to your Streamlit secrets.")
-    st.stop()
-
-API_KEY = st.secrets["API_KEY"]
+try:
+    API_KEY = st.secrets["API_KEY"]
+except Exception:
+    API_KEY = ""
 
 
 # ============================================================
-# ADDRESS / GEOCODING
+# GEOCODING
 # ============================================================
 
-def build_geo_query(row, default_postcode):
+def build_geo_query(row):
     parts = []
 
-    address_columns = {
+    possible_columns = [
         "address",
+        "Address",
         "street",
-        "location",
+        "Street",
+        "address_text",
+        "Address Text",
         "house",
-        "house number",
+        "House",
         "house_number",
-        "property",
-        "property address",
-        "address line 1",
-        "address1",
-        "address line",
-        "address2",
+        "House Number",
         "town",
+        "Town",
         "city",
-    }
+        "City",
+        "location",
+        "Location",
+    ]
 
-    for column in row.index:
-        if str(column).strip().lower() in address_columns:
-            value = clean_val(row[column])
+    for column in possible_columns:
+
+        if column in row.index:
+
+            value = clean_optional(
+                row[column]
+            )
+
             if value and value not in parts:
                 parts.append(value)
 
-    postcode = normalise_postcode(row.get("Postcode", ""))
+    postcode = normalise_postcode(
+        row.get("postcode", "")
+    )
 
     if postcode:
         parts.append(postcode)
-    else:
-        parts.append(default_postcode)
 
-    parts.append("United Kingdom")
+    parts.append("UK")
+
     return ", ".join(parts)
 
 
 def get_address_text(row):
     parts = []
 
-    for column in row.index:
-        name = str(column).strip().lower()
-        if name in {
-            "address",
-            "street",
-            "location",
-            "house",
-            "house number",
-            "house_number",
-            "property",
-            "property address",
-            "address line 1",
-            "address1",
-            "address line",
-            "address2",
-            "town",
-            "city",
-        }:
-            value = clean_val(row.get(column))
+    possible_columns = [
+        "address",
+        "Address",
+        "street",
+        "Street",
+        "address_text",
+        "Address Text",
+        "house",
+        "House",
+        "house_number",
+        "House Number",
+        "town",
+        "Town",
+        "city",
+        "City",
+    ]
+
+    for column in possible_columns:
+
+        if column in row.index:
+
+            value = clean_optional(
+                row[column]
+            )
+
             if value and value not in parts:
                 parts.append(value)
 
-    postcode = normalise_postcode(row.get("Postcode", ""))
+    postcode = normalise_postcode(
+        row.get("postcode", "")
+    )
+
     if postcode:
         parts.append(postcode)
 
     return ", ".join(parts)
 
 
-def cache_key_for(query, postcode):
-    return (str(query).strip() + "|" + str(postcode).strip()).lower()
+def cache_key_for(query):
+    return "geo:" + query.lower().strip()
 
 
-def get_coords(query_string, postcode):
-    query = str(query_string).strip()
-    postcode = normalise_postcode(postcode)
-    key = cache_key_for(query, postcode)
+def get_coords(row):
+    """
+    Geocoding priority:
 
-    if key in st.session_state.geocode_cache:
-        return st.session_state.geocode_cache[key]
+    1. Full address + postcode
+    2. Exact postcode
+    3. Postcodes.io fallback
+    """
+
+    query = build_geo_query(row)
+
+    cache_key = cache_key_for(query)
+
+    if cache_key in st.session_state.geocode_cache:
+        return st.session_state.geocode_cache[
+            cache_key
+        ]
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/11.0"
+        "User-Agent":
+            "DanCleanUK-Daily-Route-Optimizer/12.0"
     }
 
-    if query:
-        try:
-            response = requests.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={
-                    "q": query,
-                    "format": "json",
-                    "limit": 1,
-                    "countrycodes": "gb",
-                },
-                headers=headers,
-                timeout=10,
-            )
+    # --------------------------------------------------------
+    # 1. Nominatim full address
+    # --------------------------------------------------------
 
-            if response.status_code == 200:
-                data = response.json()
-                if data:
-                    coords = (
-                        float(data[0]["lat"]),
-                        float(data[0]["lon"]),
-                    )
-                    st.session_state.geocode_cache[key] = coords
-                    return coords
-        except Exception:
-            pass
+    try:
+
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={
+                "q": query,
+                "format": "json",
+                "limit": 1,
+                "countrycodes": "gb",
+            },
+            headers=headers,
+            timeout=20,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if data:
+
+            lat = float(data[0]["lat"])
+            lon = float(data[0]["lon"])
+
+            result = {
+                "latitude": lat,
+                "longitude": lon,
+                "geo_query": query,
+            }
+
+            st.session_state.geocode_cache[
+                cache_key
+            ] = result
+
+            time.sleep(1)
+
+            return result
+
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # 2. Nominatim postcode only
+    # --------------------------------------------------------
+
+    postcode = normalise_postcode(
+        row.get("postcode", "")
+    )
 
     if postcode:
+
         try:
+
             response = requests.get(
                 "https://nominatim.openstreetmap.org/search",
                 params={
-                    "q": f"{postcode}, United Kingdom",
+                    "q": postcode + ", UK",
                     "format": "json",
                     "limit": 1,
                     "countrycodes": "gb",
                 },
                 headers=headers,
-                timeout=10,
+                timeout=20,
             )
 
-            if response.status_code == 200:
-                data = response.json()
-                if data:
-                    coords = (
-                        float(data[0]["lat"]),
-                        float(data[0]["lon"]),
-                    )
-                    st.session_state.geocode_cache[key] = coords
-                    return coords
+            response.raise_for_status()
+
+            data = response.json()
+
+            if data:
+
+                lat = float(data[0]["lat"])
+                lon = float(data[0]["lon"])
+
+                result = {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "geo_query": postcode,
+                }
+
+                st.session_state.geocode_cache[
+                    cache_key
+                ] = result
+
+                time.sleep(1)
+
+                return result
+
         except Exception:
             pass
 
-    pc = postcode.replace(" ", "")
-    if pc:
+    # --------------------------------------------------------
+    # 3. Postcodes.io
+    # --------------------------------------------------------
+
+    if postcode:
+
         try:
+
             response = requests.get(
-                f"https://api.postcodes.io/postcodes/{pc}",
-                timeout=8,
+                "https://api.postcodes.io/postcodes/"
+                + quote(postcode),
+                timeout=20,
             )
 
-            if response.status_code == 200:
-                result = response.json().get("result")
-                if result:
-                    lat = result.get("latitude")
-                    lon = result.get("longitude")
-                    if lat is not None and lon is not None:
-                        coords = (float(lat), float(lon))
-                        st.session_state.geocode_cache[key] = coords
-                        return coords
+            response.raise_for_status()
+
+            data = response.json()
+
+            result_data = data.get(
+                "result"
+            )
+
+            if result_data:
+
+                lat = float(
+                    result_data["latitude"]
+                )
+
+                lon = float(
+                    result_data["longitude"]
+                )
+
+                result = {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "geo_query": postcode,
+                }
+
+                st.session_state.geocode_cache[
+                    cache_key
+                ] = result
+
+                return result
+
         except Exception:
             pass
 
@@ -552,392 +600,1183 @@ def get_coords(query_string, postcode):
 # ROUTING
 # ============================================================
 
-def haversine_km(lat1, lon1, lat2, lon2):
-    radius = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
+def haversine_km(
+    lat1,
+    lon1,
+    lat2,
+    lon2,
+):
+    R = 6371.0
+
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+
+    dlat = math.radians(
+        lat2 - lat1
+    )
+
+    dlon = math.radians(
+        lon2 - lon1
+    )
 
     a = (
         math.sin(dlat / 2) ** 2
-        + math.cos(math.radians(lat1))
-        * math.cos(math.radians(lat2))
+        +
+        math.cos(p1)
+        * math.cos(p2)
         * math.sin(dlon / 2) ** 2
     )
 
-    return radius * 2 * math.asin(math.sqrt(a))
+    return (
+        2
+        * R
+        * math.asin(
+            math.sqrt(a)
+        )
+    )
 
 
-def offline_matrix(locations):
-    n = len(locations)
-    distances = [[0.0] * n for _ in range(n)]
-    durations = [[0.0] * n for _ in range(n)]
+def offline_matrix(coords):
+    """
+    Offline fallback.
+
+    coords:
+        [(longitude, latitude), ...]
+    """
+
+    n = len(coords)
+
+    distance_matrix = [
+        [0.0] * n
+        for _ in range(n)
+    ]
+
+    duration_matrix = [
+        [0.0] * n
+        for _ in range(n)
+    ]
 
     road_factor = 1.30
-    average_speed = 35.0
+    average_speed_kmh = 35.0
 
     for i in range(n):
-        lon1, lat1 = locations[i]
 
         for j in range(n):
+
             if i == j:
                 continue
 
-            lon2, lat2 = locations[j]
-            km = haversine_km(lat1, lon1, lat2, lon2)
-            road_km = km * road_factor
+            km = haversine_km(
+                coords[i][1],
+                coords[i][0],
+                coords[j][1],
+                coords[j][0],
+            )
 
-            distances[i][j] = road_km * 1000
-            durations[i][j] = road_km / average_speed * 3600
+            road_km = (
+                km * road_factor
+            )
 
-    return distances, durations
+            distance_matrix[i][j] = (
+                road_km * 1000
+            )
+
+            duration_matrix[i][j] = (
+                road_km
+                / average_speed_kmh
+                * 3600
+            )
+
+    return (
+        distance_matrix,
+        duration_matrix,
+    )
 
 
-def get_ors_matrix(locations):
-    try:
-        response = requests.post(
-            "https://api.openrouteservice.org/v2/matrix/driving-car",
-            json={
-                "locations": locations,
-                "metrics": ["distance", "duration"],
-                "units": "m",
-            },
-            headers={
-                "Authorization": API_KEY,
-                "Content-Type": "application/json",
-            },
-            timeout=90,
+def get_ors_matrix(
+    coords,
+    api_key,
+):
+    """
+    Real road distance/time matrix
+    from OpenRouteService.
+    """
+
+    url = (
+        "https://api.openrouteservice.org/"
+        "v2/matrix/driving-car"
+    )
+
+    payload = {
+        "locations": coords,
+        "metrics": [
+            "distance",
+            "duration",
+        ],
+        "units": "m",
+    }
+
+    headers = {
+        "Authorization": api_key,
+        "Content-Type": "application/json",
+    }
+
+    response = requests.post(
+        url,
+        json=payload,
+        headers=headers,
+        timeout=60,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    distances = data.get(
+        "distances"
+    )
+
+    durations = data.get(
+        "durations"
+    )
+
+    if not distances or not durations:
+        raise ValueError(
+            "OpenRouteService returned no matrix data."
         )
 
-        if response.status_code != 200:
-            return None, None
-
-        data = response.json()
-        distances = data.get("distances")
-        durations = data.get("durations")
-
-        if not distances or not durations:
-            return None, None
-
-        return distances, durations
-
-    except Exception:
-        return None, None
+    return (
+        distances,
+        durations,
+    )
 
 
-def route_metrics(route, distances, durations, fuel_price, mpg):
-    total_distance = 0.0
-    total_time = 0.0
+# ============================================================
+# ROUTE METRICS
+# ============================================================
 
-    for i in range(len(route) - 1):
+def route_metrics(
+    route,
+    distance_matrix,
+    duration_matrix,
+    mpg,
+    fuel_price,
+):
+    total_distance_m = 0.0
+    total_time_s = 0.0
+
+    for i in range(
+        len(route) - 1
+    ):
+
         a = route[i]
         b = route[i + 1]
-        total_distance += distances[a][b]
-        total_time += durations[a][b]
 
-    miles = total_distance / 1000 * 0.621371
-    litres = miles / mpg * 4.54609
-    fuel_cost = litres * fuel_price
+        distance = (
+            distance_matrix[a][b]
+        )
+
+        duration = (
+            duration_matrix[a][b]
+        )
+
+        if distance is None:
+            distance = float("inf")
+
+        if duration is None:
+            duration = float("inf")
+
+        total_distance_m += distance
+        total_time_s += duration
+
+    total_distance_miles = (
+        total_distance_m / 1609.344
+    )
+
+    total_time_hours = (
+        total_time_s / 3600
+    )
+
+    litres_used = (
+        total_distance_miles
+        / max(mpg, 1)
+        * 4.54609
+    )
+
+    fuel_cost = (
+        litres_used * fuel_price
+    )
 
     return {
-        "distance_m": total_distance,
-        "time_s": total_time,
-        "miles": miles,
-        "litres": litres,
+        "distance_m": total_distance_m,
+        "distance_miles":
+            total_distance_miles,
+        "time_s": total_time_s,
+        "time_hours":
+            total_time_hours,
+        "litres": litres_used,
         "fuel_cost": fuel_cost,
     }
 
 
-def calculate_cluster_penalty(route, distances):
+def route_time(
+    route,
+    duration_matrix,
+):
+    total = 0.0
+
+    for i in range(
+        len(route) - 1
+    ):
+
+        total += duration_matrix[
+            route[i]
+        ][
+            route[i + 1]
+        ]
+
+    return total
+
+
+def route_distance(
+    route,
+    distance_matrix,
+):
+    total = 0.0
+
+    for i in range(
+        len(route) - 1
+    ):
+
+        total += distance_matrix[
+            route[i]
+        ][
+            route[i + 1]
+        ]
+
+    return total
+
+
+def geographical_cluster_penalty(
+    route,
+    distance_matrix,
+):
+    """
+    Mild penalty for very long jumps between otherwise
+    geographically close jobs.
+
+    Driving time remains the main priority.
+    """
+
+    if len(route) <= 4:
+        return 0.0
+
     penalty = 0.0
-    customers = route[1:-1]
 
-    for position in range(1, len(route) - 1):
-        current = route[position]
+    leg_lengths = []
 
-        remaining = [
-            x for x in customers
-            if x not in route[:position + 1]
-        ]
+    for i in range(
+        len(route) - 1
+    ):
 
-        if not remaining:
-            continue
+        leg_lengths.append(
+            distance_matrix[
+                route[i]
+            ][
+                route[i + 1]
+            ]
+        )
 
-        next_stop = route[position + 1]
-        next_distance = distances[current][next_stop]
+    if not leg_lengths:
+        return 0.0
 
-        nearby = [
-            distances[current][job]
-            for job in remaining
-            if distances[current][job] <= 15000
-        ]
+    average_leg = (
+        sum(leg_lengths)
+        / len(leg_lengths)
+    )
 
-        if nearby:
-            nearest_local = min(nearby)
+    if average_leg <= 0:
+        return 0.0
 
-            if next_distance > nearest_local * 2.5:
-                penalty += (next_distance - nearest_local) * 3.0
+    for leg in leg_lengths:
+
+        if leg > (
+            average_leg * 2.0
+        ):
+
+            penalty += (
+                leg
+                - average_leg * 2.0
+            )
 
     return penalty
 
 
 def route_score(
     route,
-    distances,
-    durations,
-    fuel_price,
-    mpg,
+    distance_matrix,
+    duration_matrix,
 ):
-    metrics = route_metrics(
+    """
+    TIME-FIRST route score.
+
+    1. Driving time
+    2. Distance
+    3. Very small geographical penalty
+
+    The uploaded file order is NOT used.
+    """
+
+    time_s = route_time(
         route,
-        distances,
-        durations,
-        fuel_price,
-        mpg,
+        duration_matrix,
     )
 
-    cluster_penalty = calculate_cluster_penalty(
+    distance_m = route_distance(
         route,
-        distances,
+        distance_matrix,
     )
 
-    return (
-        metrics["time_s"] * TIME_PRIORITY
-        + metrics["distance_m"] * DISTANCE_PRIORITY
-        + cluster_penalty * CLUSTER_PRIORITY
+    cluster_penalty = (
+        geographical_cluster_penalty(
+            route,
+            distance_matrix,
+        )
     )
 
+    score = (
+        time_s
+        + distance_m * 0.03
+        + cluster_penalty * 0.01
+    )
 
-def build_greedy_route(first_customer, distances, durations):
-    customer_count = len(distances) - 1
+    return score
 
-    route = [0, first_customer]
 
-    remaining = set(range(1, customer_count + 1))
-    remaining.discard(first_customer)
+# ============================================================
+# INITIAL ROUTES
+# ============================================================
 
-    current = first_customer
+def nearest_neighbour_route(
+    duration_matrix,
+    distance_matrix,
+    start_mode="time",
+):
+    """
+    Creates a route from the depot.
 
-    while remaining:
-        candidates = []
+    Customer order in the uploaded file is ignored.
+    """
 
-        for candidate in remaining:
-            direct_time = durations[current][candidate]
+    n = len(
+        duration_matrix
+    )
 
-            future = [
-                x for x in remaining if x != candidate
-            ]
+    customers = set(
+        range(1, n)
+    )
 
-            if future:
-                nearest_future = min(
-                    future,
-                    key=lambda x: durations[candidate][x],
+    route = [0]
+
+    current = 0
+
+    while customers:
+
+        best_customer = None
+        best_value = float("inf")
+
+        for candidate in customers:
+
+            direct_time = (
+                duration_matrix[
+                    current
+                ][
+                    candidate
+                ]
+            )
+
+            direct_distance = (
+                distance_matrix[
+                    current
+                ][
+                    candidate
+                ]
+            )
+
+            if start_mode == "distance":
+
+                value = direct_distance
+
+            elif start_mode == "combined":
+
+                value = (
+                    direct_time
+                    + direct_distance * 0.025
                 )
-                future_time = durations[candidate][nearest_future]
+
             else:
-                future_time = durations[candidate][0]
 
-            score = direct_time * 0.70 + future_time * 0.30
-            candidates.append((score, candidate))
+                value = direct_time
 
-        candidates.sort(key=lambda x: x[0])
-        next_customer = candidates[0][1]
+            if value < best_value:
 
-        route.append(next_customer)
-        remaining.remove(next_customer)
-        current = next_customer
+                best_value = value
+                best_customer = candidate
+
+        route.append(
+            best_customer
+        )
+
+        customers.remove(
+            best_customer
+        )
+
+        current = best_customer
 
     route.append(0)
+
     return route
 
 
-def two_opt(route, distances, durations, fuel_price, mpg):
-    best = route[:]
-    best_score = route_score(
-        best,
-        distances,
-        durations,
-        fuel_price,
-        mpg,
+def lookahead_route(
+    duration_matrix,
+    distance_matrix,
+):
+    """
+    Looks at both the next job and the job after that.
+
+    This helps stop the route bouncing backwards and forwards
+    across the area.
+    """
+
+    n = len(
+        duration_matrix
     )
+
+    remaining = set(
+        range(1, n)
+    )
+
+    route = [0]
+
+    current = 0
+
+    while remaining:
+
+        best_job = None
+        best_score = float("inf")
+
+        for candidate in remaining:
+
+            first_time = (
+                duration_matrix[
+                    current
+                ][
+                    candidate
+                ]
+            )
+
+            first_distance = (
+                distance_matrix[
+                    current
+                ][
+                    candidate
+                ]
+            )
+
+            others = (
+                remaining
+                - {candidate}
+            )
+
+            if others:
+
+                next_best_time = min(
+                    duration_matrix[
+                        candidate
+                    ][
+                        x
+                    ]
+                    for x in others
+                )
+
+                next_best_distance = min(
+                    distance_matrix[
+                        candidate
+                    ][
+                        x
+                    ]
+                    for x in others
+                )
+
+            else:
+
+                next_best_time = (
+                    duration_matrix[
+                        candidate
+                    ][0]
+                )
+
+                next_best_distance = (
+                    distance_matrix[
+                        candidate
+                    ][0]
+                )
+
+            value = (
+                first_time
+                + next_best_time * 0.45
+                + first_distance * 0.02
+                + next_best_distance * 0.01
+            )
+
+            if value < best_score:
+
+                best_score = value
+                best_job = candidate
+
+        route.append(
+            best_job
+        )
+
+        remaining.remove(
+            best_job
+        )
+
+        current = best_job
+
+    route.append(0)
+
+    return route
+
+
+def cheapest_insertion_route(
+    duration_matrix,
+    distance_matrix,
+):
+    """
+    Builds a route by inserting each job where it creates
+    the smallest increase in total driving time.
+    """
+
+    n = len(
+        duration_matrix
+    )
+
+    customers = list(
+        range(1, n)
+    )
+
+    if not customers:
+        return [0, 0]
+
+    first = max(
+        customers,
+        key=lambda x:
+        (
+            duration_matrix[0][x]
+            +
+            duration_matrix[x][0]
+        ),
+    )
+
+    route = [
+        0,
+        first,
+        0,
+    ]
+
+    customers.remove(
+        first
+    )
+
+    while customers:
+
+        best_job = None
+        best_position = None
+        best_increase = float(
+            "inf"
+        )
+
+        for job in customers:
+
+            for position in range(
+                1,
+                len(route),
+            ):
+
+                before = route[
+                    position - 1
+                ]
+
+                after = route[
+                    position
+                ]
+
+                old_cost = (
+                    duration_matrix[
+                        before
+                    ][
+                        after
+                    ]
+                    +
+                    distance_matrix[
+                        before
+                    ][
+                        after
+                    ] * 0.03
+                )
+
+                new_cost = (
+                    duration_matrix[
+                        before
+                    ][
+                        job
+                    ]
+                    +
+                    duration_matrix[
+                        job
+                    ][
+                        after
+                    ]
+                    +
+                    (
+                        distance_matrix[
+                            before
+                        ][
+                            job
+                        ]
+                        +
+                        distance_matrix[
+                            job
+                        ][
+                            after
+                        ]
+                    ) * 0.03
+                )
+
+                increase = (
+                    new_cost
+                    - old_cost
+                )
+
+                if increase < best_increase:
+
+                    best_increase = increase
+                    best_job = job
+                    best_position = position
+
+        route.insert(
+            best_position,
+            best_job,
+        )
+
+        customers.remove(
+            best_job
+        )
+
+    return route
+
+
+def sweep_route(
+    duration_matrix,
+    distance_matrix,
+    coords,
+):
+    """
+    Geographic sweep around the depot.
+
+    This is another completely different starting route.
+    """
+
+    depot_lat = coords[0][1]
+    depot_lon = coords[0][0]
+
+    jobs = []
+
+    for index in range(
+        1,
+        len(coords),
+    ):
+
+        lon = coords[index][0]
+        lat = coords[index][1]
+
+        angle = math.atan2(
+            lat - depot_lat,
+            lon - depot_lon,
+        )
+
+        radius = haversine_km(
+            depot_lat,
+            depot_lon,
+            lat,
+            lon,
+        )
+
+        jobs.append(
+            (
+                angle,
+                radius,
+                index,
+            )
+        )
+
+    forward = sorted(
+        jobs,
+        key=lambda x: (
+            x[0],
+            x[1],
+        ),
+    )
+
+    reverse = list(
+        reversed(forward)
+    )
+
+    candidates = []
+
+    for job_list in [
+        forward,
+        reverse,
+    ]:
+
+        route = [0]
+
+        for _, _, index in job_list:
+            route.append(index)
+
+        route.append(0)
+
+        candidates.append(
+            route
+        )
+
+    return min(
+        candidates,
+        key=lambda r:
+        route_score(
+            r,
+            distance_matrix,
+            duration_matrix,
+        ),
+    )
+
+
+# ============================================================
+# LOCAL SEARCH
+# ============================================================
+
+def two_opt(
+    route,
+    distance_matrix,
+    duration_matrix,
+):
+    """
+    2-opt improvement.
+
+    Reverses sections of the route when that improves
+    the complete route.
+    """
+
+    if len(route) <= 4:
+        return route
 
     improved = True
 
     while improved:
+
         improved = False
 
-        for i in range(1, len(best) - 2):
-            for j in range(i + 1, len(best) - 1):
+        current_score = route_score(
+            route,
+            distance_matrix,
+            duration_matrix,
+        )
+
+        n = len(route)
+
+        for i in range(
+            1,
+            n - 3,
+        ):
+
+            for j in range(
+                i + 1,
+                n - 1,
+            ):
+
+                if j - i <= 1:
+                    continue
+
                 candidate = (
-                    best[:i]
-                    + best[i:j + 1][::-1]
-                    + best[j + 1:]
+                    route[:i]
+                    +
+                    list(
+                        reversed(
+                            route[
+                                i:j + 1
+                            ]
+                        )
+                    )
+                    +
+                    route[
+                        j + 1:
+                    ]
                 )
 
-                candidate_score = route_score(
-                    candidate,
-                    distances,
-                    durations,
-                    fuel_price,
-                    mpg,
+                candidate_score = (
+                    route_score(
+                        candidate,
+                        distance_matrix,
+                        duration_matrix,
+                    )
                 )
 
-                if candidate_score < best_score - 0.01:
-                    best = candidate
-                    best_score = candidate_score
+                if candidate_score < (
+                    current_score - 0.001
+                ):
+
+                    route = candidate
                     improved = True
+
                     break
 
             if improved:
                 break
 
-    return best
+    return route
 
 
 def relocate_improvement(
     route,
-    distances,
-    durations,
-    fuel_price,
-    mpg,
+    distance_matrix,
+    duration_matrix,
 ):
-    best = route[:]
-    best_score = route_score(
-        best,
-        distances,
-        durations,
-        fuel_price,
-        mpg,
-    )
+    """
+    Takes one customer and tries moving it to every other
+    position.
+    """
+
+    if len(route) <= 4:
+        return route
 
     improved = True
 
     while improved:
+
         improved = False
 
-        for i in range(1, len(best) - 1):
-            customer = best[i]
-            shortened = best[:i] + best[i + 1:]
+        current_score = route_score(
+            route,
+            distance_matrix,
+            duration_matrix,
+        )
 
-            for j in range(1, len(shortened)):
+        n = len(route)
+
+        for i in range(
+            1,
+            n - 1,
+        ):
+
+            customer = route[i]
+
+            shortened = (
+                route[:i]
+                +
+                route[i + 1:]
+            )
+
+            for j in range(
+                1,
+                len(shortened),
+            ):
+
                 candidate = (
                     shortened[:j]
-                    + [customer]
-                    + shortened[j:]
+                    +
+                    [customer]
+                    +
+                    shortened[j:]
                 )
 
-                candidate_score = route_score(
-                    candidate,
-                    distances,
-                    durations,
-                    fuel_price,
-                    mpg,
+                candidate_score = (
+                    route_score(
+                        candidate,
+                        distance_matrix,
+                        duration_matrix,
+                    )
                 )
 
-                if candidate_score < best_score - 0.01:
-                    best = candidate
-                    best_score = candidate_score
+                if candidate_score < (
+                    current_score - 0.001
+                ):
+
+                    route = candidate
                     improved = True
+
                     break
 
             if improved:
                 break
 
-    return best
+    return route
 
 
-def generate_candidate_routes(distances, durations):
-    customer_count = len(distances) - 1
+def swap_improvement(
+    route,
+    distance_matrix,
+    duration_matrix,
+):
+    """
+    Swaps two customers and checks whether the complete
+    route becomes better.
+    """
 
-    if customer_count <= 0:
-        return []
+    if len(route) <= 4:
+        return route
+
+    improved = True
+
+    while improved:
+
+        improved = False
+
+        current_score = route_score(
+            route,
+            distance_matrix,
+            duration_matrix,
+        )
+
+        n = len(route)
+
+        for i in range(
+            1,
+            n - 2,
+        ):
+
+            for j in range(
+                i + 1,
+                n - 1,
+            ):
+
+                candidate = route[:]
+
+                candidate[i], candidate[j] = (
+                    candidate[j],
+                    candidate[i],
+                )
+
+                candidate_score = (
+                    route_score(
+                        candidate,
+                        distance_matrix,
+                        duration_matrix,
+                    )
+                )
+
+                if candidate_score < (
+                    current_score - 0.001
+                ):
+
+                    route = candidate
+                    improved = True
+
+                    break
+
+            if improved:
+                break
+
+    return route
+
+
+# ============================================================
+# MAIN ROUTE OPTIMISER
+# ============================================================
+
+def optimise_route(
+    distance_matrix,
+    duration_matrix,
+    coords=None,
+):
+    """
+    MAIN OPTIMISER.
+
+    IMPORTANT:
+
+    The uploaded file order is completely ignored.
+
+    Every customer is treated as an unordered job.
+
+    The optimiser:
+        1. Creates several different geographical routes.
+        2. Improves each route.
+        3. Chooses the best complete route.
+
+    Driving time is the main priority.
+    """
+
+    number_of_locations = len(
+        distance_matrix
+    )
+
+    if number_of_locations <= 1:
+        return [0]
+
+    if number_of_locations == 2:
+        return [0, 1, 0]
 
     candidates = []
 
-    # Do not blindly force the nearest customer first.
-    # Test several strong starting candidates.
-    start_candidates = sorted(
-        range(1, customer_count + 1),
-        key=lambda x: durations[0][x],
+    # --------------------------------------------------------
+    # Time nearest neighbour
+    # --------------------------------------------------------
+
+    candidates.append(
+        nearest_neighbour_route(
+            duration_matrix,
+            distance_matrix,
+            "time",
+        )
     )
 
-    # Include the nearest, several nearby starts and a few
-    # geographically expensive starts so the optimiser can
-    # discover a better global route.
-    selected = start_candidates[:min(10, customer_count)]
+    # --------------------------------------------------------
+    # Distance nearest neighbour
+    # --------------------------------------------------------
 
-    if customer_count > 10:
-        selected += [
-            start_candidates[-1],
-            start_candidates[len(start_candidates) // 2],
-        ]
+    candidates.append(
+        nearest_neighbour_route(
+            duration_matrix,
+            distance_matrix,
+            "distance",
+        )
+    )
 
-    selected = list(dict.fromkeys(selected))
+    # --------------------------------------------------------
+    # Combined route
+    # --------------------------------------------------------
 
-    for first_customer in selected:
+    candidates.append(
+        nearest_neighbour_route(
+            duration_matrix,
+            distance_matrix,
+            "combined",
+        )
+    )
+
+    # --------------------------------------------------------
+    # Lookahead route
+    # --------------------------------------------------------
+
+    candidates.append(
+        lookahead_route(
+            duration_matrix,
+            distance_matrix,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Cheapest insertion
+    # --------------------------------------------------------
+
+    candidates.append(
+        cheapest_insertion_route(
+            duration_matrix,
+            distance_matrix,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Geographical sweep
+    # --------------------------------------------------------
+
+    if coords is not None:
+
         candidates.append(
-            build_greedy_route(
-                first_customer,
-                distances,
-                durations,
+            sweep_route(
+                duration_matrix,
+                distance_matrix,
+                coords,
             )
         )
 
-    # A few randomised routes add diversity for larger days.
-    customer_indexes = list(range(1, customer_count + 1))
+    # --------------------------------------------------------
+    # Remove duplicates
+    # --------------------------------------------------------
 
-    for _ in range(min(15, max(3, customer_count // 2))):
-        shuffled = customer_indexes[:]
-        random.shuffle(shuffled)
-        candidates.append([0] + shuffled + [0])
+    unique_candidates = []
 
-    return candidates
+    seen = set()
 
+    for route in candidates:
 
-def optimise_route(distances, durations, fuel_price, mpg):
-    candidates = generate_candidate_routes(
-        distances,
-        durations,
+        key = tuple(route)
+
+        if key not in seen:
+
+            seen.add(key)
+            unique_candidates.append(
+                route
+            )
+
+    # --------------------------------------------------------
+    # Improve every candidate
+    # --------------------------------------------------------
+
+    improved_routes = []
+
+    for route in unique_candidates:
+
+        try:
+
+            route = two_opt(
+                route,
+                distance_matrix,
+                duration_matrix,
+            )
+
+            route = relocate_improvement(
+                route,
+                distance_matrix,
+                duration_matrix,
+            )
+
+            route = swap_improvement(
+                route,
+                distance_matrix,
+                duration_matrix,
+            )
+
+            route = two_opt(
+                route,
+                distance_matrix,
+                duration_matrix,
+            )
+
+            improved_routes.append(
+                route
+            )
+
+        except Exception:
+
+            improved_routes.append(
+                route
+            )
+
+    # --------------------------------------------------------
+    # Pick the best complete route
+    # --------------------------------------------------------
+
+    best_route = min(
+        improved_routes,
+        key=lambda r:
+        route_score(
+            r,
+            distance_matrix,
+            duration_matrix,
+        ),
     )
-
-    best_route = None
-    best_score = float("inf")
-
-    for candidate in candidates:
-        improved = two_opt(
-            candidate,
-            distances,
-            durations,
-            fuel_price,
-            mpg,
-        )
-
-        improved = relocate_improvement(
-            improved,
-            distances,
-            durations,
-            fuel_price,
-            mpg,
-        )
-
-        improved = two_opt(
-            improved,
-            distances,
-            durations,
-            fuel_price,
-            mpg,
-        )
-
-        score = route_score(
-            improved,
-            distances,
-            durations,
-            fuel_price,
-            mpg,
-        )
-
-        if score < best_score:
-            best_score = score
-            best_route = improved
 
     return best_route
 
@@ -946,34 +1785,38 @@ def optimise_route(distances, durations, fuel_price, mpg):
 # DESTINATION / WHATSAPP
 # ============================================================
 
-def get_destination(row):
-    address = clean_val(row.get("address_text"))
+def destination_for_job(row):
+    address = get_address_text(row)
+
     if address:
         return address
 
-    geo_query = clean_val(row.get("geo_query"))
-    if geo_query:
-        return geo_query
-
-    postcode = normalise_postcode(row.get("Postcode"))
-    return postcode
-
-
-def whatsapp_url(phone, price):
-    message = (
-        f"Hi from {BUSINESS_NAME}! "
-        f"Your service is complete today. "
-        f"Total: £{price:.2f}. "
-        f"Please pay via bank transfer to {BANK_NAME} - "
-        f"Sort Code: {SORT_CODE} "
-        f"Account: {ACCOUNT_NUMBER}. "
-        f"Thank you!"
+    return normalise_postcode(
+        row.get("postcode", "")
     )
+
+
+def whatsapp_url(phone, message):
+    phone = clean_val(phone)
+
+    if not phone:
+        return None
+
+    phone = (
+        phone.replace(" ", "")
+        .replace("-", "")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+    if phone.startswith("0"):
+        phone = "+44" + phone[1:]
 
     return (
         "https://wa.me/"
-        f"{quote(normalise_phone(phone))}"
-        f"?text={quote(message)}"
+        + phone.replace("+", "")
+        + "?text="
+        + quote(message)
     )
 
 
@@ -981,60 +1824,31 @@ def whatsapp_url(phone, price):
 # LOAD EXISTING DAY
 # ============================================================
 
-existing_day = load_day(service_date_str)
-
-if (
-    not existing_day.empty
-    and "master_df" not in st.session_state
-):
-    st.session_state.master_df = existing_day.copy()
-
-    # Existing persisted routes already have coordinates.
-    if "route_data" not in st.session_state:
-        customer_rows = existing_day[
-            existing_day["status"].astype(str).str.lower() != "depot"
-        ].copy()
-
-        if not customer_rows.empty:
-            completed = (
-                customer_rows["status"]
-                .astype(str)
-                .str.lower()
-                .eq("completed")
-                .sum()
-            )
-            st.session_state.route_data = {
-                "revenue": float(customer_rows["price"].sum()),
-                "fuel_cost": 0.0,
-                "take_home": float(
-                    customer_rows["price"].sum()
-                    * (1 - TAX_RATE)
-                ),
-                "miles": 0.0,
-                "litres": 0.0,
-                "time": 0.0,
-                "offline": False,
-                "jobs": len(customer_rows),
-                "completed": int(completed),
-                "persisted_only": True,
-            }
+existing_df = load_day(
+    route_date_text
+)
 
 
 # ============================================================
-# START NEW DAY / RESET
+# RESET DAY
 # ============================================================
+
+st.sidebar.markdown("---")
 
 if st.sidebar.button(
-    "🔄 Start New Day / Reset",
+    "🗑️ Reset this day",
     use_container_width=True,
 ):
-    delete_day(service_date_str)
-    for key in [
-        "master_df",
+
+    delete_day(
+        route_date_text
+    )
+
+    st.session_state.pop(
         "route_data",
-        "failed_jobs",
-    ]:
-        st.session_state.pop(key, None)
+        None,
+    )
+
     st.rerun()
 
 
@@ -1042,566 +1856,1035 @@ if st.sidebar.button(
 # FILE UPLOAD
 # ============================================================
 
-uploaded_file = st.file_uploader(
-    "📁 Upload your day's CSV or Excel file",
-    type=["csv", "xlsx"],
+st.title(
+    "🚐 DanCleanUK Daily Route Optimizer"
 )
 
+st.caption(
+    "Jobs are treated as an unordered list. "
+    "The app calculates the geographical route automatically."
+)
+
+uploaded_file = st.file_uploader(
+    "Upload today's jobs",
+    type=[
+        "csv",
+        "xlsx",
+        "xls",
+    ],
+)
+
+
 if uploaded_file is not None:
-    if st.session_state.get("uploaded_filename") != uploaded_file.name:
-        st.session_state.pop("master_df", None)
-        st.session_state.pop("route_data", None)
-        st.session_state.pop("failed_jobs", None)
 
-    st.session_state.uploaded_filename = uploaded_file.name
+    try:
 
-    if "master_df" not in st.session_state:
-        try:
-            if uploaded_file.name.lower().endswith(".xlsx"):
-                df = pd.read_excel(uploaded_file)
-            else:
-                df = pd.read_csv(uploaded_file)
+        if uploaded_file.name.lower().endswith(
+            ".csv"
+        ):
 
-            df.columns = (
-                df.columns.astype(str)
-                .str.strip()
+            uploaded_df = pd.read_csv(
+                uploaded_file
             )
 
-            required = ["Postcode", "Price", "Phone"]
-            missing = [
-                column
-                for column in required
-                if column not in df.columns
+        else:
+
+            uploaded_df = pd.read_excel(
+                uploaded_file
+            )
+
+        uploaded_df.columns = [
+            str(c).strip()
+            for c in uploaded_df.columns
+        ]
+
+        # ----------------------------------------------------
+        # Find postcode column
+        # ----------------------------------------------------
+
+        postcode_column = None
+
+        for column in uploaded_df.columns:
+
+            if column.lower() == "postcode":
+
+                postcode_column = column
+                break
+
+        if postcode_column is None:
+
+            st.error(
+                "The file must contain a Postcode column."
+            )
+
+            st.stop()
+
+        if postcode_column != "postcode":
+
+            uploaded_df = uploaded_df.rename(
+                columns={
+                    postcode_column:
+                        "postcode"
+                }
+            )
+
+        # ----------------------------------------------------
+        # Find price column
+        # ----------------------------------------------------
+
+        price_column = None
+
+        for column in uploaded_df.columns:
+
+            if column.lower() == "price":
+
+                price_column = column
+                break
+
+        if price_column is None:
+
+            st.error(
+                "The file must contain a Price column."
+            )
+
+            st.stop()
+
+        if price_column != "price":
+
+            uploaded_df = uploaded_df.rename(
+                columns={
+                    price_column:
+                        "price"
+                }
+            )
+
+        # ----------------------------------------------------
+        # Find phone column
+        # ----------------------------------------------------
+
+        phone_column = None
+
+        for column in uploaded_df.columns:
+
+            if column.lower() == "phone":
+
+                phone_column = column
+                break
+
+        if phone_column is None:
+
+            uploaded_df["phone"] = ""
+
+        elif phone_column != "phone":
+
+            uploaded_df = uploaded_df.rename(
+                columns={
+                    phone_column:
+                        "phone"
+                }
+            )
+
+        # ----------------------------------------------------
+        # Clean data
+        # ----------------------------------------------------
+
+        uploaded_df["postcode"] = (
+            uploaded_df[
+                "postcode"
             ]
+            .apply(normalise_postcode)
+        )
 
-            if missing:
-                st.error(
-                    "Missing required columns: "
-                    + ", ".join(missing)
-                )
-                st.stop()
+        uploaded_df["price"] = (
+            uploaded_df[
+                "price"
+            ]
+            .apply(
+                lambda x:
+                safe_float(x)
+            )
+        )
 
-            df = df.dropna(how="all").copy()
+        uploaded_df["phone"] = (
+            uploaded_df[
+                "phone"
+            ]
+            .apply(normalise_phone)
+        )
 
-            df["Postcode"] = (
-                df["Postcode"]
-                .fillna("")
-                .astype(str)
-                .map(normalise_postcode)
+        # ----------------------------------------------------
+        # Add stable IDs
+        # ----------------------------------------------------
+
+        job_ids = []
+
+        for _, row in uploaded_df.iterrows():
+
+            address = get_address_text(
+                row
             )
 
-            df = df[
-                ~df["Postcode"].isin(["", "NAN", "NAT"])
-            ].copy()
-
-            df["Price"] = pd.to_numeric(
-                df["Price"],
-                errors="coerce",
+            job_id = make_job_id(
+                row["postcode"],
+                address,
+                route_date_text,
             )
 
-            df = df[
-                df["Price"].notna()
-                & (df["Price"] > 0)
-            ].copy()
-
-            df["Phone"] = (
-                df["Phone"]
-                .fillna("")
-                .astype(str)
-                .str.strip()
+            job_ids.append(
+                job_id
             )
 
-            df = df[
-                ~df["Phone"]
-                .str.lower()
-                .isin(["", "nan", "nat"])
-            ].copy()
+        uploaded_df["job_id"] = job_ids
 
-            df["Phone"] = df["Phone"].map(normalise_phone)
+        uploaded_df[
+            "service_date"
+        ] = route_date_text
 
-            # Add stable identifiers and persistence fields.
-            job_ids = []
-            address_texts = []
+        # ----------------------------------------------------
+        # Merge saved information
+        # ----------------------------------------------------
 
-            for row_number, (_, row) in enumerate(
-                df.iterrows(),
-                start=1,
-            ):
-                job_ids.append(
-                    make_job_id(
-                        service_date_str,
-                        row_number,
-                        row["Postcode"],
-                        row["Phone"],
-                    )
+        if not existing_df.empty:
+
+            existing_lookup = (
+                existing_df
+                .set_index("job_id")
+                .to_dict("index")
+            )
+
+        else:
+
+            existing_lookup = {}
+
+        statuses = []
+        payments = []
+        payment_times = []
+        completed_times = []
+
+        for job_id in job_ids:
+
+            old = existing_lookup.get(
+                job_id,
+                {},
+            )
+
+            statuses.append(
+                old.get(
+                    "status",
+                    "Pending",
                 )
-                address_texts.append(
-                    get_address_text(row)
+            )
+
+            payments.append(
+                old.get(
+                    "payment",
+                    "Unpaid",
                 )
+            )
 
-            df["job_id"] = job_ids
-            df["service_date"] = service_date_str
-            df["Status"] = "pending"
-            df["Payment"] = "Waiting"
-            df["PaymentTime"] = ""
-            df["CompletedTime"] = ""
-            df["route_order"] = None
-            df["address_text"] = address_texts
-            df["latitude"] = None
-            df["longitude"] = None
-            df["geo_query"] = ""
-            df["created_at"] = now_text()
-
-            # If this day already exists, do not overwrite completed
-            # or payment information.
-            existing = load_day(service_date_str)
-
-            if not existing.empty:
-                existing_small = existing[
-                    [
-                        "job_id",
-                        "Status",
-                        "Payment",
-                        "PaymentTime",
-                        "CompletedTime",
-                        "route_order",
-                        "latitude",
-                        "longitude",
-                        "geo_query",
-                        "address_text",
-                    ]
-                ].copy()
-
-                df = df.drop(
-                    columns=[
-                        "Status",
-                        "Payment",
-                        "PaymentTime",
-                        "CompletedTime",
-                        "route_order",
-                        "latitude",
-                        "longitude",
-                        "geo_query",
-                        "address_text",
-                    ],
-                    errors="ignore",
-                ).merge(
-                    existing_small,
-                    on="job_id",
-                    how="left",
+            payment_times.append(
+                old.get(
+                    "payment_time",
+                    "",
                 )
+            )
 
-                df["Status"] = df["Status"].fillna("pending")
-                df["Payment"] = df["Payment"].fillna("Waiting")
-                df["PaymentTime"] = df["PaymentTime"].fillna("")
-                df["CompletedTime"] = df["CompletedTime"].fillna("")
-                df["address_text"] = df["address_text"].fillna("")
-                df["geo_query"] = df["geo_query"].fillna("")
+            completed_times.append(
+                old.get(
+                    "completed_time",
+                    "",
+                )
+            )
 
-            save_dataframe(df)
-            st.session_state.master_df = df.reset_index(drop=True)
-            st.session_state.pop("route_data", None)
-            st.session_state.pop("failed_jobs", None)
-            st.rerun()
+        uploaded_df[
+            "status"
+        ] = statuses
 
-        except Exception as exc:
-            st.error(f"Error loading file: {exc}")
+        uploaded_df[
+            "payment"
+        ] = payments
+
+        uploaded_df[
+            "payment_time"
+        ] = payment_times
+
+        uploaded_df[
+            "completed_time"
+        ] = completed_times
+
+        uploaded_df[
+            "address_text"
+        ] = uploaded_df.apply(
+            get_address_text,
+            axis=1,
+        )
+
+        uploaded_df[
+            "created_at"
+        ] = now_text()
+
+        # ----------------------------------------------------
+        # Save uploaded jobs
+        # ----------------------------------------------------
+
+        save_dataframe(
+            uploaded_df
+        )
+
+        st.success(
+            f"{len(uploaded_df)} jobs loaded."
+        )
+
+        st.session_state[
+            "uploaded_jobs"
+        ] = uploaded_df.copy()
+
+    except Exception as e:
+
+        st.error(
+            f"Could not read the file: {e}"
+        )
 
 
 # ============================================================
-# WAIT FOR DATA
+# LOAD CURRENT DATA
 # ============================================================
 
-if "master_df" not in st.session_state:
+day_df = load_day(
+    route_date_text
+)
+
+if day_df.empty:
+
     st.info(
-        "Upload your day's file to begin. "
-        "If you have already planned this date, the saved day "
-        "will load automatically."
+        "Upload your jobs file to begin."
     )
+
     st.stop()
 
 
-df = st.session_state.master_df
-
-
 # ============================================================
-# PLAN ROUTE
+# PLAN / RE-PLAN ROUTE
 # ============================================================
+
+st.markdown("---")
 
 if st.button(
-    "🚀 PLAN / RE-PLAN BEST DAILY ROUTE",
+    "🧭 PLAN / RE-PLAN ROUTE",
     type="primary",
     use_container_width=True,
 ):
-    if df.empty:
-        st.error("No valid customer jobs found.")
-        st.stop()
-
-    with st.spinner("📍 Locating your depot..."):
-        depot_coords = get_coords(
-            DEPOT_FULL_ADDRESS,
-            DEPOT_POSTCODE,
-        )
-
-    if depot_coords is None:
-        st.error("Could not locate the depot.")
-        st.stop()
-
-    # Plan only jobs that have not already been completed.
-    work_df = df[
-        df["Status"].astype(str).str.lower() != "completed"
-    ].copy()
-
-    if work_df.empty:
-        st.success("🎉 All jobs for this day are already completed.")
-        st.stop()
 
     progress = st.progress(
         0,
-        text="Locating customer addresses...",
+        text="Starting route planning..."
     )
 
-    valid_rows = []
-    failed_rows = []
+    # --------------------------------------------------------
+    # DEPOT
+    # --------------------------------------------------------
 
-    total = len(work_df)
+    depot_row = pd.Series({
+        "postcode":
+            normalise_postcode(
+                depot_postcode
+            ),
+        "address":
+            depot_address,
+    })
 
-    for number, (idx, row) in enumerate(
+    progress.progress(
+        5,
+        text="Finding depot..."
+    )
+
+    depot_geo = get_coords(
+        depot_row
+    )
+
+    if depot_geo is None:
+
+        st.error(
+            "Could not find the depot location."
+        )
+
+        st.stop()
+
+    # --------------------------------------------------------
+    # ACTIVE JOBS
+    #
+    # IMPORTANT:
+    # Completed jobs are excluded.
+    # The remaining jobs are NOT sorted according to
+    # the uploaded file.
+    # --------------------------------------------------------
+
+    work_df = day_df[
+        day_df["status"] != "Completed"
+    ].copy()
+
+    if work_df.empty:
+
+        st.success(
+            "All jobs are already completed."
+        )
+
+        st.stop()
+
+    # --------------------------------------------------------
+    # GEOCODE JOBS
+    # --------------------------------------------------------
+
+    coords = [
+        (
+            depot_geo["longitude"],
+            depot_geo["latitude"],
+        )
+    ]
+
+    geo_rows = []
+
+    failed_addresses = []
+
+    total_jobs = len(
+        work_df
+    )
+
+    for position, (_, row) in enumerate(
         work_df.iterrows(),
         start=1,
     ):
-        query = build_geo_query(
-            row,
-            DEPOT_POSTCODE,
+
+        progress_value = int(
+            5
+            +
+            (
+                position
+                / total_jobs
+            )
+            * 35
         )
-
-        coords = get_coords(
-            query,
-            row["Postcode"],
-        )
-
-        if coords is None:
-            failed_rows.append(idx)
-        else:
-            valid_rows.append(idx)
-
-            # Store geocoding results in the master dataframe.
-            df.at[idx, "latitude"] = coords[0]
-            df.at[idx, "longitude"] = coords[1]
-            df.at[idx, "geo_query"] = query
-            df.at[idx, "address_text"] = get_address_text(row)
 
         progress.progress(
-            number / total,
-            text=f"Locating customer {number}/{total}",
+            progress_value,
+            text=(
+                f"Finding address "
+                f"{position}/{total_jobs}..."
+            ),
         )
 
-        # Respect Nominatim's public-service usage.
-        # Cached addresses do not incur the delay.
-        if cache_key_for(query, row["Postcode"]) not in st.session_state.geocode_cache:
-            time.sleep(1)
+        geo = get_coords(
+            row
+        )
+
+        if geo is None:
+
+            failed_addresses.append(
+                row["postcode"]
+            )
+
+            continue
+
+        coords.append(
+            (
+                geo["longitude"],
+                geo["latitude"],
+            )
+        )
+
+        geo_rows.append(
+            (
+                row,
+                geo,
+            )
+        )
+
+    if failed_addresses:
+
+        st.error(
+            "Could not locate these postcodes: "
+            + ", ".join(
+                failed_addresses
+            )
+        )
+
+        progress.empty()
+
+        st.stop()
+
+    if not geo_rows:
+
+        st.error(
+            "No jobs could be geocoded."
+        )
+
+        progress.empty()
+
+        st.stop()
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # We rebuild the routing dataframe from the geocoded
+    # jobs.
+    #
+    # The order here is ONLY the matrix index order.
+    #
+    # It is NOT the route order.
+    # --------------------------------------------------------
+
+    routing_rows = []
+
+    for matrix_index, (
+        row,
+        geo,
+    ) in enumerate(
+        geo_rows,
+        start=1,
+    ):
+
+        routing_rows.append({
+            "matrix_index":
+                matrix_index,
+            "job_id":
+                row["job_id"],
+            "postcode":
+                row["postcode"],
+            "price":
+                safe_float(
+                    row["price"]
+                ),
+            "phone":
+                row.get(
+                    "phone",
+                    "",
+                ),
+            "status":
+                row.get(
+                    "status",
+                    "Pending",
+                ),
+            "payment":
+                row.get(
+                    "payment",
+                    "Unpaid",
+                ),
+            "payment_time":
+                row.get(
+                    "payment_time",
+                    "",
+                ),
+            "completed_time":
+                row.get(
+                    "completed_time",
+                    "",
+                ),
+            "address_text":
+                row.get(
+                    "address_text",
+                    "",
+                ),
+            "latitude":
+                geo["latitude"],
+            "longitude":
+                geo["longitude"],
+            "geo_query":
+                geo.get(
+                    "geo_query",
+                    "",
+                ),
+        })
+
+    routing_df = pd.DataFrame(
+        routing_rows
+    )
+
+    # --------------------------------------------------------
+    # ROAD MATRIX
+    # --------------------------------------------------------
+
+    progress.progress(
+        45,
+        text=(
+            "Calculating real road distances "
+            "and driving times..."
+        ),
+    )
+
+    try:
+
+        if not API_KEY:
+
+            raise ValueError(
+                "API_KEY is missing."
+            )
+
+        distance_matrix, duration_matrix = (
+            get_ors_matrix(
+                coords,
+                API_KEY,
+            )
+        )
+
+        routing_source = (
+            "OpenRouteService live road routing"
+        )
+
+    except Exception as e:
+
+        st.warning(
+            "OpenRouteService could not be used. "
+            "Using offline geographical routing instead."
+        )
+
+        distance_matrix, duration_matrix = (
+            offline_matrix(
+                coords
+            )
+        )
+
+        routing_source = (
+            "Offline geographical estimate"
+        )
+
+    # --------------------------------------------------------
+    # OPTIMISE
+    #
+    # THIS IS THE IMPORTANT PART.
+    #
+    # coords is passed into optimise_route().
+    #
+    # The uploaded file order is ignored.
+    # --------------------------------------------------------
+
+    progress.progress(
+        60,
+        text=(
+            "Finding the best geographical route..."
+        ),
+    )
+
+    optimised_route = optimise_route(
+        distance_matrix,
+        duration_matrix,
+        coords,
+    )
+
+    # --------------------------------------------------------
+    # METRICS
+    # --------------------------------------------------------
+
+    progress.progress(
+        85,
+        text="Calculating route totals..."
+    )
+
+    metrics = route_metrics(
+        optimised_route,
+        distance_matrix,
+        duration_matrix,
+        mpg,
+        fuel_price,
+    )
+
+    # --------------------------------------------------------
+    # BUILD FINAL ROUTE DATA
+    # --------------------------------------------------------
+
+    final_rows = []
+
+    route_order = 1
+
+    for matrix_index in optimised_route:
+
+        # Depot
+        if matrix_index == 0:
+
+            final_rows.append({
+                "route_order":
+                    route_order,
+                "job_id":
+                    "DEPOT",
+                "postcode":
+                    depot_postcode,
+                "address_text":
+                    depot_address,
+                "price":
+                    0.0,
+                "phone":
+                    "",
+                "status":
+                    "Depot",
+                "payment":
+                    "",
+                "payment_time":
+                    "",
+                "completed_time":
+                    "",
+                "latitude":
+                    depot_geo[
+                        "latitude"
+                    ],
+                "longitude":
+                    depot_geo[
+                        "longitude"
+                    ],
+                "geo_query":
+                    depot_address,
+            })
+
+        else:
+
+            row = routing_df[
+                routing_df[
+                    "matrix_index"
+                ]
+                == matrix_index
+            ]
+
+            if row.empty:
+                continue
+
+            row = row.iloc[0]
+
+            final_rows.append({
+                "route_order":
+                    route_order,
+                "job_id":
+                    row["job_id"],
+                "postcode":
+                    row["postcode"],
+                "address_text":
+                    row["address_text"],
+                "price":
+                    row["price"],
+                "phone":
+                    row["phone"],
+                "status":
+                    row["status"],
+                "payment":
+                    row["payment"],
+                "payment_time":
+                    row["payment_time"],
+                "completed_time":
+                    row["completed_time"],
+                "latitude":
+                    row["latitude"],
+                "longitude":
+                    row["longitude"],
+                "geo_query":
+                    row["geo_query"],
+            })
+
+        route_order += 1
+
+    route_data = pd.DataFrame(
+        final_rows
+    )
+
+    # --------------------------------------------------------
+    # SAVE ROUTE ORDER
+    # --------------------------------------------------------
+
+    for _, row in route_data.iterrows():
+
+        if row["job_id"] == "DEPOT":
+            continue
+
+        save_job({
+            "job_id":
+                row["job_id"],
+            "service_date":
+                route_date_text,
+            "postcode":
+                row["postcode"],
+            "price":
+                row["price"],
+            "phone":
+                row["phone"],
+            "status":
+                row["status"],
+            "payment":
+                row["payment"],
+            "payment_time":
+                row["payment_time"],
+            "completed_time":
+                row["completed_time"],
+            "route_order":
+                int(
+                    row["route_order"]
+                ),
+            "address_text":
+                row["address_text"],
+            "latitude":
+                row["latitude"],
+            "longitude":
+                row["longitude"],
+            "geo_query":
+                row["geo_query"],
+            "created_at":
+                now_text(),
+        })
+
+    # --------------------------------------------------------
+    # SAVE ROUTE IN SESSION
+    # --------------------------------------------------------
+
+    st.session_state[
+        "route_data"
+    ] = route_data
+
+    st.session_state[
+        "route_metrics"
+    ] = metrics
+
+    st.session_state[
+        "routing_source"
+    ] = routing_source
+
+    progress.progress(
+        100,
+        text="Route complete."
+    )
+
+    time.sleep(0.5)
 
     progress.empty()
 
-    if failed_rows:
-        st.session_state.failed_jobs = (
-            df.loc[failed_rows].copy()
-        )
-    else:
-        st.session_state.failed_jobs = pd.DataFrame()
-
-    if not valid_rows:
-        st.error("No customer addresses could be located.")
-        st.stop()
-
-    rows = [
-        {
-            "Postcode": DEPOT_POSTCODE,
-            "Price": 0.0,
-            "Phone": "",
-            "Status": "depot",
-            "Payment": "Waiting",
-            "geo_query": DEPOT_FULL_ADDRESS,
-            "latitude": depot_coords[0],
-            "longitude": depot_coords[1],
-        }
-    ]
-
-    locations = [[depot_coords[1], depot_coords[0]]]
-
-    for idx in valid_rows:
-        row = df.loc[idx].to_dict()
-        rows.append(row)
-        locations.append(
-            [
-                float(row["longitude"]),
-                float(row["latitude"]),
-            ]
-        )
-
-    routing_df = pd.DataFrame(rows)
-
-    with st.spinner(
-        "🛣️ Getting actual road distances and driving times..."
-    ):
-        distances, durations = get_ors_matrix(locations)
-
-    using_offline = False
-
-    if distances is None or durations is None:
-        using_offline = True
-        st.warning(
-            "OpenRouteService could not provide the live road matrix. "
-            "Using an offline estimate instead."
-        )
-        distances, durations = offline_matrix(locations)
-
-    with st.spinner(
-        f"🧠 Optimising {len(valid_rows)} customer stops..."
-    ):
-        route = optimise_route(
-            distances,
-            durations,
-            FUEL_PRICE,
-            MPG,
-        )
-
-    if not route:
-        st.error("The route optimiser could not create a route.")
-        st.stop()
-
-    metrics = route_metrics(
-        route,
-        distances,
-        durations,
-        FUEL_PRICE,
-        MPG,
+    st.success(
+        "Route successfully optimised."
     )
-
-    revenue = float(
-        routing_df["Price"].sum()
-    )
-
-    fuel_cost = metrics["fuel_cost"]
-    pre_tax_profit = revenue - fuel_cost
-    take_home = pre_tax_profit * (1 - TAX_RATE)
-
-    # Save route order back against stable job IDs.
-    final_rows = routing_df.iloc[route].reset_index(drop=True)
-
-    customer_order = 0
-
-    for _, route_row in final_rows.iterrows():
-        if str(route_row.get("Status", "")).lower() == "depot":
-            continue
-
-        job_id = route_row.get("job_id")
-        if job_id in set(df["job_id"].astype(str)):
-            master_idx = df.index[
-                df["job_id"].astype(str) == str(job_id)
-            ][0]
-
-            df.at[master_idx, "route_order"] = customer_order
-            customer_order += 1
-
-    # Persist every changed row.
-    save_dataframe(df)
-
-    st.session_state.master_df = df
-
-    st.session_state.route_data = {
-        "revenue": revenue,
-        "fuel_cost": fuel_cost,
-        "take_home": take_home,
-        "miles": metrics["miles"],
-        "litres": metrics["litres"],
-        "time": metrics["time_s"],
-        "offline": using_offline,
-        "jobs": len(valid_rows),
-        "completed": int(
-            df["Status"]
-            .astype(str)
-            .str.lower()
-            .eq("completed")
-            .sum()
-        ),
-        "persisted_only": False,
-    }
 
     st.rerun()
 
 
 # ============================================================
-# DASHBOARD
+# GET ROUTE FROM SESSION / DATABASE
 # ============================================================
 
-route_data = st.session_state.get("route_data")
-
-if route_data:
-    st.markdown("---")
-    st.subheader("💰 Daily Route Summary")
-
-    customer_df = df.copy()
-
-    total_jobs = len(customer_df)
-    completed_jobs = int(
-        customer_df["Status"]
-        .astype(str)
-        .str.lower()
-        .eq("completed")
-        .sum()
-    )
-
-    paid_jobs = int(
-        customer_df["Payment"]
-        .astype(str)
-        .str.lower()
-        .isin(["cash", "bank transfer", "card", "paid"])
-        .sum()
-    )
-
-    unpaid_jobs = int(
-        customer_df["Payment"]
-        .astype(str)
-        .str.lower()
-        .isin(["not paid", "waiting"])
-        .sum()
-    )
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.metric(
-            "Take-Home",
-            f"£{route_data['take_home']:.2f}",
-        )
-    with c2:
-        st.metric(
-            "Revenue",
-            f"£{route_data['revenue']:.2f}",
-        )
-
-    c3, c4 = st.columns(2)
-    with c3:
-        st.metric(
-            "Driving Distance",
-            f"{route_data['miles']:.1f} miles",
-        )
-    with c4:
-        st.metric(
-            "Driving Time",
-            format_duration(route_data["time"]),
-        )
-
-    c5, c6 = st.columns(2)
-    with c5:
-        st.metric(
-            "Fuel Cost",
-            f"£{route_data['fuel_cost']:.2f}",
-        )
-    with c6:
-        st.metric(
-            "Fuel Used",
-            f"{route_data['litres']:.1f} litres",
-        )
-
-    c7, c8, c9 = st.columns(3)
-    with c7:
-        st.metric("Jobs", total_jobs)
-    with c8:
-        st.metric("Completed", completed_jobs)
-    with c9:
-        st.metric("Paid", paid_jobs)
-
-    if unpaid_jobs:
-        st.warning(
-            f"{unpaid_jobs} job(s) are still showing as Waiting / Not Paid."
-        )
-
-    if route_data["offline"]:
-        st.warning(
-            "This route used estimated distances because "
-            "the live road-routing matrix was unavailable."
-        )
-    elif route_data.get("persisted_only"):
-        st.info(
-            "This day's jobs were restored from saved records. "
-            "Press PLAN / RE-PLAN to refresh live route mileage and time."
-        )
-    else:
-        st.success(
-            "✅ Route calculated using live road distance and driving time."
-        )
-
-
-# ============================================================
-# FAILED ADDRESSES
-# ============================================================
-
-failed_jobs = st.session_state.get(
-    "failed_jobs",
-    pd.DataFrame(),
+route_data = st.session_state.get(
+    "route_data"
 )
 
-if not failed_jobs.empty:
-    st.markdown("---")
-    st.error(
-        f"{len(failed_jobs)} customer(s) could not be located. "
-        "They were NOT included in the route."
+route_metrics_data = st.session_state.get(
+    "route_metrics"
+)
+
+routing_source = st.session_state.get(
+    "routing_source",
+    "Route not yet calculated",
+)
+
+
+# ============================================================
+# IF NO ROUTE YET
+# ============================================================
+
+if route_data is None:
+
+    # Try reconstructing a saved route
+    saved = load_day(
+        route_date_text
     )
 
-    with st.expander("View unlocated customers"):
-        st.dataframe(
-            failed_jobs,
-            use_container_width=True,
+    saved = saved[
+        saved["route_order"].notna()
+    ].copy()
+
+    if not saved.empty:
+
+        saved["route_order"] = (
+            saved[
+                "route_order"
+            ]
+            .astype(int)
         )
 
+        route_data = saved.sort_values(
+            "route_order"
+        )
+
+    else:
+
+        st.info(
+            "Press PLAN / RE-PLAN ROUTE to calculate today's route."
+        )
+
+        st.stop()
+
 
 # ============================================================
-# SIDEBAR NEXT STOP
+# DASHBOARD METRICS
 # ============================================================
 
-customers = df[
-    df["Status"].astype(str).str.lower() != "depot"
+customer_route = route_data[
+    route_data["job_id"] != "DEPOT"
 ].copy()
 
-pending = customers[
-    customers["Status"].astype(str).str.lower() != "completed"
-].copy()
+revenue = customer_route[
+    "price"
+].apply(
+    safe_float
+).sum()
 
-if "route_order" in pending.columns:
-    pending["_sort"] = pd.to_numeric(
-        pending["route_order"],
-        errors="coerce",
-    )
-    pending = pending.sort_values(
-        ["_sort"],
-        na_position="last",
+if route_metrics_data:
+
+    driving_distance = (
+        route_metrics_data[
+            "distance_miles"
+        ]
     )
 
-if not pending.empty:
-    next_row = pending.iloc[0]
-    destination = get_destination(next_row)
+    driving_time = (
+        route_metrics_data[
+            "time_s"
+        ]
+    )
+
+    fuel_cost = (
+        route_metrics_data[
+            "fuel_cost"
+        ]
+    )
+
+    fuel_used = (
+        route_metrics_data[
+            "litres"
+        ]
+    )
+
+else:
+
+    driving_distance = 0
+    driving_time = 0
+    fuel_cost = 0
+    fuel_used = 0
+
+
+st.markdown("---")
+
+col1, col2, col3, col4, col5 = (
+    st.columns(5)
+)
+
+col1.metric(
+    "Revenue",
+    f"£{revenue:,.2f}",
+)
+
+col2.metric(
+    "Driving Distance",
+    f"{driving_distance:,.1f} miles",
+)
+
+col3.metric(
+    "Driving Time",
+    format_duration(
+        driving_time
+    ),
+)
+
+col4.metric(
+    "Fuel Cost",
+    f"£{fuel_cost:,.2f}",
+)
+
+col5.metric(
+    "Fuel Used",
+    f"{fuel_used:,.1f} L",
+)
+
+st.caption(
+    f"Routing method: {routing_source}"
+)
+
+
+# ============================================================
+# LONG ROUTE WARNING
+# ============================================================
+
+if driving_time > 8 * 3600:
+
+    st.warning(
+        "⚠️ This route is over 8 hours of driving. "
+        "The optimiser has calculated the best route it can "
+        "from the available jobs, but the day may be too large "
+        "to complete comfortably."
+    )
+
+
+# ============================================================
+# FAILED / MISSING ADDRESS CHECK
+# ============================================================
+
+missing_coords = route_data[
+    route_data["latitude"].isna()
+    |
+    route_data["longitude"].isna()
+]
+
+if not missing_coords.empty:
+
+    st.error(
+        "Some addresses do not have coordinates:"
+    )
+
+    st.dataframe(
+        missing_coords[
+            [
+                "postcode",
+                "address_text",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# ============================================================
+# NEXT STOP
+# ============================================================
+
+pending_jobs = route_data[
+    (
+        route_data["job_id"]
+        != "DEPOT"
+    )
+    &
+    (
+        route_data["status"]
+        != "Completed"
+    )
+].sort_values(
+    "route_order"
+)
+
+if not pending_jobs.empty:
+
+    next_stop = pending_jobs.iloc[0]
 
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🧭 Route Navigation")
+    st.sidebar.subheader(
+        "📍 Next stop"
+    )
+
+    st.sidebar.write(
+        f"**Stop {int(next_stop['route_order'])}**"
+    )
+
+    st.sidebar.write(
+        next_stop["address_text"]
+        or next_stop["postcode"]
+    )
 
     st.sidebar.link_button(
-        "🚗 Navigate to Next Stop",
-        maps_url(destination),
+        "🗺️ Navigate",
+        maps_url(
+            destination_for_job(
+                next_stop
+            )
+        ),
         use_container_width=True,
-    )
-
-    st.sidebar.caption(
-        f"Next: {destination}"
-    )
-
-    st.sidebar.caption(
-        f"{len(pending)} stops remaining"
-    )
-else:
-    st.sidebar.markdown("---")
-    st.sidebar.success(
-        "🎉 All customer stops completed!"
     )
 
 
@@ -1610,257 +2893,304 @@ else:
 # ============================================================
 
 st.markdown("---")
-st.subheader("📍 Planned Route")
+st.subheader("🧭 Today's Route")
 
-# Completed jobs are kept in records but displayed separately.
-route_df = df[
-    df["Status"].astype(str).str.lower() != "completed"
-].copy()
+display_route = route_data.sort_values(
+    "route_order"
+).copy()
 
-if "route_order" in route_df.columns:
-    route_df["_route_sort"] = pd.to_numeric(
-        route_df["route_order"],
-        errors="coerce",
-    )
-    route_df = route_df.sort_values(
-        "_route_sort",
-        na_position="last",
+for _, row in display_route.iterrows():
+
+    order = int(
+        row["route_order"]
     )
 
-with st.container(border=True):
-    st.write("### 🏠 START — GRANTHAM DEPOT")
-    st.write(DEPOT_FULL_ADDRESS)
+    job_id = row["job_id"]
 
-if route_df.empty:
-    st.success("No pending stops remain.")
-else:
-    for display_number, (idx, row) in enumerate(
-        route_df.iterrows(),
-        start=1,
-    ):
-        postcode = clean_val(row.get("Postcode"))
-        price = float(row.get("Price", 0))
-        phone = clean_val(row.get("Phone"))
-        status = clean_val(row.get("Status")).lower()
-        payment = clean_val(row.get("Payment")) or "Waiting"
-        destination = get_destination(row)
+    # --------------------------------------------------------
+    # DEPOT
+    # --------------------------------------------------------
 
-        if status == "completed":
-            icon = "✅"
-            text = "Completed"
-        else:
-            icon = "⏳"
-            text = "Pending"
+    if job_id == "DEPOT":
 
-        extra = []
+        st.markdown(
+            f"### 🏠 {order}. DEPOT"
+        )
 
-        ignored = {
-            "postcode",
-            "price",
-            "phone",
-            "status",
-            "payment",
-            "paymenttime",
-            "completedtime",
-            "job_id",
-            "service_date",
-            "route_order",
-            "address_text",
-            "latitude",
-            "longitude",
-            "geo_query",
-            "created_at",
-            "_route_sort",
-        }
+        st.caption(
+            row["address_text"]
+        )
 
-        for column in row.index:
-            if str(column).lower() in ignored:
-                continue
+        continue
 
-            value = clean_val(row.get(column))
-            if value:
-                extra.append(
-                    f"**{column}:** {value}"
+    # --------------------------------------------------------
+    # CUSTOMER
+    # --------------------------------------------------------
+
+    completed = (
+        row["status"]
+        == "Completed"
+    )
+
+    if completed:
+        icon = "✅"
+    else:
+        icon = "🧹"
+
+    with st.container():
+
+        col_a, col_b, col_c = (
+            st.columns(
+                [1, 5, 2]
+            )
+        )
+
+        with col_a:
+
+            st.markdown(
+                f"### {icon}"
+            )
+
+            st.markdown(
+                f"**{order}**"
+            )
+
+        with col_b:
+
+            st.markdown(
+                f"**{row['postcode']}**"
+            )
+
+            st.caption(
+                row["address_text"]
+                or row["postcode"]
+            )
+
+            st.write(
+                f"Price: £{safe_float(row['price']):.2f}"
+            )
+
+            if row.get(
+                "phone",
+                "",
+            ):
+
+                st.caption(
+                    f"📞 {row['phone']}"
                 )
 
-        with st.container(border=True):
-            st.write(
-                f"### {icon} STOP {display_number} — {postcode}"
+        with col_c:
+
+            destination = (
+                destination_for_job(
+                    row
+                )
             )
 
-            if extra:
-                st.write(" | ".join(extra))
-
-            st.write(
-                f"**Price:** £{price:.2f} "
-                f"| **Status:** {text} "
-                f"| **Payment:** {payment}"
+            st.link_button(
+                "🗺️ Navigate",
+                maps_url(
+                    destination
+                ),
+                use_container_width=True,
             )
 
-            col1, col2 = st.columns(2)
+            phone = clean_val(
+                row.get(
+                    "phone",
+                    "",
+                )
+            )
 
-            with col1:
-                if status != "completed":
-                    if st.button(
-                        "✅ Mark Complete",
-                        key=f"complete_{row['job_id']}",
+            if phone:
+
+                message = (
+                    "Hello, this is Dan from "
+                    "DanCleanUK. I'm on my way."
+                )
+
+                wa = whatsapp_url(
+                    phone,
+                    message,
+                )
+
+                if wa:
+
+                    st.link_button(
+                        "💬 WhatsApp",
+                        wa,
                         use_container_width=True,
-                    ):
-                        master_idx = df.index[
-                            df["job_id"].astype(str)
-                            == str(row["job_id"])
-                        ][0]
+                    )
 
-                        df.at[
-                            master_idx,
-                            "Status",
-                        ] = "completed"
+        # ----------------------------------------------------
+        # JOB ACTIONS
+        # ----------------------------------------------------
 
-                        df.at[
-                            master_idx,
-                            "CompletedTime",
-                        ] = now_text()
+        action_col1, action_col2, action_col3 = (
+            st.columns(3)
+        )
 
-                        save_job(df.loc[master_idx])
-                        st.session_state.master_df = df
-                        st.rerun()
-                else:
-                    st.success("Completed")
+        with action_col1:
 
-            with col2:
-                st.link_button(
-                    "🚗 Navigate Here",
-                    maps_url(destination),
-                    key=f"nav_{row['job_id']}",
+            if not completed:
+
+                if st.button(
+                    "✅ Complete",
+                    key=f"complete_{job_id}",
                     use_container_width=True,
+                ):
+
+                    save_job({
+                        "job_id":
+                            job_id,
+                        "service_date":
+                            route_date_text,
+                        "postcode":
+                            row["postcode"],
+                        "price":
+                            row["price"],
+                        "phone":
+                            row["phone"],
+                        "status":
+                            "Completed",
+                        "payment":
+                            row["payment"],
+                        "payment_time":
+                            row["payment_time"],
+                        "completed_time":
+                            now_text(),
+                        "route_order":
+                            order,
+                        "address_text":
+                            row["address_text"],
+                        "latitude":
+                            row["latitude"],
+                        "longitude":
+                            row["longitude"],
+                        "geo_query":
+                            row["geo_query"],
+                        "created_at":
+                            now_text(),
+                    })
+
+                    st.rerun()
+
+            else:
+
+                st.success(
+                    "Completed"
                 )
 
-            pay1, pay2, pay3 = st.columns(3)
+        with action_col2:
 
-            with pay1:
-                if st.button(
-                    "💵 Cash",
-                    key=f"cash_{row['job_id']}",
-                    use_container_width=True,
-                ):
-                    master_idx = df.index[
-                        df["job_id"].astype(str)
-                        == str(row["job_id"])
-                    ][0]
+            payment_value = row.get(
+                "payment",
+                "Unpaid",
+            )
 
-                    df.at[
-                        master_idx,
-                        "Payment",
-                    ] = "Cash"
+            if payment_value == "Paid":
 
-                    df.at[
-                        master_idx,
-                        "PaymentTime",
-                    ] = now_text()
-
-                    save_job(df.loc[master_idx])
-                    st.session_state.master_df = df
-                    st.rerun()
-
-            with pay2:
-                if st.button(
-                    "🏦 Bank Transfer",
-                    key=f"bank_{row['job_id']}",
-                    use_container_width=True,
-                ):
-                    master_idx = df.index[
-                        df["job_id"].astype(str)
-                        == str(row["job_id"])
-                    ][0]
-
-                    df.at[
-                        master_idx,
-                        "Payment",
-                    ] = "Bank Transfer"
-
-                    df.at[
-                        master_idx,
-                        "PaymentTime",
-                    ] = now_text()
-
-                    save_job(df.loc[master_idx])
-                    st.session_state.master_df = df
-                    st.rerun()
-
-            with pay3:
-                if st.button(
-                    "❌ Not Paid",
-                    key=f"notpaid_{row['job_id']}",
-                    use_container_width=True,
-                ):
-                    master_idx = df.index[
-                        df["job_id"].astype(str)
-                        == str(row["job_id"])
-                    ][0]
-
-                    df.at[
-                        master_idx,
-                        "Payment",
-                    ] = "Not Paid"
-
-                    df.at[
-                        master_idx,
-                        "PaymentTime",
-                    ] = now_text()
-
-                    save_job(df.loc[master_idx])
-                    st.session_state.master_df = df
-                    st.rerun()
-
-            if status == "completed" and phone:
-                st.link_button(
-                    "💬 Send WhatsApp Payment Message",
-                    whatsapp_url(phone, price),
-                    use_container_width=True,
+                st.success(
+                    "💷 Paid"
                 )
 
-with st.container(border=True):
-    st.write("### 🏁 FINISH — GRANTHAM DEPOT")
-    st.write(DEPOT_FULL_ADDRESS)
+            else:
 
-    st.link_button(
-        "🚗 Navigate Back to Depot",
-        maps_url(DEPOT_FULL_ADDRESS),
-        use_container_width=True,
+                if st.button(
+                    "💷 Mark Paid",
+                    key=f"paid_{job_id}",
+                    use_container_width=True,
+                ):
+
+                    save_job({
+                        "job_id":
+                            job_id,
+                        "service_date":
+                            route_date_text,
+                        "postcode":
+                            row["postcode"],
+                        "price":
+                            row["price"],
+                        "phone":
+                            row["phone"],
+                        "status":
+                            row["status"],
+                        "payment":
+                            "Paid",
+                        "payment_time":
+                            now_text(),
+                        "completed_time":
+                            row["completed_time"],
+                        "route_order":
+                            order,
+                        "address_text":
+                            row["address_text"],
+                        "latitude":
+                            row["latitude"],
+                        "longitude":
+                            row["longitude"],
+                        "geo_query":
+                            row["geo_query"],
+                        "created_at":
+                            now_text(),
+                    })
+
+                    st.rerun()
+
+        with action_col3:
+
+            if st.button(
+                "🔄 Re-plan",
+                key=f"replan_{job_id}",
+                use_container_width=True,
+            ):
+
+                st.info(
+                    "Press PLAN / RE-PLAN ROUTE above "
+                    "to recalculate the complete route."
+                )
+
+    st.markdown("---")
+
+
+# ============================================================
+# COMPLETED SUMMARY
+# ============================================================
+
+completed_df = route_data[
+    (
+        route_data["job_id"]
+        != "DEPOT"
     )
-
-
-# ============================================================
-# COMPLETED / PAYMENT SUMMARY
-# ============================================================
-
-completed_df = df[
-    df["Status"].astype(str).str.lower() == "completed"
+    &
+    (
+        route_data["status"]
+        == "Completed"
+    )
 ].copy()
 
 if not completed_df.empty:
-    st.markdown("---")
-    st.subheader("✅ Completed Jobs")
 
-    show_completed = completed_df[
-        [
-            column
-            for column in [
-                "Postcode",
-                "Price",
-                "Phone",
-                "Payment",
-                "PaymentTime",
-                "CompletedTime",
-            ]
-            if column in completed_df.columns
-        ]
-    ].copy()
+    st.subheader(
+        "✅ Completed Jobs"
+    )
 
-    st.dataframe(
-        show_completed,
-        use_container_width=True,
-        hide_index=True,
+    completed_revenue = (
+        completed_df["price"]
+        .apply(safe_float)
+        .sum()
+    )
+
+    c1, c2 = st.columns(2)
+
+    c1.metric(
+        "Completed Jobs",
+        len(completed_df),
+    )
+
+    c2.metric(
+        "Completed Revenue",
+        f"£{completed_revenue:,.2f}",
     )
 
 
@@ -1868,176 +3198,102 @@ if not completed_df.empty:
 # EXCEL EXPORT
 # ============================================================
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("📊 Export Records")
+st.markdown("---")
+st.subheader(
+    "📊 Export"
+)
 
-export_df = df.copy()
+if st.button(
+    "📥 Create Excel report",
+    use_container_width=True,
+):
 
-if not export_df.empty:
-    export_df = export_df[
-        export_df["Status"].astype(str).str.lower() != "depot"
-    ].copy()
-
-    export_columns_to_remove = [
-        "latitude",
-        "longitude",
-        "geo_query",
-        "created_at",
-        "_route_sort",
-    ]
-
-    export_df = export_df.drop(
-        columns=[
-            c for c in export_columns_to_remove
-            if c in export_df.columns
-        ],
-        errors="ignore",
-    )
-
-    # Put useful columns first.
-    preferred = [
-        "Postcode",
-        "Price",
-        "Phone",
-        "Status",
-        "Payment",
-        "PaymentTime",
-        "CompletedTime",
-        "route_order",
-        "address_text",
-        "job_id",
-    ]
-
-    ordered = [
-        c for c in preferred if c in export_df.columns
-    ]
-
-    remaining = [
-        c for c in export_df.columns if c not in ordered
-    ]
-
-    export_df = export_df[ordered + remaining]
-
-    output = io.BytesIO()
     workbook = Workbook()
 
-    summary_ws = workbook.active
-    summary_ws.title = "Daily Summary"
+    worksheet = workbook.active
+    worksheet.title = "Daily Route"
 
-    total_revenue = float(export_df["Price"].sum()) if not export_df.empty else 0
-    completed_count = int(
-        export_df["Status"]
-        .astype(str)
-        .str.lower()
-        .eq("completed")
-        .sum()
-    ) if not export_df.empty else 0
+    export_df = route_data.copy()
 
-    cash_total = float(
-        export_df.loc[
-            export_df["Payment"].astype(str).str.lower() == "cash",
-            "Price",
-        ].sum()
-    ) if not export_df.empty else 0
-
-    bank_total = float(
-        export_df.loc[
-            export_df["Payment"].astype(str).str.lower() == "bank transfer",
-            "Price",
-        ].sum()
-    ) if not export_df.empty else 0
-
-    unpaid_total = float(
-        export_df.loc[
-            export_df["Payment"].astype(str).str.lower().isin(
-                ["waiting", "not paid"]
-            ),
-            "Price",
-        ].sum()
-    ) if not export_df.empty else 0
-
-    summary_rows = [
-        ["DanCleanUK Daily Report", ""],
-        ["Route Date", service_date_str],
-        ["Depot", DEPOT_FULL_ADDRESS],
-        ["Total Jobs", len(export_df)],
-        ["Completed Jobs", completed_count],
-        ["Revenue", total_revenue],
-        ["Cash Received", cash_total],
-        ["Bank Transfer Received", bank_total],
-        ["Outstanding / Unpaid", unpaid_total],
-        ["Fuel Cost", route_data["fuel_cost"] if route_data else 0],
-        ["Fuel Used (litres)", route_data["litres"] if route_data else 0],
-        ["Driving Miles", route_data["miles"] if route_data else 0],
-        ["Driving Time", format_duration(route_data["time"]) if route_data else "0m"],
-        ["Tax Rate", f"{TAX_RATE * 100:.0f}%"],
-        ["Estimated Take-Home", route_data["take_home"] if route_data else 0],
+    export_df = export_df[
+        [
+            "route_order",
+            "postcode",
+            "address_text",
+            "price",
+            "phone",
+            "status",
+            "payment",
+            "payment_time",
+            "completed_time",
+        ]
     ]
-
-    for row in summary_rows:
-        summary_ws.append(row)
-
-    header_fill = PatternFill(
-        start_color="2F4F4F",
-        end_color="2F4F4F",
-        fill_type="solid",
-    )
-
-    header_font = Font(
-        color="FFFFFF",
-        bold=True,
-    )
-
-    summary_ws["A1"].fill = header_fill
-    summary_ws["A1"].font = header_font
-
-    summary_ws.column_dimensions["A"].width = 28
-    summary_ws.column_dimensions["B"].width = 45
-
-    records_ws = workbook.create_sheet("Customer Records")
 
     for row in dataframe_to_rows(
         export_df,
         index=False,
         header=True,
     ):
-        records_ws.append(row)
 
-    for cell in records_ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
+        worksheet.append(row)
+
+    # Header formatting
+    for cell in worksheet[1]:
+
+        cell.font = Font(
+            bold=True
+        )
+
+        cell.fill = PatternFill(
+            "solid",
+            fgColor="D9EAF7",
+        )
+
         cell.alignment = Alignment(
             horizontal="center"
         )
 
-    for column_cells in records_ws.columns:
-        max_length = 0
-        letter = column_cells[0].column_letter
+    # Column widths
+    widths = {
+        "A": 12,
+        "B": 15,
+        "C": 45,
+        "D": 12,
+        "E": 18,
+        "F": 15,
+        "G": 15,
+        "H": 22,
+        "I": 22,
+    }
 
-        for cell in column_cells:
-            try:
-                max_length = max(
-                    max_length,
-                    len(str(cell.value)),
-                )
-            except Exception:
-                pass
+    for column, width in widths.items():
 
-        records_ws.column_dimensions[letter].width = min(
-            max_length + 2,
-            50,
-        )
+        worksheet.column_dimensions[
+            column
+        ].width = width
 
-    workbook.save(output)
+    # Freeze header
+    worksheet.freeze_panes = "A2"
 
-    st.sidebar.download_button(
-        "⬇️ Download Excel Report",
-        output.getvalue(),
-        f"DanCleanUK_{service_date_str}.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+    # Save
+    output = io.BytesIO()
+
+    workbook.save(
+        output
     )
 
-st.sidebar.caption(
-    f"DanCleanUK Route Optimizer v{APP_VERSION}"
-)
+    output.seek(0)
+
+    st.download_button(
+        label="⬇️ Download Excel",
+        data=output,
+        file_name=(
+            f"DanCleanUK_"
+            f"{route_date_text}.xlsx"
+        ),
+        mime=(
+            "application/vnd.openxmlformats-"
+            "officedocument.spreadsheetml.sheet"
+        ),
+        use_container_width=True,
+    )
