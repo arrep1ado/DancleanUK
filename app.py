@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "22.0"
+APP_VERSION = "23.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -601,7 +601,7 @@ def get_coords(query_string, postcode):
     # 2-4. NOMINATIM CANDIDATES
     # --------------------------------------------------------
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/22.0"
+        "User-Agent": "DanCleanUKRouteOptimizer/23.0"
     }
 
     for candidate in geocode_candidates(query, postcode):
@@ -1726,18 +1726,22 @@ def improve_sweep_route(
 
 
 def build_driver_sweep_routes(locations, distances=None, durations=None):
-    """Build routes in broad geographical territories, like a real driver.
+    """Build general-purpose geographic sweep routes.
 
-    V21 deliberately separates the day into a small number of geographic
-    territories and clears each territory before moving to the next one.
-    The depot area is treated as its own territory so Grantham jobs are not
-    repeatedly revisited between rural runs.
+    The route must work for arbitrary customer locations, so this function
+    deliberately does not know anything about Grantham, villages or postcodes.
+
+    Instead it treats the depot as the centre of the working area, creates
+    several possible circular geographic sweeps, and chooses the road-aware
+    ordering later.  Nearby customers are kept together by angle/radius and
+    the route is never forced to return to the depot between territories.
     """
     customer_count = len(locations) - 1
     if customer_count <= 0:
         return []
 
     depot = locations[0]
+    customers = list(range(1, customer_count + 1))
 
     def bearing(index):
         lon, lat = locations[index]
@@ -1748,117 +1752,113 @@ def build_driver_sweep_routes(locations, distances=None, durations=None):
     def radius(index):
         return haversine_points(depot, locations[index])
 
-    customers = list(range(1, customer_count + 1))
     radii = {i: radius(i) for i in customers}
     bearings = {i: bearing(i) for i in customers}
 
-    # The inner ring is the town/depot work.  The exact threshold adapts to
-    # the day's spread, but normally captures the Grantham jobs without
-    # swallowing the surrounding villages.
-    sorted_radii = sorted(radii.values())
-    if customer_count >= 20:
-        ring_index = max(0, min(customer_count - 1, int(customer_count * 0.30) - 1))
-        local_radius = max(2.5, min(4.5, sorted_radii[ring_index]))
-    else:
-        local_radius = max(2.5, min(4.0, sorted_radii[max(0, int(customer_count * 0.25) - 1)]))
+    def road_cost(a, b):
+        if durations is not None:
+            return durations[a][b]
+        if distances is not None:
+            return distances[a][b]
+        return haversine_points(locations[a], locations[b])
 
-    local = [i for i in customers if radii[i] <= local_radius]
-    outer = [i for i in customers if i not in local]
-
-    # If the local ring is too small, keep at least a useful town group.
-    if len(local) < 4 and customer_count >= 8:
-        local = sorted(customers, key=lambda i: radii[i])[:min(6, customer_count)]
-        outer = [i for i in customers if i not in set(local)]
-
-    def local_order(members, start_index):
-        if not members:
-            return []
+    def nearest_first(members, start):
+        """Order a small geographic territory without crossing the whole day."""
         remaining = set(members)
-        sequence = []
-        current = start_index
+        result = []
+        current = start
         while remaining:
-            if distances is not None:
-                nxt = min(
-                    remaining,
-                    key=lambda x: (durations[current][x] if durations is not None else distances[current][x],
-                                   distances[current][x])
-                )
-            else:
-                nxt = min(remaining, key=lambda x: haversine_points(locations[current], locations[x]))
-            sequence.append(nxt)
+            nxt = min(
+                remaining,
+                key=lambda x: (
+                    road_cost(current, x),
+                    radii[x],
+                ),
+            )
+            result.append(nxt)
             remaining.remove(nxt)
             current = nxt
-        return sequence
+        return result
 
     routes = []
 
-    # Always test both orientations of the local Grantham group.
-    local_candidates = []
-    if local:
-        local_candidates.append(local_order(local, 0))
-        local_candidates.append(list(reversed(local_order(local, 0))))
+    # Generate many possible angular cuts.  This makes the method independent
+    # of where the customer's geography happens to sit relative to north.
+    cut_count = 18 if customer_count >= 12 else 12
+    cuts = [360.0 * i / cut_count for i in range(cut_count)]
 
-    if not outer:
-        for seq in local_candidates:
-            routes.append([0] + seq + [0])
-        return routes
+    # Test 2, 3 and 4 broad territories.  The number is derived from the job
+    # count rather than hard-coded to the current test addresses.
+    territory_counts = [2]
+    if customer_count >= 8:
+        territory_counts.append(3)
+    if customer_count >= 16:
+        territory_counts.append(4)
 
-    # Divide the outer work into angular territories.  Unlike V20's balanced
-    # sectors, these are fixed angular bands, so a territory cannot wrap from
-    # one side of the depot to the other.
-    outer_bearings = [bearings[i] for i in outer]
-    spread = max(outer_bearings) - min(outer_bearings) if outer_bearings else 0
-    sector_count = 4 if len(outer) >= 12 else 3
-    width = 360.0 / sector_count
+    for territory_count in territory_counts:
+        width = 360.0 / territory_count
 
-    for offset in (0.0, width / 2.0):
-        bands = [[] for _ in range(sector_count)]
-        for i in outer:
-            bucket = int(((bearings[i] - offset) % 360.0) / width)
-            bucket = min(sector_count - 1, bucket)
-            bands[bucket].append(i)
+        for cut in cuts:
+            bands = [[] for _ in range(territory_count)]
+            for job in customers:
+                bucket = int(((bearings[job] - cut) % 360.0) / width)
+                bucket = min(territory_count - 1, bucket)
+                bands[bucket].append(job)
 
-        # Remove empty bands but retain their circular position.
-        nonempty = [b for b in range(sector_count) if bands[b]]
-        if len(nonempty) < 2:
-            continue
+            if any(not band for band in bands):
+                continue
 
-        # Build a few possible circular sweeps. The first band is reached from
-        # the local ring, then each subsequent band is cleared completely.
-        for direction in (1, -1):
-            order = nonempty if direction == 1 else list(reversed(nonempty))
-            for cut in range(len(order)):
-                band_order = order[cut:] + order[:cut]
-                outer_sequence = []
-                current = local[-1] if local else 0
-                for band_id in band_order:
-                    members = bands[band_id][:]
-                    if not members:
-                        continue
-                    forward = local_order(members, current)
-                    reverse = list(reversed(forward))
-                    if distances is not None:
-                        f_cost = distances[current][forward[0]] if forward else 0
-                        r_cost = distances[current][reverse[0]] if reverse else 0
-                        chosen = forward if f_cost <= r_cost else reverse
-                    else:
-                        chosen = forward
-                    outer_sequence.extend(chosen)
-                    current = chosen[-1]
+            # Try both directions around the depot.  For each direction, try
+            # every possible starting territory so the best sweep is not tied
+            # to an arbitrary compass direction.
+            for direction in (1, -1):
+                base = list(range(territory_count))
+                if direction == -1:
+                    base.reverse()
 
-                if outer_sequence:
-                    for local_seq in local_candidates or [[]]:
-                        routes.append([0] + local_seq + outer_sequence + [0])
-                        routes.append([0] + local_seq + list(reversed(outer_sequence)) + [0])
+                for start_pos in range(territory_count):
+                    order = base[start_pos:] + base[:start_pos]
+                    sequence = []
+                    current = 0
 
-    # A radial sweep is another useful protected structure: once we leave
-    # Grantham, keep moving outward rather than returning inward repeatedly.
-    for direction in (1, -1):
-        radial = sorted(outer, key=lambda i: (bearings[i], radii[i]), reverse=(direction == -1))
-        for local_seq in local_candidates or [[]]:
-            routes.append([0] + local_seq + radial + [0])
+                    for band_id in order:
+                        members = bands[band_id]
+                        forward = nearest_first(members, current)
+                        reverse = list(reversed(forward))
 
-    # Deduplicate while preserving deterministic order.
+                        # Choose the orientation which connects most naturally
+                        # from the previous territory.
+                        if road_cost(current, reverse[0]) < road_cost(current, forward[0]):
+                            chosen = reverse
+                        else:
+                            chosen = forward
+
+                        sequence.extend(chosen)
+                        current = chosen[-1]
+
+                    if len(sequence) == customer_count:
+                        routes.append([0] + sequence + [0])
+
+    # Pure polar sweeps are useful when the customers form one broad corridor.
+    # They are especially valuable for completely new areas not resembling
+    # the current test data.
+    for reverse_angle in (False, True):
+        angular = sorted(
+            customers,
+            key=lambda i: (bearings[i], radii[i]),
+            reverse=reverse_angle,
+        )
+        routes.append([0] + angular + [0])
+
+        # Also test the reverse radial order inside each small angular group.
+        radial = sorted(
+            customers,
+            key=lambda i: (bearings[i], -radii[i]),
+            reverse=reverse_angle,
+        )
+        routes.append([0] + radial + [0])
+
+    # Deduplicate deterministic candidates.
     unique = []
     seen = set()
     for route in routes:
@@ -1866,6 +1866,7 @@ def build_driver_sweep_routes(locations, distances=None, durations=None):
         if key not in seen and len(route) == customer_count + 2:
             seen.add(key)
             unique.append(route)
+
     return unique
 
 
@@ -1900,47 +1901,79 @@ def optimise_route(
     mpg,
     locations=None,
 ):
-    """V21 optimiser: driver-style territory sweep first, road optimisation second."""
+    """General-purpose driver-style route optimiser.
+
+    V23 makes the geographical sweep the primary structure.  It is not tuned
+    to the current 30-address example: all territories are generated from the
+    actual customer coordinates for whatever jobs are supplied.
+    """
     customer_count = len(distances) - 1
     if customer_count <= 0:
         return [0, 0]
 
-    # V21's protected routes are intentionally built differently from the old
-    # k-means/sector candidates. The key rule is: clear the inner Grantham ring
-    # once, then work through broad outer territories without returning to town.
-    structured = []
-    if locations is not None:
-        structured.extend(build_driver_sweep_routes(locations, distances, durations))
-        structured.extend(directional_sector_routes(locations, distances, durations))
-        structured.extend(geographic_zone_routes(locations))
-
-    unique_structured = []
-    seen = set()
-    for candidate in structured:
-        key = tuple(candidate)
-        if key not in seen and len(candidate) == customer_count + 2:
-            seen.add(key)
-            unique_structured.append(candidate)
-
     structured_results = []
-    for candidate in unique_structured:
-        improved = improve_driver_sweep_route(
-            candidate, distances, durations, fuel_price, mpg, locations
-        ) if locations is not None else candidate
-        metrics = route_metrics(improved, distances, durations, fuel_price, mpg)
-        score = route_score(improved, distances, durations, fuel_price, mpg, locations)
-        structured_results.append((score, metrics["time_s"], metrics["distance_m"], improved))
+    if locations is not None:
+        structured_candidates = build_driver_sweep_routes(
+            locations, distances, durations
+        )
+
+        # Keep the older geographic candidates as additional general-purpose
+        # options, but they are evaluated alongside the new sweep rather than
+        # replacing it with a pure road-distance answer.
+        structured_candidates.extend(
+            directional_sector_routes(locations, distances, durations)
+        )
+        structured_candidates.extend(
+            geographic_zone_routes(locations)
+        )
+
+        seen = set()
+        for candidate in structured_candidates:
+            key = tuple(candidate)
+            if key in seen or len(candidate) != customer_count + 2:
+                continue
+            seen.add(key)
+
+            improved = improve_driver_sweep_route(
+                candidate,
+                distances,
+                durations,
+                fuel_price,
+                mpg,
+                locations,
+            )
+            metrics = route_metrics(
+                improved, distances, durations, fuel_price, mpg
+            )
+            score = route_score(
+                improved, distances, durations, fuel_price, mpg, locations
+            )
+            structured_results.append(
+                (score, metrics["time_s"], metrics["distance_m"], improved)
+            )
 
     structured_results.sort(key=lambda x: x[0])
 
-    # Build the normal road-efficient family as a benchmark.
+    # Road-efficient benchmark.  This is retained so the app can reject a
+    # genuinely absurd sweep caused by an unusual road network.
     fallback_candidates = []
     starts = list(range(1, customer_count + 1))
     starts.sort(key=lambda x: durations[0][x])
+
+    if customer_count > 40:
+        selected = starts[:12] + starts[-12:] + starts[::max(1, customer_count // 12)]
+        starts = list(dict.fromkeys(selected))
+
     for first_customer in starts:
-        fallback_candidates.append(build_greedy_route(first_customer, distances, durations, "time"))
-        fallback_candidates.append(build_greedy_route(first_customer, distances, durations, "balanced"))
-        fallback_candidates.append(build_greedy_route(first_customer, distances, durations, "distance"))
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "time")
+        )
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "balanced")
+        )
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "distance")
+        )
 
     insertion = cheapest_insertion_route(distances, durations)
     if insertion:
@@ -1957,11 +1990,26 @@ def optimise_route(
             unique_fallbacks.append(candidate)
 
     fallback_results = []
-    for candidate in unique_fallbacks[:60]:
-        improved = improve_route(candidate, distances, durations, fuel_price, mpg, locations, preserve_structure=False)
-        metrics = route_metrics(improved, distances, durations, fuel_price, mpg)
-        score = route_score(improved, distances, durations, fuel_price, mpg, locations)
-        fallback_results.append((score, metrics["time_s"], metrics["distance_m"], improved))
+    for candidate in unique_fallbacks[:80]:
+        improved = improve_route(
+            candidate,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+            locations,
+            preserve_structure=False,
+        )
+        metrics = route_metrics(
+            improved, distances, durations, fuel_price, mpg
+        )
+        score = route_score(
+            improved, distances, durations, fuel_price, mpg, locations
+        )
+        fallback_results.append(
+            (score, metrics["time_s"], metrics["distance_m"], improved)
+        )
+
     fallback_results.sort(key=lambda x: x[0])
 
     if not structured_results:
@@ -1980,18 +2028,16 @@ def optimise_route(
     time_ratio = structured_time / max(fallback_time, 1.0)
     distance_ratio = structured_distance / max(fallback_distance, 1.0)
 
-    # V21 deliberately gives the driver-style route more authority than V20.
-    # We accept up to 20% extra road cost when the structured route avoids
-    # repeatedly crossing the same town/territory. This is the important change.
-    if time_ratio <= 1.20 and distance_ratio <= 1.20:
+    # Driver-style structure is preferred when it remains reasonably close to
+    # the road-efficient solution.  This prevents the optimiser from turning a
+    # sensible working day into a mathematically neat but impractical zig-zag.
+    if time_ratio <= 1.15 and distance_ratio <= 1.15:
         return best_structured[3]
 
-    combined_ratio = time_ratio * 0.60 + distance_ratio * 0.40
-    if combined_ratio <= 1.17:
+    combined_ratio = time_ratio * 0.55 + distance_ratio * 0.45
+    if combined_ratio <= 1.12:
         return best_structured[3]
 
-    # If the best structured route is genuinely much worse, retain the road
-    # efficient fallback rather than creating an absurd working day.
     return best_fallback[3]
 
 
