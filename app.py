@@ -4,6 +4,7 @@ import random
 import sqlite3
 import time
 from datetime import datetime, date
+from functools import lru_cache
 from urllib.parse import quote
 
 import pandas as pd
@@ -16,10 +17,10 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 # ============================================================
 # DAN CLEAN UK - DAILY ROUTE OPTIMIZER
-# Version 11.0
+# Version 14.0
 # ============================================================
 
-APP_VERSION = "13.0"
+APP_VERSION = "14.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -721,6 +722,10 @@ def route_score(
 
     continuity = calculate_continuity_penalty(route, distances)
 
+    zone_penalty = 0.0
+    if locations is not None:
+        zone_penalty = calculate_zone_penalty(route, locations)
+
     shape_penalty = 0.0
     if locations is not None:
         shape_penalty = calculate_shape_penalty(route, locations)
@@ -729,6 +734,7 @@ def route_score(
         driving_minutes * TIME_PRIORITY
         + driving_miles * DISTANCE_PRIORITY
         + continuity * CLUSTER_PRIORITY * 8.0
+        + zone_penalty * CLUSTER_PRIORITY * 2.5
         + shape_penalty * CLUSTER_PRIORITY * 0.75
     )
 
@@ -821,6 +827,198 @@ def calculate_shape_penalty(route, locations):
             penalty += (delta - 115) / 45.0
 
     return penalty
+
+
+@lru_cache(maxsize=32)
+def geographic_zone_labels(location_tuple):
+    """Create stable geographic zones from customer coordinates.
+
+    Zones are calculated from the actual customer spread rather than from
+    postcode text, so the optimiser still works when the user imports a
+    completely different day's jobs.
+    """
+    locations = list(location_tuple)
+    customer_count = len(locations) - 1
+    if customer_count <= 0:
+        return tuple()
+
+    if customer_count <= 12:
+        k = 3
+    elif customer_count <= 24:
+        k = 4
+    elif customer_count <= 40:
+        k = 5
+    else:
+        k = 6
+    k = min(k, customer_count)
+
+    # Deterministic farthest-point seeds. This avoids depending on sklearn.
+    seeds = [1]
+    while len(seeds) < k:
+        best_idx = None
+        best_dist = -1.0
+        for idx in range(1, customer_count + 1):
+            if idx in seeds:
+                continue
+            nearest = min(
+                haversine_km(locations[idx], locations[s])
+                for s in seeds
+            )
+            if nearest > best_dist:
+                best_dist = nearest
+                best_idx = idx
+        if best_idx is None:
+            break
+        seeds.append(best_idx)
+
+    labels = [0] * (customer_count + 1)
+    centroids = [locations[i] for i in seeds]
+
+    for _ in range(12):
+        changed = False
+        for idx in range(1, customer_count + 1):
+            distances_to_centroids = [
+                haversine_km(locations[idx], c) for c in centroids
+            ]
+            label = min(range(len(centroids)), key=lambda x: distances_to_centroids[x])
+            if labels[idx] != label + 1:
+                labels[idx] = label + 1
+                changed = True
+
+        new_centroids = []
+        for zone in range(1, len(centroids) + 1):
+            members = [
+                locations[i] for i in range(1, customer_count + 1)
+                if labels[i] == zone
+            ]
+            if members:
+                lon = sum(p[0] for p in members) / len(members)
+                lat = sum(p[1] for p in members) / len(members)
+                new_centroids.append((lon, lat))
+            else:
+                new_centroids.append(centroids[zone - 1])
+        centroids = new_centroids
+        if not changed:
+            break
+
+    return tuple(labels[1:])
+
+
+def calculate_zone_penalty(route, locations):
+    """Penalise leaving a geographic work zone before clearing it.
+
+    This is deliberately softer than live road time/distance. It prevents
+    the optimiser from doing things like Grantham -> NG33 -> NG31 -> NG32
+    when a clean geographical sweep is available, without forcing an
+    unrealistic postcode-based route.
+    """
+    if len(route) < 4:
+        return 0.0
+
+    labels = geographic_zone_labels(tuple(locations))
+    if not labels:
+        return 0.0
+
+    def zone(customer):
+        return labels[customer - 1]
+
+    penalty = 0.0
+    visited_zones = []
+
+    for pos in range(1, len(route) - 1):
+        current = route[pos]
+        nxt = route[pos + 1]
+        current_zone = zone(current)
+        next_zone = zone(nxt)
+
+        if current_zone != next_zone:
+            remaining_same_zone = any(
+                zone(x) == current_zone for x in route[pos + 1:-1]
+            )
+            if remaining_same_zone:
+                penalty += 2.5
+
+            if next_zone in visited_zones:
+                penalty += 3.5
+            visited_zones.append(next_zone)
+        elif current_zone not in visited_zones:
+            visited_zones.append(current_zone)
+
+    # A second visit to an already-cleared zone is particularly undesirable.
+    for zone_id in set(visited_zones):
+        occurrences = visited_zones.count(zone_id)
+        if occurrences > 1:
+            penalty += (occurrences - 1) * 2.0
+
+    return penalty
+
+
+def geographic_zone_routes(locations):
+    """Build candidate routes which clear dynamically detected areas."""
+    customer_count = len(locations) - 1
+    if customer_count <= 0:
+        return []
+
+    labels = geographic_zone_labels(tuple(locations))
+    zones = {}
+    for customer in range(1, customer_count + 1):
+        zones.setdefault(labels[customer - 1], []).append(customer)
+
+    if len(zones) <= 1:
+        return []
+
+    depot = locations[0]
+
+    centroids = {}
+    for zone_id, members in zones.items():
+        lon = sum(locations[i][0] for i in members) / len(members)
+        lat = sum(locations[i][1] for i in members) / len(members)
+        centroids[zone_id] = (lon, lat)
+
+    # Create a few sensible zone orders. Starting with the zone nearest the
+    # depot is usually good, but testing each possible first zone matters
+    # because the depot can sit between two natural work areas.
+    zone_ids = list(zones)
+    routes = []
+
+    for start_zone in sorted(
+        zone_ids,
+        key=lambda z: haversine_km(depot, centroids[z])
+    ):
+        remaining = set(zone_ids)
+        remaining.remove(start_zone)
+        order = [start_zone]
+        current = start_zone
+        while remaining:
+            next_zone = min(
+                remaining,
+                key=lambda z: haversine_km(centroids[current], centroids[z])
+            )
+            order.append(next_zone)
+            remaining.remove(next_zone)
+            current = next_zone
+
+        for zone_order in (order, list(reversed(order))):
+            sequence = []
+            for zone_id in zone_order:
+                members = zones[zone_id][:]
+                # Within each zone, sort by angle around the zone centroid.
+                c_lon, c_lat = centroids[zone_id]
+                members.sort(
+                    key=lambda i: (
+                        math.degrees(
+                            math.atan2(
+                                (locations[i][0] - c_lon) * math.cos(math.radians(c_lat)),
+                                locations[i][1] - c_lat,
+                            )
+                        ) + 360.0
+                    ) % 360.0
+                )
+                sequence.extend(members)
+            routes.append([0] + sequence + [0])
+            routes.append([0] + list(reversed(sequence)) + [0])
+
+    return routes
 
 
 def build_greedy_route(
@@ -1113,8 +1311,10 @@ def generate_candidate_routes(distances, durations, locations=None):
 
     candidates = []
 
-    # 1. Geographical sweep candidates are now the backbone of the optimiser.
+    # 1. Dynamic geographic-zone routes. These are the backbone of v14:
+    # clear one natural area before moving to the next.
     if locations is not None:
+        candidates.extend(geographic_zone_routes(locations))
         candidates.extend(angular_sweep_routes(locations))
 
     # 2. Multi-start greedy routes.  Test all starts for small lists and a
@@ -2320,4 +2520,3 @@ if not export_df.empty:
 
 st.sidebar.caption(
     f"DanCleanUK Route Optimizer v{APP_VERSION}"
-)
