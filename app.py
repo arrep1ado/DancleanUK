@@ -19,7 +19,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # APP CONFIG
 # ============================================================
 
-APP_VERSION = "12.0"
+APP_VERSION = "12.1"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -129,6 +129,12 @@ def normalise_postcode(value):
     return " ".join(
         value.upper().split()
     )
+
+
+def postcode_without_space(value):
+    return normalise_postcode(
+        value
+    ).replace(" ", "")
 
 
 def normalise_phone(value):
@@ -431,78 +437,185 @@ def cache_key_for(query):
 
 def get_coords(row):
     """
-    Geocoding priority:
+    ROBUST GEOCODING
 
-    1. Full address + postcode
-    2. Exact postcode
-    3. Postcodes.io fallback
+    The route only needs reliable geographical coordinates.
+
+    Priority:
+
+    1. Postcodes.io exact postcode
+    2. Postcodes.io postcode without spaces
+    3. Nominatim postcode
+    4. Nominatim full address
+
+    This means a bad/odd street address in the spreadsheet
+    will NOT prevent a valid postcode from being routed.
+
+    The full address is still retained separately for
+    Google Maps navigation.
     """
+
+    postcode = normalise_postcode(
+        row.get("postcode", "")
+    )
 
     query = build_geo_query(row)
 
+    # --------------------------------------------------------
+    # Cache by postcode first
+    # --------------------------------------------------------
+
+    if postcode:
+
+        postcode_cache_key = (
+            "postcode:"
+            + postcode_without_space(
+                postcode
+            )
+        )
+
+        if (
+            postcode_cache_key
+            in st.session_state.geocode_cache
+        ):
+
+            return st.session_state.geocode_cache[
+                postcode_cache_key
+            ]
+
+    # Full query cache
     cache_key = cache_key_for(query)
 
     if cache_key in st.session_state.geocode_cache:
+
         return st.session_state.geocode_cache[
             cache_key
         ]
 
     headers = {
         "User-Agent":
-            "DanCleanUK-Daily-Route-Optimizer/12.0"
+            "DanCleanUK-Daily-Route-Optimizer/12.1"
     }
 
-    # --------------------------------------------------------
-    # 1. Nominatim full address
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. POSTCODES.IO - NORMAL POSTCODE
+    # ========================================================
 
-    try:
+    if postcode:
 
-        response = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={
-                "q": query,
-                "format": "json",
-                "limit": 1,
-                "countrycodes": "gb",
-            },
-            headers=headers,
-            timeout=20,
-        )
+        try:
 
-        response.raise_for_status()
+            clean_postcode = (
+                postcode_without_space(
+                    postcode
+                )
+            )
 
-        data = response.json()
+            response = requests.get(
+                "https://api.postcodes.io/postcodes/"
+                + quote(clean_postcode),
+                timeout=15,
+            )
 
-        if data:
+            if response.status_code == 200:
 
-            lat = float(data[0]["lat"])
-            lon = float(data[0]["lon"])
+                data = response.json()
 
-            result = {
-                "latitude": lat,
-                "longitude": lon,
-                "geo_query": query,
-            }
+                result_data = data.get(
+                    "result"
+                )
 
-            st.session_state.geocode_cache[
-                cache_key
-            ] = result
+                if result_data:
 
-            time.sleep(1)
+                    lat = float(
+                        result_data[
+                            "latitude"
+                        ]
+                    )
 
-            return result
+                    lon = float(
+                        result_data[
+                            "longitude"
+                        ]
+                    )
 
-    except Exception:
-        pass
+                    result = {
+                        "latitude": lat,
+                        "longitude": lon,
+                        "geo_query": postcode,
+                    }
 
-    # --------------------------------------------------------
-    # 2. Nominatim postcode only
-    # --------------------------------------------------------
+                    st.session_state.geocode_cache[
+                        postcode_cache_key
+                    ] = result
 
-    postcode = normalise_postcode(
-        row.get("postcode", "")
-    )
+                    st.session_state.geocode_cache[
+                        cache_key
+                    ] = result
+
+                    return result
+
+        except Exception:
+            pass
+
+    # ========================================================
+    # 2. POSTCODES.IO - FORMATTED POSTCODE
+    # ========================================================
+
+    if postcode:
+
+        try:
+
+            response = requests.get(
+                "https://api.postcodes.io/postcodes/"
+                + quote(postcode),
+                timeout=15,
+            )
+
+            if response.status_code == 200:
+
+                data = response.json()
+
+                result_data = data.get(
+                    "result"
+                )
+
+                if result_data:
+
+                    lat = float(
+                        result_data[
+                            "latitude"
+                        ]
+                    )
+
+                    lon = float(
+                        result_data[
+                            "longitude"
+                        ]
+                    )
+
+                    result = {
+                        "latitude": lat,
+                        "longitude": lon,
+                        "geo_query": postcode,
+                    }
+
+                    st.session_state.geocode_cache[
+                        postcode_cache_key
+                    ] = result
+
+                    st.session_state.geocode_cache[
+                        cache_key
+                    ] = result
+
+                    return result
+
+        except Exception:
+            pass
+
+    # ========================================================
+    # 3. NOMINATIM POSTCODE ONLY
+    # ========================================================
 
     if postcode:
 
@@ -520,75 +633,93 @@ def get_coords(row):
                 timeout=20,
             )
 
-            response.raise_for_status()
+            if response.status_code == 200:
 
-            data = response.json()
+                data = response.json()
 
-            if data:
+                if data:
 
-                lat = float(data[0]["lat"])
-                lon = float(data[0]["lon"])
+                    lat = float(
+                        data[0]["lat"]
+                    )
 
-                result = {
-                    "latitude": lat,
-                    "longitude": lon,
-                    "geo_query": postcode,
-                }
+                    lon = float(
+                        data[0]["lon"]
+                    )
 
-                st.session_state.geocode_cache[
-                    cache_key
-                ] = result
+                    result = {
+                        "latitude": lat,
+                        "longitude": lon,
+                        "geo_query": postcode,
+                    }
 
-                time.sleep(1)
+                    st.session_state.geocode_cache[
+                        postcode_cache_key
+                    ] = result
 
-                return result
+                    st.session_state.geocode_cache[
+                        cache_key
+                    ] = result
+
+                    time.sleep(1)
+
+                    return result
 
         except Exception:
             pass
 
-    # --------------------------------------------------------
-    # 3. Postcodes.io
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. NOMINATIM FULL ADDRESS
+    # ========================================================
 
-    if postcode:
+    if query:
 
         try:
 
             response = requests.get(
-                "https://api.postcodes.io/postcodes/"
-                + quote(postcode),
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "q": query,
+                    "format": "json",
+                    "limit": 1,
+                    "countrycodes": "gb",
+                },
+                headers=headers,
                 timeout=20,
             )
 
-            response.raise_for_status()
+            if response.status_code == 200:
 
-            data = response.json()
+                data = response.json()
 
-            result_data = data.get(
-                "result"
-            )
+                if data:
 
-            if result_data:
+                    lat = float(
+                        data[0]["lat"]
+                    )
 
-                lat = float(
-                    result_data["latitude"]
-                )
+                    lon = float(
+                        data[0]["lon"]
+                    )
 
-                lon = float(
-                    result_data["longitude"]
-                )
+                    result = {
+                        "latitude": lat,
+                        "longitude": lon,
+                        "geo_query": query,
+                    }
 
-                result = {
-                    "latitude": lat,
-                    "longitude": lon,
-                    "geo_query": postcode,
-                }
+                    if postcode:
+                        st.session_state.geocode_cache[
+                            postcode_cache_key
+                        ] = result
 
-                st.session_state.geocode_cache[
-                    cache_key
-                ] = result
+                    st.session_state.geocode_cache[
+                        cache_key
+                    ] = result
 
-                return result
+                    time.sleep(1)
+
+                    return result
 
         except Exception:
             pass
@@ -1044,9 +1175,6 @@ def lookahead_route(
 ):
     """
     Looks at both the next job and the job after that.
-
-    This helps stop the route bouncing backwards and forwards
-    across the area.
     """
 
     n = len(
@@ -1285,8 +1413,6 @@ def sweep_route(
 ):
     """
     Geographic sweep around the depot.
-
-    This is another completely different starting route.
     """
 
     depot_lat = coords[0][1]
@@ -1374,9 +1500,6 @@ def two_opt(
 ):
     """
     2-opt improvement.
-
-    Reverses sections of the route when that improves
-    the complete route.
     """
 
     if len(route) <= 4:
@@ -1454,8 +1577,7 @@ def relocate_improvement(
     duration_matrix,
 ):
     """
-    Takes one customer and tries moving it to every other
-    position.
+    Moves one customer to another position.
     """
 
     if len(route) <= 4:
@@ -1530,8 +1652,7 @@ def swap_improvement(
     duration_matrix,
 ):
     """
-    Swaps two customers and checks whether the complete
-    route becomes better.
+    Swaps two customers.
     """
 
     if len(route) <= 4:
@@ -1603,16 +1724,9 @@ def optimise_route(
     """
     MAIN OPTIMISER.
 
-    IMPORTANT:
-
-    The uploaded file order is completely ignored.
+    Uploaded file order is completely ignored.
 
     Every customer is treated as an unordered job.
-
-    The optimiser:
-        1. Creates several different geographical routes.
-        2. Improves each route.
-        3. Chooses the best complete route.
 
     Driving time is the main priority.
     """
@@ -1629,10 +1743,6 @@ def optimise_route(
 
     candidates = []
 
-    # --------------------------------------------------------
-    # Time nearest neighbour
-    # --------------------------------------------------------
-
     candidates.append(
         nearest_neighbour_route(
             duration_matrix,
@@ -1640,10 +1750,6 @@ def optimise_route(
             "time",
         )
     )
-
-    # --------------------------------------------------------
-    # Distance nearest neighbour
-    # --------------------------------------------------------
 
     candidates.append(
         nearest_neighbour_route(
@@ -1653,10 +1759,6 @@ def optimise_route(
         )
     )
 
-    # --------------------------------------------------------
-    # Combined route
-    # --------------------------------------------------------
-
     candidates.append(
         nearest_neighbour_route(
             duration_matrix,
@@ -1665,10 +1767,6 @@ def optimise_route(
         )
     )
 
-    # --------------------------------------------------------
-    # Lookahead route
-    # --------------------------------------------------------
-
     candidates.append(
         lookahead_route(
             duration_matrix,
@@ -1676,20 +1774,12 @@ def optimise_route(
         )
     )
 
-    # --------------------------------------------------------
-    # Cheapest insertion
-    # --------------------------------------------------------
-
     candidates.append(
         cheapest_insertion_route(
             duration_matrix,
             distance_matrix,
         )
     )
-
-    # --------------------------------------------------------
-    # Geographical sweep
-    # --------------------------------------------------------
 
     if coords is not None:
 
@@ -1700,10 +1790,6 @@ def optimise_route(
                 coords,
             )
         )
-
-    # --------------------------------------------------------
-    # Remove duplicates
-    # --------------------------------------------------------
 
     unique_candidates = []
 
@@ -1716,13 +1802,10 @@ def optimise_route(
         if key not in seen:
 
             seen.add(key)
+
             unique_candidates.append(
                 route
             )
-
-    # --------------------------------------------------------
-    # Improve every candidate
-    # --------------------------------------------------------
 
     improved_routes = []
 
@@ -1763,10 +1846,6 @@ def optimise_route(
             improved_routes.append(
                 route
             )
-
-    # --------------------------------------------------------
-    # Pick the best complete route
-    # --------------------------------------------------------
 
     best_route = min(
         improved_routes,
@@ -1846,6 +1925,16 @@ if st.sidebar.button(
 
     st.session_state.pop(
         "route_data",
+        None,
+    )
+
+    st.session_state.pop(
+        "route_metrics",
+        None,
+    )
+
+    st.session_state.pop(
+        "routing_source",
         None,
     )
 
@@ -2212,11 +2301,6 @@ if st.button(
 
     # --------------------------------------------------------
     # ACTIVE JOBS
-    #
-    # IMPORTANT:
-    # Completed jobs are excluded.
-    # The remaining jobs are NOT sorted according to
-    # the uploaded file.
     # --------------------------------------------------------
 
     work_df = day_df[
@@ -2299,6 +2383,10 @@ if st.button(
             )
         )
 
+    # --------------------------------------------------------
+    # FAILED ADDRESS REPORT
+    # --------------------------------------------------------
+
     if failed_addresses:
 
         st.error(
@@ -2306,6 +2394,12 @@ if st.button(
             + ", ".join(
                 failed_addresses
             )
+        )
+
+        st.warning(
+            "The app tried Postcodes.io and OpenStreetMap "
+            "using the postcode directly. Check these "
+            "postcodes in your job file."
         )
 
         progress.empty()
@@ -2323,14 +2417,7 @@ if st.button(
         st.stop()
 
     # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # We rebuild the routing dataframe from the geocoded
-    # jobs.
-    #
-    # The order here is ONLY the matrix index order.
-    #
-    # It is NOT the route order.
+    # BUILD ROUTING DATA
     # --------------------------------------------------------
 
     routing_rows = []
@@ -2430,7 +2517,7 @@ if st.button(
             "OpenRouteService live road routing"
         )
 
-    except Exception as e:
+    except Exception:
 
         st.warning(
             "OpenRouteService could not be used. "
@@ -2449,12 +2536,6 @@ if st.button(
 
     # --------------------------------------------------------
     # OPTIMISE
-    #
-    # THIS IS THE IMPORTANT PART.
-    #
-    # coords is passed into optimise_route().
-    #
-    # The uploaded file order is ignored.
     # --------------------------------------------------------
 
     progress.progress(
@@ -2497,7 +2578,10 @@ if st.button(
 
     for matrix_index in optimised_route:
 
-        # Depot
+        # ----------------------------------------------------
+        # DEPOT
+        # ----------------------------------------------------
+
         if matrix_index == 0:
 
             final_rows.append({
@@ -2627,7 +2711,7 @@ if st.button(
         })
 
     # --------------------------------------------------------
-    # SAVE ROUTE IN SESSION
+    # SAVE SESSION
     # --------------------------------------------------------
 
     st.session_state[
@@ -2659,7 +2743,7 @@ if st.button(
 
 
 # ============================================================
-# GET ROUTE FROM SESSION / DATABASE
+# GET ROUTE
 # ============================================================
 
 route_data = st.session_state.get(
@@ -2682,7 +2766,6 @@ routing_source = st.session_state.get(
 
 if route_data is None:
 
-    # Try reconstructing a saved route
     saved = load_day(
         route_date_text
     )
@@ -2864,6 +2947,7 @@ if not pending_jobs.empty:
     next_stop = pending_jobs.iloc[0]
 
     st.sidebar.markdown("---")
+
     st.sidebar.subheader(
         "📍 Next stop"
     )
@@ -3199,6 +3283,7 @@ if not completed_df.empty:
 # ============================================================
 
 st.markdown("---")
+
 st.subheader(
     "📊 Export"
 )
@@ -3272,10 +3357,8 @@ if st.button(
             column
         ].width = width
 
-    # Freeze header
     worksheet.freeze_panes = "A2"
 
-    # Save
     output = io.BytesIO()
 
     workbook.save(
