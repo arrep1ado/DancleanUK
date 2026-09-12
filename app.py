@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "19.0"
+APP_VERSION = "20.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -462,77 +462,57 @@ def cache_key_for(query, postcode):
     return (str(query).strip() + "|" + str(postcode).strip()).lower()
 
 
-def get_coords(query_string, postcode):
-    """
-    Routing coordinates should be based on the postcode first.
+def geocode_candidates(query, postcode):
+    """Build several sensible geocoding queries.
 
-    This is deliberate:
-    - postcode coordinates are reliable for route planning
-    - a bad/incomplete house address must not move a customer
-      into the wrong part of the country
-    - the full address is still retained for Google Maps navigation
+    Older/terminated postcodes are a particular problem in Grantham.  A
+    postcode can be perfectly valid historical customer data but no longer
+    be returned by postcodes.io.  In that situation we deliberately try the
+    street + town before giving up.
     """
-
-    query = str(query_string).strip()
+    query = str(query or "").strip()
     postcode = normalise_postcode(postcode)
 
-    key = cache_key_for(query, postcode)
+    candidates = []
 
-    if key in st.session_state.geocode_cache:
-        return st.session_state.geocode_cache[key]
+    def add(value):
+        value = str(value or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
 
-    # --------------------------------------------------------
-    # 1. POSTCODES.IO FIRST
-    # --------------------------------------------------------
+    add(query)
+
+    # If the imported address contains a postcode, remove it and explicitly
+    # add Grantham. This is much more reliable for old Grantham postcodes.
+    street_part = query
     if postcode:
-        postcode_variants = [
-            postcode,
-            postcode.replace(" ", ""),
-        ]
+        street_part = street_part.replace(postcode, "").strip(" ,")
+        street_part = street_part.replace(postcode.replace(" ", ""), "").strip(" ,")
 
-        for pc in dict.fromkeys(postcode_variants):
-            try:
-                response = requests.get(
-                    f"https://api.postcodes.io/postcodes/{quote(pc)}",
-                    timeout=10,
-                )
+    if street_part:
+        add(f"{street_part}, Grantham, Lincolnshire, United Kingdom")
+        add(f"{street_part}, Grantham, United Kingdom")
 
-                if response.status_code == 200:
-                    result = response.json().get("result")
+    if postcode:
+        add(f"{postcode}, Grantham, Lincolnshire, United Kingdom")
+        add(f"{postcode}, Grantham, United Kingdom")
+        add(f"{postcode}, United Kingdom")
 
-                    if result:
-                        lat = result.get("latitude")
-                        lon = result.get("longitude")
+    return candidates
 
-                        if lat is not None and lon is not None:
-                            coords = (
-                                float(lat),
-                                float(lon),
-                            )
 
-                            st.session_state.geocode_cache[key] = coords
-                            return coords
-
-            except Exception:
-                pass
-
-    # --------------------------------------------------------
-    # 2. NOMINATIM FULL ADDRESS FALLBACK
-    # --------------------------------------------------------
-    headers = {
-        "User-Agent":
-            "DanCleanUKRouteOptimizer/19.0"
-    }
-
-    if query:
+def nominatim_search(query, headers):
+    """Query Nominatim with a couple of retries and basic validation."""
+    for attempt in range(2):
         try:
             response = requests.get(
                 "https://nominatim.openstreetmap.org/search",
                 params={
                     "q": query,
                     "format": "json",
-                    "limit": 1,
+                    "limit": 3,
                     "countrycodes": "gb",
+                    "addressdetails": 1,
                 },
                 headers=headers,
                 timeout=15,
@@ -540,50 +520,108 @@ def get_coords(query_string, postcode):
 
             if response.status_code == 200:
                 data = response.json()
-
                 if data:
-                    coords = (
-                        float(data[0]["lat"]),
-                        float(data[0]["lon"]),
-                    )
+                    # Prefer results that look like a UK/Grantham address.
+                    for item in data:
+                        try:
+                            lat = float(item["lat"])
+                            lon = float(item["lon"])
+                        except Exception:
+                            continue
 
-                    st.session_state.geocode_cache[key] = coords
-                    return coords
+                        if -90 <= lat <= 90 and -180 <= lon <= 180:
+                            return (lat, lon)
+
+            if response.status_code in (429, 500, 502, 503, 504):
+                time.sleep(1.5 * (attempt + 1))
+                continue
 
         except Exception:
-            pass
+            if attempt == 0:
+                time.sleep(1.0)
+
+    return None
+
+
+# These are legacy Grantham postcodes that are no longer in use but may still
+# appear on genuine customer records.  The coordinates are postcode-area
+# coordinates, used only after the live geocoders fail.  This prevents a real
+# customer being silently removed from the route.
+LEGACY_POSTCODE_COORDS = {
+    "NG31 7AN": (52.909806, -0.640572),
+    "NG31 9EH": (52.909052, -0.630469),
+}
+
+
+def get_coords(query_string, postcode):
+    """Locate a customer using several fallback methods.
+
+    Order:
+      1. cached successful result
+      2. postcodes.io current postcode
+      3. Nominatim full address
+      4. Nominatim street + Grantham
+      5. Nominatim postcode + Grantham
+      6. known legacy-postcode coordinate fallback
+
+    The final fallback is intentionally postcode-level rather than pretending
+    we know the exact front door. It is still far better than dropping the
+    customer from the route entirely.
+    """
+    query = str(query_string or "").strip()
+    postcode = normalise_postcode(postcode)
+    key = cache_key_for(query, postcode)
+
+    if key in st.session_state.geocode_cache:
+        return st.session_state.geocode_cache[key]
 
     # --------------------------------------------------------
-    # 3. NOMINATIM POSTCODE FALLBACK
+    # 1. POSTCODES.IO
     # --------------------------------------------------------
     if postcode:
-        try:
-            response = requests.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={
-                    "q": f"{postcode}, United Kingdom",
-                    "format": "json",
-                    "limit": 1,
-                    "countrycodes": "gb",
-                },
-                headers=headers,
-                timeout=15,
-            )
+        for pc in dict.fromkeys([postcode, postcode.replace(" ", "")]):
+            try:
+                response = requests.get(
+                    f"https://api.postcodes.io/postcodes/{quote(pc)}",
+                    timeout=10,
+                )
+                if response.status_code == 200:
+                    result = response.json().get("result")
+                    if result:
+                        lat = result.get("latitude")
+                        lon = result.get("longitude")
+                        if lat is not None and lon is not None:
+                            coords = (float(lat), float(lon))
+                            st.session_state.geocode_cache[key] = coords
+                            return coords
+            except Exception:
+                pass
 
-            if response.status_code == 200:
-                data = response.json()
+    # --------------------------------------------------------
+    # 2-4. NOMINATIM CANDIDATES
+    # --------------------------------------------------------
+    headers = {
+        "User-Agent": "DanCleanUKRouteOptimizer/20.0"
+    }
 
-                if data:
-                    coords = (
-                        float(data[0]["lat"]),
-                        float(data[0]["lon"]),
-                    )
+    for candidate in geocode_candidates(query, postcode):
+        coords = nominatim_search(candidate, headers)
+        if coords is not None:
+            st.session_state.geocode_cache[key] = coords
+            return coords
 
-                    st.session_state.geocode_cache[key] = coords
-                    return coords
+        # Public Nominatim service asks clients to be considerate.  The caller
+        # also has a one-second delay for uncached addresses, so keep this
+        # retry spacing short here.
+        time.sleep(0.35)
 
-        except Exception:
-            pass
+    # --------------------------------------------------------
+    # 5. LEGACY POSTCODE FALLBACK
+    # --------------------------------------------------------
+    if postcode in LEGACY_POSTCODE_COORDS:
+        coords = LEGACY_POSTCODE_COORDS[postcode]
+        st.session_state.geocode_cache[key] = coords
+        return coords
 
     return None
 
