@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.5"
+APP_VERSION = "25.6"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2835,7 +2835,10 @@ if st.button(
         "persisted_only": False,
     }
 
-    st.rerun()
+    # V25.6: do NOT rerun immediately after planning.
+    # The dashboard below must render the freshly calculated route totals
+    # in the same Streamlit run. The previous rerun could return to the
+    # persisted-day state before the new totals were visible.
 
 
 # ============================================================
