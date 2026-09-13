@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.2"
+APP_VERSION = "25.3"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1923,10 +1923,24 @@ def improve_driver_sweep_route(route, distances, durations, fuel_price, mpg, loc
     best = route[:]
     best_score = route_score(best, distances, durations, fuel_price, mpg, locations)
 
-    # Adjacent swaps only. This keeps the broad territory sweep intact.
+    # Adjacent swaps only.  V25.3 adds one small protection: do not swap
+    # jobs that belong to different dynamically detected geographic zones.
+    # This keeps a road-efficient improvement from accidentally tearing apart
+    # an area that the sweep has already grouped together.  The zones are
+    # calculated from the actual coordinates, so nothing is hard-coded to
+    # Grantham or to the current test postcodes.
+    zone_labels = geographic_zone_labels(location_cache_key(locations))
+
     for _ in range(3):
         changed = False
         for i in range(1, len(best) - 2):
+            left = best[i]
+            right = best[i + 1]
+            if left <= 0 or right <= 0:
+                continue
+            if zone_labels[left - 1] != zone_labels[right - 1]:
+                continue
+
             candidate = best[:]
             candidate[i], candidate[i + 1] = candidate[i + 1], candidate[i]
             score = route_score(candidate, distances, durations, fuel_price, mpg, locations)
@@ -2077,11 +2091,11 @@ def optimise_route(
     # driver-style territory route is allowed to cost a modest amount more
     # than the pure road-time benchmark because repeatedly returning to an
     # area that has already been cleared is expensive in real working time.
-    if time_ratio <= 1.18 and distance_ratio <= 1.18:
+    if time_ratio <= 1.20 and distance_ratio <= 1.20:
         return best_structured[3]
 
     combined_ratio = time_ratio * 0.60 + distance_ratio * 0.40
-    if combined_ratio <= 1.14:
+    if combined_ratio <= 1.16:
         return best_structured[3]
 
     return best_fallback[3]
