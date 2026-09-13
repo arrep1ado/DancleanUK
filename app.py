@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.1"
+APP_VERSION = "25.2"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2077,11 +2077,11 @@ def optimise_route(
     # driver-style territory route is allowed to cost a modest amount more
     # than the pure road-time benchmark because repeatedly returning to an
     # area that has already been cleared is expensive in real working time.
-    if time_ratio <= 1.20 and distance_ratio <= 1.20:
+    if time_ratio <= 1.18 and distance_ratio <= 1.18:
         return best_structured[3]
 
     combined_ratio = time_ratio * 0.60 + distance_ratio * 0.40
-    if combined_ratio <= 1.16:
+    if combined_ratio <= 1.14:
         return best_structured[3]
 
     return best_fallback[3]
@@ -3186,4 +3186,3 @@ if not export_df.empty:
 
 st.sidebar.caption(
     f"DanCleanUK Route Optimizer v{APP_VERSION}"
-)
