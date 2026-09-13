@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.0"
+APP_VERSION = "25.1"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -153,7 +153,49 @@ def load_day(service_date):
     if not rows:
         return pd.DataFrame()
 
-    return pd.DataFrame([dict(row) for row in rows])
+    loaded = pd.DataFrame([dict(row) for row in rows])
+
+    # SQLite column names are lowercase, while the rest of the app
+    # consistently uses the display/import column names.  Normalise
+    # persisted records here so restored days behave exactly like
+    # freshly uploaded jobs.
+    loaded = loaded.rename(
+        columns={
+            "postcode": "Postcode",
+            "price": "Price",
+            "phone": "Phone",
+            "status": "Status",
+            "payment": "Payment",
+            "payment_time": "PaymentTime",
+            "completed_time": "CompletedTime",
+        }
+    )
+
+    # Keep all fields expected by the UI present even if an older
+    # database/version did not contain a value.
+    defaults = {
+        "Status": "pending",
+        "Payment": "Waiting",
+        "PaymentTime": "",
+        "CompletedTime": "",
+        "route_order": None,
+        "address_text": "",
+        "latitude": None,
+        "longitude": None,
+        "geo_query": "",
+    }
+    for column, default in defaults.items():
+        if column not in loaded.columns:
+            loaded[column] = default
+
+    loaded["Status"] = loaded["Status"].fillna("pending")
+    loaded["Payment"] = loaded["Payment"].fillna("Waiting")
+    loaded["PaymentTime"] = loaded["PaymentTime"].fillna("")
+    loaded["CompletedTime"] = loaded["CompletedTime"].fillna("")
+    loaded["address_text"] = loaded["address_text"].fillna("")
+    loaded["geo_query"] = loaded["geo_query"].fillna("")
+
+    return loaded
 
 
 def delete_day(service_date):
@@ -2095,22 +2137,22 @@ if (
     # Existing persisted routes already have coordinates.
     if "route_data" not in st.session_state:
         customer_rows = existing_day[
-            existing_day["status"].astype(str).str.lower() != "depot"
+            existing_day["Status"].astype(str).str.lower() != "depot"
         ].copy()
 
         if not customer_rows.empty:
             completed = (
-                customer_rows["status"]
+                customer_rows["Status"]
                 .astype(str)
                 .str.lower()
                 .eq("completed")
                 .sum()
             )
             st.session_state.route_data = {
-                "revenue": float(customer_rows["price"].sum()),
+                "revenue": float(customer_rows["Price"].sum()),
                 "fuel_cost": 0.0,
                 "take_home": float(
-                    customer_rows["price"].sum()
+                    customer_rows["Price"].sum()
                     * (1 - TAX_RATE)
                 ),
                 "miles": 0.0,
