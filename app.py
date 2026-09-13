@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.3"
+APP_VERSION = "25.4"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1143,6 +1143,178 @@ def calculate_zone_penalty(route, locations):
     return penalty
 
 
+def proximity_cluster_routes(locations, distances, durations):
+    """Build driver-style routes that finish a local area before leaving it.
+
+    Unlike postcode-based grouping, clusters are created from the actual
+    coordinates. Dense streets therefore stay together even when several
+    customers share a postcode, while isolated rural jobs remain flexible.
+    Small components are merged only when necessary to keep the number of
+    territories practical.
+    """
+    customer_count = len(locations) - 1
+    if customer_count <= 1:
+        return []
+
+    # Estimate what counts as a genuinely local connection from this day's
+    # own geography. The bounds prevent either a dense town or a very sparse
+    # rural list from producing unreasonable clusters.
+    nearest = []
+    for i in range(1, customer_count + 1):
+        d = min(
+            haversine_points(locations[i], locations[j])
+            for j in range(1, customer_count + 1)
+            if j != i
+        )
+        nearest.append(d)
+
+    nearest_sorted = sorted(nearest)
+    median_nearest = nearest_sorted[len(nearest_sorted) // 2]
+    local_radius = max(
+        0.8 * 1609.344,
+        min(2.5 * 1609.344, median_nearest * 2.4),
+    )
+
+    # Connected components: nearby chains remain one local area.
+    parent = list(range(customer_count + 1))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(1, customer_count + 1):
+        for j in range(i + 1, customer_count + 1):
+            if haversine_points(locations[i], locations[j]) <= local_radius:
+                union(i, j)
+
+    components = {}
+    for i in range(1, customer_count + 1):
+        components.setdefault(find(i), []).append(i)
+    clusters = list(components.values())
+
+    # Merge isolated/small territories until the route has a manageable
+    # number of areas. The closest component pair is merged each time, so
+    # this never depends on postcode names or today's particular addresses.
+    target = min(7, max(4, math.ceil(customer_count / 6)))
+    while len(clusters) > target:
+        best_pair = None
+        best_gap = float("inf")
+        for a in range(len(clusters)):
+            for b in range(a + 1, len(clusters)):
+                gap = min(
+                    haversine_points(locations[x], locations[y])
+                    for x in clusters[a]
+                    for y in clusters[b]
+                )
+                if gap < best_gap:
+                    best_gap = gap
+                    best_pair = (a, b)
+        if best_pair is None:
+            break
+        a, b = best_pair
+        clusters[a].extend(clusters[b])
+        del clusters[b]
+
+    depot = locations[0]
+    cluster_centres = []
+    for members in clusters:
+        lon = sum(locations[i][0] for i in members) / len(members)
+        lat = sum(locations[i][1] for i in members) / len(members)
+        centre = (lon, lat)
+        depot_distance = haversine_points(depot, centre)
+        cluster_centres.append((members, centre, depot_distance))
+
+    # Generate several sensible territory orders. Each one completely clears
+    # a cluster before moving to the next.
+    orders = []
+    base = sorted(
+        range(len(cluster_centres)),
+        key=lambda k: cluster_centres[k][2],
+    )
+    orders.append(base)
+    orders.append(list(reversed(base)))
+
+    # Nearest-next territory order from several possible starting areas.
+    for start in base[:min(len(base), 4)]:
+        remaining = set(range(len(cluster_centres)))
+        remaining.remove(start)
+        order = [start]
+        current = start
+        while remaining:
+            next_cluster = min(
+                remaining,
+                key=lambda k: haversine_points(
+                    cluster_centres[current][1],
+                    cluster_centres[k][1],
+                ),
+            )
+            order.append(next_cluster)
+            remaining.remove(next_cluster)
+            current = next_cluster
+        orders.append(order)
+        orders.append(list(reversed(order)))
+
+    routes = []
+    seen = set()
+    for order in orders:
+        sequence = []
+        for cluster_index in order:
+            members = cluster_centres[cluster_index][0][:]
+
+            # Road-aware nearest-neighbour ordering inside the local area.
+            # Try the member nearest the previous stop and let live road
+            # durations decide the following jobs.
+            if sequence:
+                first = min(
+                    members,
+                    key=lambda x: durations[sequence[-1]][x],
+                )
+            else:
+                first = min(
+                    members,
+                    key=lambda x: durations[0][x],
+                )
+
+            local = [first]
+            remaining = set(members)
+            remaining.remove(first)
+            current = first
+            while remaining:
+                next_customer = min(
+                    remaining,
+                    key=lambda x: (
+                        durations[current][x]
+                        + 0.35 * distances[current][x]
+                    ),
+                )
+                local.append(next_customer)
+                remaining.remove(next_customer)
+                current = next_customer
+
+            sequence.extend(local)
+
+        route = [0] + sequence + [0]
+        key = tuple(route)
+        if key not in seen:
+            seen.add(key)
+            routes.append(route)
+
+        reverse_route = [0] + list(reversed(sequence)) + [0]
+        key = tuple(reverse_route)
+        if key not in seen:
+            seen.add(key)
+            routes.append(reverse_route)
+
+    return routes
+
+
 def geographic_zone_routes(locations):
     """Build candidate routes which clear dynamically detected areas."""
     customer_count = len(locations) - 1
@@ -1981,6 +2153,12 @@ def optimise_route(
         # replacing it with a pure road-distance answer.
         structured_candidates.extend(
             directional_sector_routes(locations, distances, durations)
+        )
+        # V25.4 adds proximity-based territories. These are deliberately
+        # separate from the older centroid zones: the goal is to recognise
+        # dense local areas and clear them before travelling elsewhere.
+        structured_candidates.extend(
+            proximity_cluster_routes(locations, distances, durations)
         )
         structured_candidates.extend(
             geographic_zone_routes(locations)
