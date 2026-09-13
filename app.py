@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.7"
+APP_VERSION = "25.1"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -827,11 +827,9 @@ def route_score(
 
     shape_penalty = 0.0
     backtrack_penalty = 0.0
-    local_area_penalty = 0.0
     if locations is not None:
         shape_penalty = calculate_shape_penalty(route, locations)
         backtrack_penalty = calculate_geographic_backtracking_penalty(route, locations)
-        local_area_penalty = calculate_local_area_penalty(route, locations)
 
     return (
         driving_minutes * TIME_PRIORITY
@@ -840,7 +838,6 @@ def route_score(
         + zone_penalty * CLUSTER_PRIORITY * 1.80
         + shape_penalty * CLUSTER_PRIORITY * 0.90
         + backtrack_penalty * CLUSTER_PRIORITY * 1.80
-        + local_area_penalty * CLUSTER_PRIORITY * 3.25
     )
 
 
@@ -1142,244 +1139,6 @@ def calculate_zone_penalty(route, locations):
         occurrences = visited_zones.count(zone_id)
         if occurrences > 1:
             penalty += (occurrences - 1) * 2.0
-
-    return penalty
-
-
-def proximity_cluster_routes(locations, distances, durations):
-    """Build driver-style routes that finish a local area before leaving it.
-
-    Unlike postcode-based grouping, clusters are created from the actual
-    coordinates. Dense streets therefore stay together even when several
-    customers share a postcode, while isolated rural jobs remain flexible.
-    Small components are merged only when necessary to keep the number of
-    territories practical.
-    """
-    customer_count = len(locations) - 1
-    if customer_count <= 1:
-        return []
-
-    # Estimate what counts as a genuinely local connection from this day's
-    # own geography. The bounds prevent either a dense town or a very sparse
-    # rural list from producing unreasonable clusters.
-    nearest = []
-    for i in range(1, customer_count + 1):
-        d = min(
-            haversine_points(locations[i], locations[j])
-            for j in range(1, customer_count + 1)
-            if j != i
-        )
-        nearest.append(d)
-
-    nearest_sorted = sorted(nearest)
-    median_nearest = nearest_sorted[len(nearest_sorted) // 2]
-    # Keep genuinely local streets/villages together, but do not allow a
-    # long chain of rural jobs to swallow several separate areas.  V25.5
-    # deliberately uses a tighter adaptive radius than V25.4.
-    local_radius = max(
-        0.65 * 1609.344,
-        min(1.75 * 1609.344, median_nearest * 2.0),
-    )
-
-    # Connected components: nearby chains remain one local area.
-    parent = list(range(customer_count + 1))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    for i in range(1, customer_count + 1):
-        for j in range(i + 1, customer_count + 1):
-            if haversine_points(locations[i], locations[j]) <= local_radius:
-                union(i, j)
-
-    components = {}
-    for i in range(1, customer_count + 1):
-        components.setdefault(find(i), []).append(i)
-    clusters = list(components.values())
-
-    # Merge isolated/small territories until the route has a manageable
-    # number of areas. The closest component pair is merged each time, so
-    # this never depends on postcode names or today's particular addresses.
-    # Use smaller territories so a village/street group is less likely to be
-    # merged with a neighbouring area.  This is still dynamic for any job list.
-    target = min(10, max(5, math.ceil(customer_count / 4)))
-    while len(clusters) > target:
-        best_pair = None
-        best_gap = float("inf")
-        for a in range(len(clusters)):
-            for b in range(a + 1, len(clusters)):
-                gap = min(
-                    haversine_points(locations[x], locations[y])
-                    for x in clusters[a]
-                    for y in clusters[b]
-                )
-                if gap < best_gap:
-                    best_gap = gap
-                    best_pair = (a, b)
-        if best_pair is None:
-            break
-        a, b = best_pair
-        clusters[a].extend(clusters[b])
-        del clusters[b]
-
-    depot = locations[0]
-    cluster_centres = []
-    for members in clusters:
-        lon = sum(locations[i][0] for i in members) / len(members)
-        lat = sum(locations[i][1] for i in members) / len(members)
-        centre = (lon, lat)
-        depot_distance = haversine_points(depot, centre)
-        cluster_centres.append((members, centre, depot_distance))
-
-    # Generate several sensible territory orders. Each one completely clears
-    # a cluster before moving to the next.
-    orders = []
-    base = sorted(
-        range(len(cluster_centres)),
-        key=lambda k: cluster_centres[k][2],
-    )
-    orders.append(base)
-    orders.append(list(reversed(base)))
-
-    # Nearest-next territory order from several possible starting areas.
-    for start in base[:min(len(base), 4)]:
-        remaining = set(range(len(cluster_centres)))
-        remaining.remove(start)
-        order = [start]
-        current = start
-        while remaining:
-            next_cluster = min(
-                remaining,
-                key=lambda k: haversine_points(
-                    cluster_centres[current][1],
-                    cluster_centres[k][1],
-                ),
-            )
-            order.append(next_cluster)
-            remaining.remove(next_cluster)
-            current = next_cluster
-        orders.append(order)
-        orders.append(list(reversed(order)))
-
-    routes = []
-    seen = set()
-    for order in orders:
-        sequence = []
-        for cluster_index in order:
-            members = cluster_centres[cluster_index][0][:]
-
-            # Road-aware nearest-neighbour ordering inside the local area.
-            # Try the member nearest the previous stop and let live road
-            # durations decide the following jobs.
-            if sequence:
-                first = min(
-                    members,
-                    key=lambda x: durations[sequence[-1]][x],
-                )
-            else:
-                first = min(
-                    members,
-                    key=lambda x: durations[0][x],
-                )
-
-            local = [first]
-            remaining = set(members)
-            remaining.remove(first)
-            current = first
-            while remaining:
-                next_customer = min(
-                    remaining,
-                    key=lambda x: (
-                        durations[current][x]
-                        + 0.35 * distances[current][x]
-                    ),
-                )
-                local.append(next_customer)
-                remaining.remove(next_customer)
-                current = next_customer
-
-            sequence.extend(local)
-
-        route = [0] + sequence + [0]
-        key = tuple(route)
-        if key not in seen:
-            seen.add(key)
-            routes.append(route)
-
-        reverse_route = [0] + list(reversed(sequence)) + [0]
-        key = tuple(reverse_route)
-        if key not in seen:
-            seen.add(key)
-            routes.append(reverse_route)
-
-    return routes
-
-
-def calculate_local_area_penalty(route, locations):
-    """Strongly penalise leaving nearby unvisited work behind.
-
-    V25.5 adds a separate locality measure because a route can have a good
-    overall score while still doing the exact thing a driver dislikes: leave
-    a street/village, travel several miles, and return later.  The radius is
-    adaptive to the day's own customer density and uses coordinates only; no
-    postcode or current-address knowledge is hard-coded.
-    """
-    if len(route) < 5:
-        return 0.0
-
-    customer_count = len(locations) - 1
-    nearest = []
-    for i in range(1, customer_count + 1):
-        values = [
-            haversine_points(locations[i], locations[j])
-            for j in range(1, customer_count + 1)
-            if j != i
-        ]
-        if values:
-            nearest.append(min(values))
-
-    if not nearest:
-        return 0.0
-
-    nearest.sort()
-    median_nearest = nearest[len(nearest) // 2]
-    local_radius = max(0.55 * 1609.344, min(1.5 * 1609.344, median_nearest * 2.2))
-    close_radius = local_radius * 1.45
-
-    remaining = set(route[1:-1])
-    penalty = 0.0
-
-    for pos in range(1, len(route) - 1):
-        current = route[pos]
-        nxt = route[pos + 1]
-        remaining.discard(current)
-        if nxt == 0 or not remaining:
-            continue
-
-        next_miles = haversine_points(locations[current], locations[nxt]) / 1609.344
-        nearby = []
-        close = []
-        for job in remaining:
-            miles = haversine_points(locations[current], locations[job]) / 1609.344
-            if miles <= local_radius / 1609.344:
-                nearby.append(miles)
-            if miles <= close_radius / 1609.344:
-                close.append(miles)
-
-        # If work is still on the same local patch, leaving it for a distant
-        # stop is heavily discouraged.
-        if nearby and next_miles > max(1.25, (local_radius / 1609.344) * 1.8):
-            penalty += (next_miles - max(1.25, (local_radius / 1609.344) * 1.8)) * (3.0 + 0.9 * len(nearby))
-        elif len(close) >= 2 and next_miles > max(2.0, (local_radius / 1609.344) * 2.0):
-            penalty += (next_miles - max(2.0, (local_radius / 1609.344) * 2.0)) * (1.8 + 0.45 * len(close))
 
     return penalty
 
@@ -2164,24 +1923,10 @@ def improve_driver_sweep_route(route, distances, durations, fuel_price, mpg, loc
     best = route[:]
     best_score = route_score(best, distances, durations, fuel_price, mpg, locations)
 
-    # Adjacent swaps only.  V25.3 adds one small protection: do not swap
-    # jobs that belong to different dynamically detected geographic zones.
-    # This keeps a road-efficient improvement from accidentally tearing apart
-    # an area that the sweep has already grouped together.  The zones are
-    # calculated from the actual coordinates, so nothing is hard-coded to
-    # Grantham or to the current test postcodes.
-    zone_labels = geographic_zone_labels(location_cache_key(locations))
-
+    # Adjacent swaps only. This keeps the broad territory sweep intact.
     for _ in range(3):
         changed = False
         for i in range(1, len(best) - 2):
-            left = best[i]
-            right = best[i + 1]
-            if left <= 0 or right <= 0:
-                continue
-            if zone_labels[left - 1] != zone_labels[right - 1]:
-                continue
-
             candidate = best[:]
             candidate[i], candidate[i + 1] = candidate[i + 1], candidate[i]
             score = route_score(candidate, distances, durations, fuel_price, mpg, locations)
@@ -2222,12 +1967,6 @@ def optimise_route(
         # replacing it with a pure road-distance answer.
         structured_candidates.extend(
             directional_sector_routes(locations, distances, durations)
-        )
-        # V25.4 adds proximity-based territories. These are deliberately
-        # separate from the older centroid zones: the goal is to recognise
-        # dense local areas and clear them before travelling elsewhere.
-        structured_candidates.extend(
-            proximity_cluster_routes(locations, distances, durations)
         )
         structured_candidates.extend(
             geographic_zone_routes(locations)
@@ -2835,10 +2574,7 @@ if st.button(
         "persisted_only": False,
     }
 
-    # V25.6: do NOT rerun immediately after planning.
-    # The dashboard below must render the freshly calculated route totals
-    # in the same Streamlit run. The previous rerun could return to the
-    # persisted-day state before the new totals were visible.
+    st.rerun()
 
 
 # ============================================================
@@ -2849,7 +2585,7 @@ route_data = st.session_state.get("route_data")
 
 if route_data:
     st.markdown("---")
-    st.subheader("💰 Daily Route Summary — V25.7")
+    st.subheader("💰 Daily Route Summary")
 
     customer_df = df.copy()
 
@@ -3013,8 +2749,6 @@ else:
     st.sidebar.success(
         "🎉 All customer stops completed!"
     )
-
-
 
 
 # ============================================================
