@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "24.0"
+APP_VERSION = "25.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -792,10 +792,10 @@ def route_score(
     return (
         driving_minutes * TIME_PRIORITY
         + driving_miles * DISTANCE_PRIORITY
-        + continuity * CLUSTER_PRIORITY * 8.0
-        + zone_penalty * CLUSTER_PRIORITY * 0.70
-        + shape_penalty * CLUSTER_PRIORITY * 0.55
-        + backtrack_penalty * CLUSTER_PRIORITY * 1.00
+        + continuity * CLUSTER_PRIORITY * 10.0
+        + zone_penalty * CLUSTER_PRIORITY * 1.80
+        + shape_penalty * CLUSTER_PRIORITY * 0.90
+        + backtrack_penalty * CLUSTER_PRIORITY * 1.80
     )
 
 
@@ -2031,14 +2031,15 @@ def optimise_route(
     time_ratio = structured_time / max(fallback_time, 1.0)
     distance_ratio = structured_distance / max(fallback_distance, 1.0)
 
-    # Driver-style structure is preferred when it remains reasonably close to
-    # the road-efficient solution.  This prevents the optimiser from turning a
-    # sensible working day into a mathematically neat but impractical zig-zag.
-    if time_ratio <= 1.15 and distance_ratio <= 1.15:
+    # V25 gives the geographical sweep a little more authority.  A clean
+    # driver-style territory route is allowed to cost a modest amount more
+    # than the pure road-time benchmark because repeatedly returning to an
+    # area that has already been cleared is expensive in real working time.
+    if time_ratio <= 1.20 and distance_ratio <= 1.20:
         return best_structured[3]
 
-    combined_ratio = time_ratio * 0.55 + distance_ratio * 0.45
-    if combined_ratio <= 1.12:
+    combined_ratio = time_ratio * 0.60 + distance_ratio * 0.40
+    if combined_ratio <= 1.16:
         return best_structured[3]
 
     return best_fallback[3]
