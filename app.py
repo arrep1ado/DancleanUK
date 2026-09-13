@@ -987,7 +987,7 @@ def calculate_geographic_backtracking_penalty(route, locations):
             if delta <= 55.0:
                 # Scale gently: the optimiser should prefer progress, but
                 # real road time/distance still dominate.
-                penalty += min(radial_backtrack, 8.0) * 0.55
+                penalty += min(radial_backtrack, 8.0) * 0.85
                 break
 
         # Penalise a sharp reversal between consecutive legs, but only when
@@ -1014,7 +1014,7 @@ def calculate_geographic_backtracking_penalty(route, locations):
             turn = abs(second - first)
             turn = min(turn, 360.0 - turn)
             if turn > 120.0 and radial_backtrack > 2.0:
-                penalty += (turn - 120.0) / 35.0
+                penalty += (turn - 120.0) / 28.0
 
     return penalty
 
@@ -1915,181 +1915,6 @@ def build_driver_sweep_routes(locations, distances=None, durations=None):
     return unique
 
 
-
-def build_depot_outward_routes(locations, distances=None, durations=None):
-    """Build safe candidates that move from the depot outward through work.
-
-    This is an additional candidate family only.  It does not replace the
-    existing routing methods or change any distance/time/fuel calculations.
-
-    The key idea is to keep jobs close to the depot together near the start,
-    then move progressively farther away.  Several angular orders are tested
-    so the road-aware scoring can still choose the best shape for arbitrary
-    geography.
-    """
-    customer_count = len(locations) - 1
-    if customer_count <= 0:
-        return []
-
-    depot = locations[0]
-    customers = list(range(1, customer_count + 1))
-
-    def radius(index):
-        return haversine_points(depot, locations[index])
-
-    def bearing(index):
-        lon, lat = locations[index]
-        dlon = (lon - depot[0]) * math.cos(math.radians(depot[1]))
-        dlat = lat - depot[1]
-        return (math.degrees(math.atan2(dlon, dlat)) + 360.0) % 360.0
-
-    radii = {i: radius(i) for i in customers}
-    bearings = {i: bearing(i) for i in customers}
-
-    def road_cost(a, b):
-        if durations is not None:
-            return durations[a][b]
-        if distances is not None:
-            return distances[a][b]
-        return haversine_points(locations[a], locations[b])
-
-    routes = []
-
-    # Radial bands are based on sorted distance from the depot.  Quantile
-    # bands keep dense local work together without assuming any postcode.
-    sorted_by_radius = sorted(customers, key=lambda i: (radii[i], bearings[i], i))
-
-    band_counts = [2]
-    if customer_count >= 8:
-        band_counts.append(3)
-    if customer_count >= 16:
-        band_counts.append(4)
-    if customer_count >= 28:
-        band_counts.append(5)
-
-    for band_count in band_counts:
-        bands = [[] for _ in range(band_count)]
-        for pos, job in enumerate(sorted_by_radius):
-            band = min(
-                band_count - 1,
-                (pos * band_count) // customer_count,
-            )
-            bands[band].append(job)
-
-        # Each band is visited from nearest to farthest.  Within a band,
-        # test several natural orders and let the existing road-aware score
-        # choose the winner.
-        for reverse_angle in (False, True):
-            for start_angle in (
-                0.0,
-                90.0,
-                180.0,
-                270.0,
-            ):
-                sequence = []
-                current = 0
-
-                for members in bands:
-                    if not members:
-                        continue
-
-                    if reverse_angle:
-                        ordered = sorted(
-                            members,
-                            key=lambda i: (
-                                (start_angle - bearings[i]) % 360.0,
-                                radii[i],
-                                i,
-                            ),
-                        )
-                    else:
-                        ordered = sorted(
-                            members,
-                            key=lambda i: (
-                                (bearings[i] - start_angle) % 360.0,
-                                radii[i],
-                                i,
-                            ),
-                        )
-
-                    # Start each radial band at the member which connects
-                    # best from the previous band, then continue locally.
-                    remaining = set(ordered)
-                    band_route = []
-
-                    while remaining:
-                        nxt = min(
-                            remaining,
-                            key=lambda i: (
-                                road_cost(current, i),
-                                abs(radii[i] - radii[current]) if current != 0 else radii[i],
-                                (bearings[i] - bearings[current]) % 360.0
-                                if current != 0 else bearings[i],
-                                i,
-                            ),
-                        )
-                        band_route.append(nxt)
-                        remaining.remove(nxt)
-                        current = nxt
-
-                    sequence.extend(band_route)
-
-                if len(sequence) == customer_count:
-                    routes.append([0] + sequence + [0])
-
-    # A stricter "nearest outward frontier" candidate.  It gives nearby jobs
-    # priority while still allowing a necessary road jump when the current
-    # local area is exhausted.
-    for angle_offset in (0.0, 90.0, 180.0, 270.0):
-        remaining = set(customers)
-        sequence = []
-        current = 0
-        current_radius = 0.0
-
-        while remaining:
-            if current == 0:
-                candidates = list(remaining)
-            else:
-                outward_limit = current_radius + max(1.5, current_radius * 0.35)
-                candidates = [
-                    job for job in remaining
-                    if radii[job] <= outward_limit
-                ]
-                if not candidates:
-                    candidates = list(remaining)
-
-            def frontier_key(job):
-                angle_delta = abs(
-                    ((bearings[job] - angle_offset + 180.0) % 360.0) - 180.0
-                )
-                return (
-                    road_cost(current, job),
-                    max(0.0, radii[job] - current_radius),
-                    angle_delta,
-                    radii[job],
-                    job,
-                )
-
-            nxt = min(candidates, key=frontier_key)
-            sequence.append(nxt)
-            remaining.remove(nxt)
-            current = nxt
-            current_radius = radii[nxt]
-
-        routes.append([0] + sequence + [0])
-
-    unique = []
-    seen = set()
-    for route in routes:
-        key = tuple(route)
-        if key not in seen and len(route) == customer_count + 2:
-            seen.add(key)
-            unique.append(route)
-
-    return unique
-
-
-
 def improve_driver_sweep_route(route, distances, durations, fuel_price, mpg, locations):
     """Make only small road-aware changes without breaking territory order."""
     if not route or len(route) < 5:
@@ -2135,12 +1960,6 @@ def optimise_route(
     if locations is not None:
         structured_candidates = build_driver_sweep_routes(
             locations, distances, durations
-        )
-
-        # Additional depot-outward candidates.  This is deliberately additive:
-        # all existing v25.1 candidate families remain available.
-        structured_candidates.extend(
-            build_depot_outward_routes(locations, distances, durations)
         )
 
         # Keep the older geographic candidates as additional general-purpose
