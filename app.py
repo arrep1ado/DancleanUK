@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.6"
+APP_VERSION = "25.7"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2849,7 +2849,7 @@ route_data = st.session_state.get("route_data")
 
 if route_data:
     st.markdown("---")
-    st.subheader("💰 Daily Route Summary")
+    st.subheader("💰 Daily Route Summary — V25.7")
 
     customer_df = df.copy()
 
@@ -3013,6 +3013,8 @@ else:
     st.sidebar.success(
         "🎉 All customer stops completed!"
     )
+
+
 
 
 # ============================================================
