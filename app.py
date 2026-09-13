@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.4"
+APP_VERSION = "25.5"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -827,9 +827,11 @@ def route_score(
 
     shape_penalty = 0.0
     backtrack_penalty = 0.0
+    local_area_penalty = 0.0
     if locations is not None:
         shape_penalty = calculate_shape_penalty(route, locations)
         backtrack_penalty = calculate_geographic_backtracking_penalty(route, locations)
+        local_area_penalty = calculate_local_area_penalty(route, locations)
 
     return (
         driving_minutes * TIME_PRIORITY
@@ -838,6 +840,7 @@ def route_score(
         + zone_penalty * CLUSTER_PRIORITY * 1.80
         + shape_penalty * CLUSTER_PRIORITY * 0.90
         + backtrack_penalty * CLUSTER_PRIORITY * 1.80
+        + local_area_penalty * CLUSTER_PRIORITY * 3.25
     )
 
 
@@ -1170,9 +1173,12 @@ def proximity_cluster_routes(locations, distances, durations):
 
     nearest_sorted = sorted(nearest)
     median_nearest = nearest_sorted[len(nearest_sorted) // 2]
+    # Keep genuinely local streets/villages together, but do not allow a
+    # long chain of rural jobs to swallow several separate areas.  V25.5
+    # deliberately uses a tighter adaptive radius than V25.4.
     local_radius = max(
-        0.8 * 1609.344,
-        min(2.5 * 1609.344, median_nearest * 2.4),
+        0.65 * 1609.344,
+        min(1.75 * 1609.344, median_nearest * 2.0),
     )
 
     # Connected components: nearby chains remain one local area.
@@ -1202,7 +1208,9 @@ def proximity_cluster_routes(locations, distances, durations):
     # Merge isolated/small territories until the route has a manageable
     # number of areas. The closest component pair is merged each time, so
     # this never depends on postcode names or today's particular addresses.
-    target = min(7, max(4, math.ceil(customer_count / 6)))
+    # Use smaller territories so a village/street group is less likely to be
+    # merged with a neighbouring area.  This is still dynamic for any job list.
+    target = min(10, max(5, math.ceil(customer_count / 4)))
     while len(clusters) > target:
         best_pair = None
         best_gap = float("inf")
@@ -1313,6 +1321,67 @@ def proximity_cluster_routes(locations, distances, durations):
             routes.append(reverse_route)
 
     return routes
+
+
+def calculate_local_area_penalty(route, locations):
+    """Strongly penalise leaving nearby unvisited work behind.
+
+    V25.5 adds a separate locality measure because a route can have a good
+    overall score while still doing the exact thing a driver dislikes: leave
+    a street/village, travel several miles, and return later.  The radius is
+    adaptive to the day's own customer density and uses coordinates only; no
+    postcode or current-address knowledge is hard-coded.
+    """
+    if len(route) < 5:
+        return 0.0
+
+    customer_count = len(locations) - 1
+    nearest = []
+    for i in range(1, customer_count + 1):
+        values = [
+            haversine_points(locations[i], locations[j])
+            for j in range(1, customer_count + 1)
+            if j != i
+        ]
+        if values:
+            nearest.append(min(values))
+
+    if not nearest:
+        return 0.0
+
+    nearest.sort()
+    median_nearest = nearest[len(nearest) // 2]
+    local_radius = max(0.55 * 1609.344, min(1.5 * 1609.344, median_nearest * 2.2))
+    close_radius = local_radius * 1.45
+
+    remaining = set(route[1:-1])
+    penalty = 0.0
+
+    for pos in range(1, len(route) - 1):
+        current = route[pos]
+        nxt = route[pos + 1]
+        remaining.discard(current)
+        if nxt == 0 or not remaining:
+            continue
+
+        next_miles = haversine_points(locations[current], locations[nxt]) / 1609.344
+        nearby = []
+        close = []
+        for job in remaining:
+            miles = haversine_points(locations[current], locations[job]) / 1609.344
+            if miles <= local_radius / 1609.344:
+                nearby.append(miles)
+            if miles <= close_radius / 1609.344:
+                close.append(miles)
+
+        # If work is still on the same local patch, leaving it for a distant
+        # stop is heavily discouraged.
+        if nearby and next_miles > max(1.25, (local_radius / 1609.344) * 1.8):
+            penalty += (next_miles - max(1.25, (local_radius / 1609.344) * 1.8)) * (3.0 + 0.9 * len(nearby))
+        elif len(close) >= 2 and next_miles > max(2.0, (local_radius / 1609.344) * 2.0):
+            penalty += (next_miles - max(2.0, (local_radius / 1609.344) * 2.0)) * (1.8 + 0.45 * len(close))
+
+    return penalty
 
 
 def geographic_zone_routes(locations):
