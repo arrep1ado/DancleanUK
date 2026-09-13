@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "23.0"
+APP_VERSION = "24.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -554,19 +554,18 @@ LEGACY_POSTCODE_COORDS = {
 
 
 def get_coords(query_string, postcode):
-    """Locate a customer using several fallback methods.
+    """Locate a customer using address-first geocoding with fallbacks.
 
-    Order:
+    V24 changes only the geocoding priority used by V23:
       1. cached successful result
-      2. postcodes.io current postcode
-      3. Nominatim full address
-      4. Nominatim street + Grantham
-      5. Nominatim postcode + Grantham
-      6. known legacy-postcode coordinate fallback
+      2. Nominatim full address / street candidates
+      3. postcodes.io postcode centroid
+      4. known legacy-postcode coordinate fallback
 
-    The final fallback is intentionally postcode-level rather than pretending
-    we know the exact front door. It is still far better than dropping the
-    customer from the route entirely.
+    The important difference is that customers sharing a postcode are now
+    given a chance to receive different coordinates when their full street
+    addresses are known.  This is especially important for multiple houses
+    on the same postcode, such as 180/190/194/196 Queensway.
     """
     query = str(query_string or "").strip()
     postcode = normalise_postcode(postcode)
@@ -576,8 +575,30 @@ def get_coords(query_string, postcode):
         return st.session_state.geocode_cache[key]
 
     # --------------------------------------------------------
-    # 1. POSTCODES.IO
+    # 1-3. NOMINATIM FIRST - FULL ADDRESS / STREET CANDIDATES
     # --------------------------------------------------------
+    # Try the complete customer address before falling back to a postcode
+    # centroid.  This prevents several different houses in the same postcode
+    # from automatically sharing one coordinate.
+    headers = {
+        "User-Agent": "DanCleanUKRouteOptimizer/24.0"
+    }
+
+    for candidate in geocode_candidates(query, postcode):
+        coords = nominatim_search(candidate, headers)
+        if coords is not None:
+            st.session_state.geocode_cache[key] = coords
+            return coords
+
+        # Public Nominatim service asks clients to be considerate.  Keep the
+        # existing short spacing between uncached requests.
+        time.sleep(0.35)
+
+    # --------------------------------------------------------
+    # 4. POSTCODES.IO POSTCODE FALLBACK
+    # --------------------------------------------------------
+    # If the exact address cannot be located, use the normal postcode
+    # coordinate rather than losing the customer from the route.
     if postcode:
         for pc in dict.fromkeys([postcode, postcode.replace(" ", "")]):
             try:
@@ -596,24 +617,6 @@ def get_coords(query_string, postcode):
                             return coords
             except Exception:
                 pass
-
-    # --------------------------------------------------------
-    # 2-4. NOMINATIM CANDIDATES
-    # --------------------------------------------------------
-    headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/23.0"
-    }
-
-    for candidate in geocode_candidates(query, postcode):
-        coords = nominatim_search(candidate, headers)
-        if coords is not None:
-            st.session_state.geocode_cache[key] = coords
-            return coords
-
-        # Public Nominatim service asks clients to be considerate.  The caller
-        # also has a one-second delay for uncached addresses, so keep this
-        # retry spacing short here.
-        time.sleep(0.35)
 
     # --------------------------------------------------------
     # 5. LEGACY POSTCODE FALLBACK
