@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.7"
+APP_VERSION = "25.8"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1217,202 +1217,143 @@ def geographic_zone_routes(locations):
     return routes
 
 
+def improve_locality_completion_route(route, distances, durations, locations):
+    """Make small, road-aware locality repairs without rebuilding the route.
 
-def build_cluster_completion_routes(locations, distances, durations):
-    """Build routes in two levels: choose geographic clusters first, then
-    finish each cluster before moving to the next one.
+    V25.8 deliberately starts from the proven V25.3 route structure.  Instead
+    of replacing it with another clustering algorithm, this pass only moves a
+    job when doing so keeps a nearby geographical pocket together and does not
+    materially increase live-road time or distance.
 
-    This is deliberately a candidate generator, not a hard rule.  The normal
-    route scoring/selection still decides whether one of these routes is good
-    enough compared with the road-efficient alternatives.
-
-    The important difference from the older geographic candidates is that the
-    order inside a cluster is built from the live road matrix and the next
-    cluster is chosen only after the current cluster has been completely
-    visited.  This prevents the optimiser from treating nearby jobs as
-    unrelated individual choices and repeatedly crossing between villages.
+    The method is intentionally conservative:
+      * it never changes the depot start/end;
+      * it works one job at a time;
+      * it favours putting a job beside its closest geographical neighbours;
+      * a move is accepted only when the resulting route remains within tight
+        time/distance limits and improves the locality objective.
     """
-    customer_count = len(locations) - 1
+    if not locations or len(route) < 5:
+        return route
+
+    customer_count = len(route) - 2
     if customer_count < 4:
-        return []
+        return route
 
-    # Try a few cluster counts.  Different spreads of jobs can need different
-    # numbers of areas; using several counts lets the final route score choose
-    # instead of hard-coding one geography.
-    if customer_count <= 12:
-        cluster_counts = [3]
-    elif customer_count <= 24:
-        cluster_counts = [3, 4]
-    elif customer_count <= 40:
-        cluster_counts = [4, 5, 6]
-    else:
-        cluster_counts = [5, 6, 7]
+    def geo_distance(a, b):
+        return haversine_points(locations[a], locations[b])
 
-    routes = []
+    def locality_cost(candidate):
+        # Penalise gaps between geographically close jobs.  This measures the
+        # order itself, not postcode text, so it remains general-purpose.
+        cost = 0.0
+        positions = {job: i for i, job in enumerate(candidate)}
+        jobs = candidate[1:-1]
 
-    for k in cluster_counts:
-        # Reuse the deterministic coordinate clustering, temporarily using
-        # the same k-means idea but with a local helper so this candidate can
-        # test more than the single default zone count.
-        seeds = [1]
-        while len(seeds) < min(k, customer_count):
-            best_idx = None
-            best_dist = -1.0
-            for idx in range(1, customer_count + 1):
-                if idx in seeds:
-                    continue
-                nearest = min(
-                    haversine_points(locations[idx], locations[s])
-                    for s in seeds
+        for job in jobs:
+            neighbours = sorted(
+                (geo_distance(job, other), other)
+                for other in jobs
+                if other != job
+            )[:3]
+            if not neighbours:
+                continue
+
+            for d, other in neighbours:
+                gap = abs(positions[job] - positions[other])
+                if d <= 1200 and gap > 1:
+                    cost += (gap - 1) * 7.0
+                elif d <= 2500 and gap > 2:
+                    cost += (gap - 2) * 2.5
+                elif d <= 4500 and gap > 4:
+                    cost += (gap - 4) * 0.75
+
+        return cost
+
+    current = list(route)
+    current_metrics = route_metrics(current, distances, durations, 1.0, 1.0)
+    current_time = current_metrics["time_s"]
+    current_distance = current_metrics["distance_m"]
+    current_locality = locality_cost(current)
+
+    # A locality repair is allowed to cost only a very small amount.  This is
+    # the key difference from V25.7: a prettier area grouping cannot purchase
+    # several extra miles of driving.
+    max_time = current_time * 1.018 + 45.0
+    max_distance = current_distance * 1.018 + 1609.344
+
+    for _ in range(3):
+        best = None
+        best_key = (current_locality, current_time, current_distance)
+
+        jobs = current[1:-1]
+        positions = {job: i for i, job in enumerate(current)}
+
+        # Only examine jobs which have at least one close geographical friend.
+        priority_jobs = []
+        for job in jobs:
+            close = [
+                geo_distance(job, other)
+                for other in jobs
+                if other != job and geo_distance(job, other) <= 4.5 * 1609.344
+            ]
+            if close:
+                priority_jobs.append((min(close), job))
+        priority_jobs.sort()
+
+        for _, job in priority_jobs:
+            old_pos = positions[job]
+            without = [x for x in current if x != job]
+
+            # Candidate insertion points are concentrated around the job's
+            # closest geographic neighbours, plus a few positions around its
+            # current location.  This keeps the search small and safe.
+            close_jobs = sorted(
+                (
+                    geo_distance(job, other),
+                    positions[other],
                 )
-                if nearest > best_dist:
-                    best_dist = nearest
-                    best_idx = idx
-            if best_idx is None:
-                break
-            seeds.append(best_idx)
+                for other in jobs
+                if other != job
+            )[:5]
 
-        centroids = [locations[i] for i in seeds]
-        labels = [0] * (customer_count + 1)
+            insert_positions = {max(1, min(len(without), old_pos))}
+            for _, pos in close_jobs:
+                for delta in (-1, 0, 1):
+                    insert_positions.add(max(1, min(len(without), pos + delta)))
 
-        for _ in range(12):
-            changed = False
-            for idx in range(1, customer_count + 1):
-                ds = [
-                    haversine_points(locations[idx], c)
-                    for c in centroids
-                ]
-                label = min(range(len(centroids)), key=lambda z: ds[z]) + 1
-                if labels[idx] != label:
-                    labels[idx] = label
-                    changed = True
+            for insert_pos in sorted(insert_positions):
+                candidate = without[:insert_pos] + [job] + without[insert_pos:]
+                if candidate == current:
+                    continue
 
-            new_centroids = []
-            for zone in range(1, len(centroids) + 1):
-                members = [
-                    locations[i]
-                    for i in range(1, customer_count + 1)
-                    if labels[i] == zone
-                ]
-                if members:
-                    new_centroids.append((
-                        sum(p[0] for p in members) / len(members),
-                        sum(p[1] for p in members) / len(members),
-                    ))
-                else:
-                    new_centroids.append(centroids[zone - 1])
-            centroids = new_centroids
-            if not changed:
-                break
+                metrics = route_metrics(candidate, distances, durations, 1.0, 1.0)
+                new_time = metrics["time_s"]
+                new_distance = metrics["distance_m"]
 
-        clusters = {}
-        for customer in range(1, customer_count + 1):
-            clusters.setdefault(labels[customer], []).append(customer)
+                if new_time > max_time or new_distance > max_distance:
+                    continue
 
-        if len(clusters) <= 1:
-            continue
+                new_locality = locality_cost(candidate)
+                key = (new_locality, new_time, new_distance)
 
-        # A cluster route is generated by selecting the next whole cluster,
-        # then solving that cluster from the actual current customer.  We try
-        # several possible first clusters because the depot can sit between
-        # two natural areas.
-        cluster_ids = list(clusters)
-        depot = 0
-        first_clusters = sorted(
-            cluster_ids,
-            key=lambda z: min(durations[depot][x] for x in clusters[z]),
-        )
+                # Require a meaningful locality improvement.  Tiny changes are
+                # not worth touching an already-good route.
+                if new_locality < current_locality - 0.50 and key < best_key:
+                    best = (candidate, new_locality, new_time, new_distance)
+                    best_key = key
 
-        for first_cluster in first_clusters:
-            remaining_clusters = set(cluster_ids)
-            remaining_clusters.remove(first_cluster)
-            current = depot
-            sequence = []
-            cluster_order = []
+        if best is None:
+            break
 
-            while True:
-                if first_cluster is not None:
-                    cluster_id = first_cluster
-                    first_cluster = None
-                elif not remaining_clusters:
-                    break
-                else:
-                    # Choose the next whole area by the cheapest live-road
-                    # entry from the current location to any job in it.
-                    cluster_id = min(
-                        remaining_clusters,
-                        key=lambda z: min(
-                            durations[current][x]
-                            for x in clusters[z]
-                        ),
-                    )
-                    remaining_clusters.remove(cluster_id)
+        current, current_locality, current_time, current_distance = best
 
-                members = set(clusters[cluster_id])
-                cluster_order.append(cluster_id)
+        # Recalculate the guard after each accepted repair.  This prevents a
+        # sequence of individually-small moves from drifting too far.
+        max_time = current_time * 1.018 + 45.0
+        max_distance = current_distance * 1.018 + 1609.344
 
-                # Finish the selected cluster before considering another one.
-                # Try each member as the entry point, but then use live-road
-                # nearest-neighbour choices to complete the local pocket.
-                best_local = None
-                for entry in members:
-                    local_remaining = set(members)
-                    local_remaining.remove(entry)
-                    local_route = [entry]
-                    local_current = entry
+    return current
 
-                    while local_remaining:
-                        nxt = min(
-                            local_remaining,
-                            key=lambda x: (
-                                durations[local_current][x] * 0.70
-                                + distances[local_current][x] * 0.30
-                            ),
-                        )
-                        local_route.append(nxt)
-                        local_remaining.remove(nxt)
-                        local_current = nxt
-
-                    local_cost = durations[current][entry]
-                    for a, b in zip(local_route, local_route[1:]):
-                        local_cost += durations[a][b]
-
-                    if best_local is None or local_cost < best_local[0]:
-                        best_local = (local_cost, local_route)
-
-                if best_local is None:
-                    break
-
-                sequence.extend(best_local[1])
-                current = best_local[1][-1]
-
-                if not remaining_clusters:
-                    break
-
-            if len(sequence) == customer_count:
-                routes.append([0] + sequence + [0])
-                routes.append([0] + list(reversed(sequence)) + [0])
-
-                # Also test the same cluster order while reversing each local
-                # pocket.  This can matter on roads where one-way approaches
-                # make the opposite direction substantially better.
-                reversed_sequence = []
-                for cluster_id in cluster_order:
-                    members = clusters[cluster_id][:]
-                    # Road-aware local order from the cluster centroid is used
-                    # only as a deterministic alternative; the main sequence
-                    # above remains the preferred live-road construction.
-                    c = centroids[cluster_id - 1]
-                    members.sort(
-                        key=lambda i: haversine_points(locations[i], c),
-                        reverse=True,
-                    )
-                    reversed_sequence.extend(members)
-                if len(reversed_sequence) == customer_count:
-                    routes.append([0] + reversed_sequence + [0])
-                    routes.append([0] + list(reversed(reversed_sequence)) + [0])
-
-    return routes
 
 def build_greedy_route(
     first_customer,
@@ -2174,12 +2115,6 @@ def optimise_route(
         structured_candidates.extend(
             geographic_zone_routes(locations)
         )
-        # v25.7: add true two-level cluster-completion candidates.  These
-        # routes choose an area first and then finish every job in that area
-        # before crossing into another area.
-        structured_candidates.extend(
-            build_cluster_completion_routes(locations, distances, durations)
-        )
 
         seen = set()
         for candidate in structured_candidates:
@@ -2196,6 +2131,17 @@ def optimise_route(
                 mpg,
                 locations,
             )
+
+            # V25.8: make only conservative locality repairs.  The V25.3
+            # sweep remains the foundation; this pass may tighten a split
+            # local pocket but is not allowed to trade several miles for it.
+            improved = improve_locality_completion_route(
+                improved,
+                distances,
+                durations,
+                locations,
+            )
+
             metrics = route_metrics(
                 improved, distances, durations, fuel_price, mpg
             )
