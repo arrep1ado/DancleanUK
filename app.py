@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.4"
+APP_VERSION = "25.5"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1037,11 +1037,7 @@ def geographic_zone_labels(location_tuple):
     elif customer_count <= 24:
         k = 4
     elif customer_count <= 40:
-        # Use one extra geographic zone for medium-sized routes so nearby
-        # villages/streets are less likely to be merged into one large zone.
-        # This gives the optimiser a better chance to finish a local area
-        # before moving on, without changing the live-road scoring.
-        k = 6
+        k = 5
     else:
         k = 6
     k = min(k, customer_count)
@@ -1217,6 +1213,122 @@ def geographic_zone_routes(locations):
                 sequence.extend(members)
             routes.append([0] + sequence + [0])
             routes.append([0] + list(reversed(sequence)) + [0])
+
+    return routes
+
+
+
+def build_cluster_completion_routes(locations, distances, durations):
+    """
+    Build road-aware routes that deliberately finish a local pocket before
+    moving to the next pocket.
+
+    This is a targeted v25.5 change.  It does not use postcode ordering and
+    it does not replace the live-road scoring.  At each stop we first look for
+    unvisited jobs that are genuinely close by on the road network.  If there
+    are several, the route is encouraged to clear that local group before
+    making a longer jump.
+
+    Several locality thresholds are tested so the optimiser can choose the
+    version that best balances cluster completion with total driving time.
+    """
+    customer_count = len(locations) - 1
+    if customer_count < 2:
+        return []
+
+    routes = []
+
+    # Keep this deliberately conservative.  The first threshold is tight
+    # enough for streets/villages; the larger thresholds help where a natural
+    # local area is spread over several roads.
+    for local_limit_miles in (1.5, 2.5, 4.0):
+        local_limit = local_limit_miles * 1609.344
+
+        for first in sorted(
+            range(1, customer_count + 1),
+            key=lambda i: (
+                durations[0][i],
+                distances[0][i],
+            ),
+        )[:min(customer_count, 10)]:
+            remaining = set(range(1, customer_count + 1))
+            remaining.remove(first)
+            route = [0, first]
+            current = first
+
+            while remaining:
+                nearby = [
+                    candidate
+                    for candidate in remaining
+                    if distances[current][candidate] <= local_limit
+                ]
+
+                if nearby:
+                    # If local work exists, compare local choices using live
+                    # road time plus a small look-ahead.  This makes the
+                    # decision road-aware without forcing a postcode order.
+                    pool = nearby
+                else:
+                    pool = list(remaining)
+
+                def candidate_score(candidate):
+                    leg_time = durations[current][candidate]
+                    leg_distance = distances[current][candidate]
+
+                    future = [x for x in remaining if x != candidate]
+                    if future:
+                        nearest_future = min(
+                            future,
+                            key=lambda x: durations[candidate][x]
+                        )
+                        future_time = durations[candidate][nearest_future]
+                        future_distance = distances[candidate][nearest_future]
+
+                        # Count genuinely local work around the candidate.
+                        local_jobs = sum(
+                            1
+                            for x in future
+                            if distances[candidate][x] <= local_limit
+                        )
+                    else:
+                        future_time = durations[candidate][0]
+                        future_distance = distances[candidate][0]
+                        local_jobs = 0
+
+                    score = (
+                        leg_time
+                        + future_time * 0.28
+                        + (leg_distance / 10.0) * 0.10
+                        + (future_distance / 10.0) * 0.06
+                        - local_jobs * 55.0
+                    )
+
+                    # When we have local choices, make a longer jump pay a
+                    # modest extra cost.  This is intentionally small because
+                    # the final route score still uses actual road metrics.
+                    if nearby:
+                        nearest_local = min(
+                            durations[current][x] for x in nearby
+                        )
+                        if leg_time > nearest_local * 1.35:
+                            score += (leg_time - nearest_local * 1.35) * 0.35
+
+                    return score
+
+                next_customer = min(pool, key=candidate_score)
+                route.append(next_customer)
+                remaining.remove(next_customer)
+                current = next_customer
+
+            route.append(0)
+            routes.append(route)
+
+    # Also test the reverse of each generated sweep.  This can matter when
+    # the depot sits between two natural local work areas.
+    original = routes[:]
+    for route in original:
+        if len(route) > 3:
+            routes.append([0] + route[1:-1][::-1] + [0])
 
     return routes
 
@@ -1980,6 +2092,12 @@ def optimise_route(
         )
         structured_candidates.extend(
             geographic_zone_routes(locations)
+        )
+        # v25.5: add a road-aware cluster-completion candidate.  This is
+        # intentionally additive; the existing v25.3 sweep candidates remain
+        # untouched and can still win if they are shorter/faster.
+        structured_candidates.extend(
+            build_cluster_completion_routes(locations, distances, durations)
         )
 
         seen = set()
