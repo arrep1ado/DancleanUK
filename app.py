@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.12"
+APP_VERSION = "25.13"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2144,13 +2144,15 @@ def optimise_route(
             mpg,
         )
 
-        # Locality is used only as a tie-breaker here.  We do not run the old
-        # expensive 2-opt/relocate search over the complete route.
-        breaks = calculate_cluster_penalty(route, distances)
+        # Locality is used only as a tie-breaker here.  The old
+        # calculate_cluster_penalty() function is intentionally not used in
+        # V25.13 because it is not part of this fast optimiser.  Use the
+        # continuity penalty that is already defined above instead.
+        locality = calculate_continuity_penalty(route, distances)
         score = (
             metrics["time_s"] * TIME_PRIORITY
             + metrics["distance_m"] * DISTANCE_PRIORITY
-            + breaks * CLUSTER_PRIORITY
+            + locality * CLUSTER_PRIORITY
         )
         routes.append(
             (
