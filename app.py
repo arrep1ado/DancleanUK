@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.6"
+APP_VERSION = "25.7"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1149,154 +1149,6 @@ def calculate_zone_penalty(route, locations):
     return penalty
 
 
-
-def build_cluster_completion_routes(locations, distances, durations):
-    """
-    Build candidate routes which commit to a local road-connected pocket.
-
-    Unlike the older zone candidates, this uses the LIVE road matrix to form
-    small local clusters. Once a cluster is entered, every job in that cluster
-    is completed before the optimiser is allowed to move to another cluster.
-
-    Several road-distance thresholds are tested because the right definition
-    of "local" depends on the day's job spread. No postcode text is used.
-    """
-    customer_count = len(locations) - 1
-    if customer_count < 2:
-        return []
-
-    # These are deliberately candidate thresholds rather than one hard rule.
-    # They are in miles of actual road distance.
-    thresholds_miles = (0.75, 1.00, 1.35, 1.75, 2.25)
-
-    routes = []
-    customer_ids = list(range(1, customer_count + 1))
-
-    def road_miles(a, b):
-        return distances[a][b] / 1609.344
-
-    def make_clusters(threshold):
-        # Build connected components from actual road distances. This means
-        # nearby streets/villages naturally stay together without postcode
-        # assumptions.
-        graph = {i: set() for i in customer_ids}
-        for pos, a in enumerate(customer_ids):
-            for b in customer_ids[pos + 1:]:
-                if road_miles(a, b) <= threshold:
-                    graph[a].add(b)
-                    graph[b].add(a)
-
-        clusters = []
-        unseen = set(customer_ids)
-        while unseen:
-            seed = min(unseen)
-            stack = [seed]
-            unseen.remove(seed)
-            component = []
-
-            while stack:
-                current = stack.pop()
-                component.append(current)
-                for nxt in graph[current]:
-                    if nxt in unseen:
-                        unseen.remove(nxt)
-                        stack.append(nxt)
-
-            clusters.append(component)
-
-        return clusters
-
-    for threshold in thresholds_miles:
-        clusters = make_clusters(threshold)
-
-        # A useful cluster-completion candidate needs more than one pocket;
-        # otherwise it is effectively just a normal nearest-neighbour route.
-        if len(clusters) < 2:
-            continue
-
-        cluster_by_job = {}
-        for cluster_id, members in enumerate(clusters):
-            for job in members:
-                cluster_by_job[job] = cluster_id
-
-        # Build several cluster orders. The order is chosen by live road
-        # travel from the current end of the previous cluster. We try every
-        # possible first cluster for smaller routes, plus the nearest few for
-        # larger routes.
-        if len(clusters) <= 8:
-            first_cluster_ids = range(len(clusters))
-        else:
-            first_cluster_ids = sorted(
-                range(len(clusters)),
-                key=lambda c: min(
-                    durations[0][job] for job in clusters[c]
-                )
-            )[:8]
-
-        for first_cluster in first_cluster_ids:
-            remaining_clusters = set(range(len(clusters)))
-            remaining_clusters.remove(first_cluster)
-
-            cluster_order = [first_cluster]
-            current_job = 0
-
-            # Start the first cluster with the job closest to the depot by
-            # live driving time, then complete it before moving on.
-            first_members = clusters[first_cluster][:]
-            first_members.sort(
-                key=lambda job: (durations[current_job][job], distances[current_job][job])
-            )
-            current_job = first_members[0]
-
-            while remaining_clusters:
-                next_cluster = min(
-                    remaining_clusters,
-                    key=lambda c: min(
-                        durations[current_job][job]
-                        for job in clusters[c]
-                    )
-                )
-                cluster_order.append(next_cluster)
-                remaining_clusters.remove(next_cluster)
-
-                # The endpoint of this cluster is not known until we order it,
-                # so the next iteration uses the endpoint chosen below.
-                # Store only the cluster order here; ordering is rebuilt below.
-                members = clusters[next_cluster]
-                current_job = min(
-                    members,
-                    key=lambda job: durations[current_job][job]
-                )
-
-            for order in (cluster_order, list(reversed(cluster_order))):
-                sequence = []
-                current = 0
-
-                for cluster_id in order:
-                    remaining = set(clusters[cluster_id])
-
-                    # Road-aware nearest-first ordering inside the cluster.
-                    # This is intentionally local: it cannot jump to another
-                    # cluster just because that single job scores slightly
-                    # better.
-                    while remaining:
-                        nxt = min(
-                            remaining,
-                            key=lambda job: (
-                                durations[current][job],
-                                distances[current][job],
-                            )
-                        )
-                        sequence.append(nxt)
-                        remaining.remove(nxt)
-                        current = nxt
-
-                candidate = [0] + sequence + [0]
-                routes.append(candidate)
-
-    return routes
-
-
 def geographic_zone_routes(locations):
     """Build candidate routes which clear dynamically detected areas."""
     customer_count = len(locations) - 1
@@ -1364,6 +1216,203 @@ def geographic_zone_routes(locations):
 
     return routes
 
+
+
+def build_cluster_completion_routes(locations, distances, durations):
+    """Build routes in two levels: choose geographic clusters first, then
+    finish each cluster before moving to the next one.
+
+    This is deliberately a candidate generator, not a hard rule.  The normal
+    route scoring/selection still decides whether one of these routes is good
+    enough compared with the road-efficient alternatives.
+
+    The important difference from the older geographic candidates is that the
+    order inside a cluster is built from the live road matrix and the next
+    cluster is chosen only after the current cluster has been completely
+    visited.  This prevents the optimiser from treating nearby jobs as
+    unrelated individual choices and repeatedly crossing between villages.
+    """
+    customer_count = len(locations) - 1
+    if customer_count < 4:
+        return []
+
+    # Try a few cluster counts.  Different spreads of jobs can need different
+    # numbers of areas; using several counts lets the final route score choose
+    # instead of hard-coding one geography.
+    if customer_count <= 12:
+        cluster_counts = [3]
+    elif customer_count <= 24:
+        cluster_counts = [3, 4]
+    elif customer_count <= 40:
+        cluster_counts = [4, 5, 6]
+    else:
+        cluster_counts = [5, 6, 7]
+
+    routes = []
+
+    for k in cluster_counts:
+        # Reuse the deterministic coordinate clustering, temporarily using
+        # the same k-means idea but with a local helper so this candidate can
+        # test more than the single default zone count.
+        seeds = [1]
+        while len(seeds) < min(k, customer_count):
+            best_idx = None
+            best_dist = -1.0
+            for idx in range(1, customer_count + 1):
+                if idx in seeds:
+                    continue
+                nearest = min(
+                    haversine_points(locations[idx], locations[s])
+                    for s in seeds
+                )
+                if nearest > best_dist:
+                    best_dist = nearest
+                    best_idx = idx
+            if best_idx is None:
+                break
+            seeds.append(best_idx)
+
+        centroids = [locations[i] for i in seeds]
+        labels = [0] * (customer_count + 1)
+
+        for _ in range(12):
+            changed = False
+            for idx in range(1, customer_count + 1):
+                ds = [
+                    haversine_points(locations[idx], c)
+                    for c in centroids
+                ]
+                label = min(range(len(centroids)), key=lambda z: ds[z]) + 1
+                if labels[idx] != label:
+                    labels[idx] = label
+                    changed = True
+
+            new_centroids = []
+            for zone in range(1, len(centroids) + 1):
+                members = [
+                    locations[i]
+                    for i in range(1, customer_count + 1)
+                    if labels[i] == zone
+                ]
+                if members:
+                    new_centroids.append((
+                        sum(p[0] for p in members) / len(members),
+                        sum(p[1] for p in members) / len(members),
+                    ))
+                else:
+                    new_centroids.append(centroids[zone - 1])
+            centroids = new_centroids
+            if not changed:
+                break
+
+        clusters = {}
+        for customer in range(1, customer_count + 1):
+            clusters.setdefault(labels[customer], []).append(customer)
+
+        if len(clusters) <= 1:
+            continue
+
+        # A cluster route is generated by selecting the next whole cluster,
+        # then solving that cluster from the actual current customer.  We try
+        # several possible first clusters because the depot can sit between
+        # two natural areas.
+        cluster_ids = list(clusters)
+        depot = 0
+        first_clusters = sorted(
+            cluster_ids,
+            key=lambda z: min(durations[depot][x] for x in clusters[z]),
+        )
+
+        for first_cluster in first_clusters:
+            remaining_clusters = set(cluster_ids)
+            remaining_clusters.remove(first_cluster)
+            current = depot
+            sequence = []
+            cluster_order = []
+
+            while True:
+                if first_cluster is not None:
+                    cluster_id = first_cluster
+                    first_cluster = None
+                elif not remaining_clusters:
+                    break
+                else:
+                    # Choose the next whole area by the cheapest live-road
+                    # entry from the current location to any job in it.
+                    cluster_id = min(
+                        remaining_clusters,
+                        key=lambda z: min(
+                            durations[current][x]
+                            for x in clusters[z]
+                        ),
+                    )
+                    remaining_clusters.remove(cluster_id)
+
+                members = set(clusters[cluster_id])
+                cluster_order.append(cluster_id)
+
+                # Finish the selected cluster before considering another one.
+                # Try each member as the entry point, but then use live-road
+                # nearest-neighbour choices to complete the local pocket.
+                best_local = None
+                for entry in members:
+                    local_remaining = set(members)
+                    local_remaining.remove(entry)
+                    local_route = [entry]
+                    local_current = entry
+
+                    while local_remaining:
+                        nxt = min(
+                            local_remaining,
+                            key=lambda x: (
+                                durations[local_current][x] * 0.70
+                                + distances[local_current][x] * 0.30
+                            ),
+                        )
+                        local_route.append(nxt)
+                        local_remaining.remove(nxt)
+                        local_current = nxt
+
+                    local_cost = durations[current][entry]
+                    for a, b in zip(local_route, local_route[1:]):
+                        local_cost += durations[a][b]
+
+                    if best_local is None or local_cost < best_local[0]:
+                        best_local = (local_cost, local_route)
+
+                if best_local is None:
+                    break
+
+                sequence.extend(best_local[1])
+                current = best_local[1][-1]
+
+                if not remaining_clusters:
+                    break
+
+            if len(sequence) == customer_count:
+                routes.append([0] + sequence + [0])
+                routes.append([0] + list(reversed(sequence)) + [0])
+
+                # Also test the same cluster order while reversing each local
+                # pocket.  This can matter on roads where one-way approaches
+                # make the opposite direction substantially better.
+                reversed_sequence = []
+                for cluster_id in cluster_order:
+                    members = clusters[cluster_id][:]
+                    # Road-aware local order from the cluster centroid is used
+                    # only as a deterministic alternative; the main sequence
+                    # above remains the preferred live-road construction.
+                    c = centroids[cluster_id - 1]
+                    members.sort(
+                        key=lambda i: haversine_points(locations[i], c),
+                        reverse=True,
+                    )
+                    reversed_sequence.extend(members)
+                if len(reversed_sequence) == customer_count:
+                    routes.append([0] + reversed_sequence + [0])
+                    routes.append([0] + list(reversed(reversed_sequence)) + [0])
+
+    return routes
 
 def build_greedy_route(
     first_customer,
@@ -2102,7 +2151,7 @@ def optimise_route(
 ):
     """General-purpose driver-style route optimiser.
 
-    V26 makes geographical sweeps and local cluster-completion routes primary structure.  It is not tuned
+    V23 makes the geographical sweep the primary structure.  It is not tuned
     to the current 30-address example: all territories are generated from the
     actual customer coordinates for whatever jobs are supplied.
     """
@@ -2125,9 +2174,9 @@ def optimise_route(
         structured_candidates.extend(
             geographic_zone_routes(locations)
         )
-        # V25.6: add road-connected cluster-completion candidates. These
-        # routes deliberately finish a local pocket before crossing to the
-        # next pocket, while still being judged by the same live-road score.
+        # v25.7: add true two-level cluster-completion candidates.  These
+        # routes choose an area first and then finish every job in that area
+        # before crossing into another area.
         structured_candidates.extend(
             build_cluster_completion_routes(locations, distances, durations)
         )
@@ -2233,7 +2282,7 @@ def optimise_route(
     time_ratio = structured_time / max(fallback_time, 1.0)
     distance_ratio = structured_distance / max(fallback_distance, 1.0)
 
-    # V26 gives clean geographical routes a little more authority.  A clean
+    # V25 gives the geographical sweep a little more authority.  A clean
     # driver-style territory route is allowed to cost a modest amount more
     # than the pure road-time benchmark because repeatedly returning to an
     # area that has already been cleared is expensive in real working time.
