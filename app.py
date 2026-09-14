@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.8"
+APP_VERSION = "25.9"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1217,144 +1217,6 @@ def geographic_zone_routes(locations):
     return routes
 
 
-def improve_locality_completion_route(route, distances, durations, locations):
-    """Make small, road-aware locality repairs without rebuilding the route.
-
-    V25.8 deliberately starts from the proven V25.3 route structure.  Instead
-    of replacing it with another clustering algorithm, this pass only moves a
-    job when doing so keeps a nearby geographical pocket together and does not
-    materially increase live-road time or distance.
-
-    The method is intentionally conservative:
-      * it never changes the depot start/end;
-      * it works one job at a time;
-      * it favours putting a job beside its closest geographical neighbours;
-      * a move is accepted only when the resulting route remains within tight
-        time/distance limits and improves the locality objective.
-    """
-    if not locations or len(route) < 5:
-        return route
-
-    customer_count = len(route) - 2
-    if customer_count < 4:
-        return route
-
-    def geo_distance(a, b):
-        return haversine_points(locations[a], locations[b])
-
-    def locality_cost(candidate):
-        # Penalise gaps between geographically close jobs.  This measures the
-        # order itself, not postcode text, so it remains general-purpose.
-        cost = 0.0
-        positions = {job: i for i, job in enumerate(candidate)}
-        jobs = candidate[1:-1]
-
-        for job in jobs:
-            neighbours = sorted(
-                (geo_distance(job, other), other)
-                for other in jobs
-                if other != job
-            )[:3]
-            if not neighbours:
-                continue
-
-            for d, other in neighbours:
-                gap = abs(positions[job] - positions[other])
-                if d <= 1200 and gap > 1:
-                    cost += (gap - 1) * 7.0
-                elif d <= 2500 and gap > 2:
-                    cost += (gap - 2) * 2.5
-                elif d <= 4500 and gap > 4:
-                    cost += (gap - 4) * 0.75
-
-        return cost
-
-    current = list(route)
-    current_metrics = route_metrics(current, distances, durations, 1.0, 1.0)
-    current_time = current_metrics["time_s"]
-    current_distance = current_metrics["distance_m"]
-    current_locality = locality_cost(current)
-
-    # A locality repair is allowed to cost only a very small amount.  This is
-    # the key difference from V25.7: a prettier area grouping cannot purchase
-    # several extra miles of driving.
-    max_time = current_time * 1.018 + 45.0
-    max_distance = current_distance * 1.018 + 1609.344
-
-    for _ in range(3):
-        best = None
-        best_key = (current_locality, current_time, current_distance)
-
-        jobs = current[1:-1]
-        positions = {job: i for i, job in enumerate(current)}
-
-        # Only examine jobs which have at least one close geographical friend.
-        priority_jobs = []
-        for job in jobs:
-            close = [
-                geo_distance(job, other)
-                for other in jobs
-                if other != job and geo_distance(job, other) <= 4.5 * 1609.344
-            ]
-            if close:
-                priority_jobs.append((min(close), job))
-        priority_jobs.sort()
-
-        for _, job in priority_jobs:
-            old_pos = positions[job]
-            without = [x for x in current if x != job]
-
-            # Candidate insertion points are concentrated around the job's
-            # closest geographic neighbours, plus a few positions around its
-            # current location.  This keeps the search small and safe.
-            close_jobs = sorted(
-                (
-                    geo_distance(job, other),
-                    positions[other],
-                )
-                for other in jobs
-                if other != job
-            )[:5]
-
-            insert_positions = {max(1, min(len(without), old_pos))}
-            for _, pos in close_jobs:
-                for delta in (-1, 0, 1):
-                    insert_positions.add(max(1, min(len(without), pos + delta)))
-
-            for insert_pos in sorted(insert_positions):
-                candidate = without[:insert_pos] + [job] + without[insert_pos:]
-                if candidate == current:
-                    continue
-
-                metrics = route_metrics(candidate, distances, durations, 1.0, 1.0)
-                new_time = metrics["time_s"]
-                new_distance = metrics["distance_m"]
-
-                if new_time > max_time or new_distance > max_distance:
-                    continue
-
-                new_locality = locality_cost(candidate)
-                key = (new_locality, new_time, new_distance)
-
-                # Require a meaningful locality improvement.  Tiny changes are
-                # not worth touching an already-good route.
-                if new_locality < current_locality - 0.50 and key < best_key:
-                    best = (candidate, new_locality, new_time, new_distance)
-                    best_key = key
-
-        if best is None:
-            break
-
-        current, current_locality, current_time, current_distance = best
-
-        # Recalculate the guard after each accepted repair.  This prevents a
-        # sequence of individually-small moves from drifting too far.
-        max_time = current_time * 1.018 + 45.0
-        max_distance = current_distance * 1.018 + 1609.344
-
-    return current
-
-
 def build_greedy_route(
     first_customer,
     distances,
@@ -2131,17 +1993,6 @@ def optimise_route(
                 mpg,
                 locations,
             )
-
-            # V25.8: make only conservative locality repairs.  The V25.3
-            # sweep remains the foundation; this pass may tighten a split
-            # local pocket but is not allowed to trade several miles for it.
-            improved = improve_locality_completion_route(
-                improved,
-                distances,
-                durations,
-                locations,
-            )
-
             metrics = route_metrics(
                 improved, distances, durations, fuel_price, mpg
             )
