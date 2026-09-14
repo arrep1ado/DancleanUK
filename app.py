@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.2"
+APP_VERSION = "25.3"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -987,7 +987,7 @@ def calculate_geographic_backtracking_penalty(route, locations):
             if delta <= 55.0:
                 # Scale gently: the optimiser should prefer progress, but
                 # real road time/distance still dominate.
-                penalty += min(radial_backtrack, 8.0) * 0.85
+                penalty += min(radial_backtrack, 8.0) * 0.55
                 break
 
         # Penalise a sharp reversal between consecutive legs, but only when
@@ -1014,7 +1014,7 @@ def calculate_geographic_backtracking_penalty(route, locations):
             turn = abs(second - first)
             turn = min(turn, 360.0 - turn)
             if turn > 120.0 and radial_backtrack > 2.0:
-                penalty += (turn - 120.0) / 28.0
+                penalty += (turn - 120.0) / 35.0
 
     return penalty
 
@@ -1129,7 +1129,13 @@ def calculate_zone_penalty(route, locations):
                 penalty += 2.5
 
             if next_zone in visited_zones:
-                penalty += 3.5
+                # Strongly discourage re-entering a geographic work zone
+                # after the route has already moved on.  This is the key
+                # v25.3 routing change: road time still decides between
+                # sensible alternatives, but a route should not clear an
+                # area, leave it, and then return much later just to collect
+                # one remaining job.
+                penalty += 8.0
             visited_zones.append(next_zone)
         elif current_zone not in visited_zones:
             visited_zones.append(current_zone)
@@ -1138,7 +1144,7 @@ def calculate_zone_penalty(route, locations):
     for zone_id in set(visited_zones):
         occurrences = visited_zones.count(zone_id)
         if occurrences > 1:
-            penalty += (occurrences - 1) * 2.0
+            penalty += (occurrences - 1) * 5.0
 
     return penalty
 
