@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.3"
+APP_VERSION = "25.4"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1037,7 +1037,11 @@ def geographic_zone_labels(location_tuple):
     elif customer_count <= 24:
         k = 4
     elif customer_count <= 40:
-        k = 5
+        # Use one extra geographic zone for medium-sized routes so nearby
+        # villages/streets are less likely to be merged into one large zone.
+        # This gives the optimiser a better chance to finish a local area
+        # before moving on, without changing the live-road scoring.
+        k = 6
     else:
         k = 6
     k = min(k, customer_count)
