@@ -1,3 +1,4 @@
+import itertools
 import io
 import math
 import random
@@ -20,7 +21,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.23"
+APP_VERSION = "25.24"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2265,6 +2266,77 @@ def _repair_local_pockets(route, distances, durations, fuel_price, mpg):
     return best
 
 
+def _repair_depot_pocket(route, distances, durations, fuel_price, mpg):
+    """Keep the small live-road-distance pocket around the depot together.
+
+    This is deliberately narrow: it only acts on customers that are genuinely
+    close to the depot according to the live road matrix.  It does not use
+    postcode order, town names, or hard-coded customer addresses.
+
+    The existing v25.23 route remains the baseline.  We test moving the depot
+    pocket immediately after the depot, try the possible orders for that small
+    pocket, and accept the repair only when the overall route remains within a
+    very small road-cost tolerance.
+    """
+    if not route or len(route) < 4:
+        return route
+
+    # Node 0 is the depot in the routing matrix.
+    depot_nodes = [
+        node for node in route
+        if node != 0 and node < len(distances) and distances[0][node] <= 900.0
+    ]
+
+    # Nothing to repair, or too many jobs to brute-force safely.
+    if len(depot_nodes) <= 1 or len(depot_nodes) > 7:
+        return route
+
+    baseline = route_metrics(route, distances, durations, fuel_price, mpg)
+
+    # Remove the depot-pocket jobs from wherever the optimiser put them.
+    remaining = [node for node in route if node == 0 or node not in depot_nodes]
+
+    # Put the pocket immediately after the depot.  Try every order for this
+    # small pocket; the route matrix decides which order is best.
+    depot_pos = remaining.index(0)
+    best = route[:]
+    best_metrics = baseline
+
+    max_time = baseline["time_s"] * 1.006 + 60.0
+    max_distance = baseline["distance_m"] * 1.006 + 1200.0
+
+    # First check the original order, then all permutations for a pocket of
+    # this size.  This is only a handful of jobs, so it is cheap compared with
+    # the main optimiser.
+    orders = list(itertools.permutations(depot_nodes))
+
+    # Evaluate shorter permutations first by their direct depot travel.
+    orders.sort(
+        key=lambda order: (
+            sum(distances[order[i]][order[i + 1]] for i in range(len(order) - 1)),
+            sum(durations[order[i]][order[i + 1]] for i in range(len(order) - 1)),
+        )
+    )
+
+    for order in orders:
+        candidate = remaining[:depot_pos + 1] + list(order) + remaining[depot_pos + 1:]
+        metrics = route_metrics(candidate, distances, durations, fuel_price, mpg)
+
+        if metrics["time_s"] > max_time or metrics["distance_m"] > max_distance:
+            continue
+
+        # Prefer a shorter complete route.  If effectively tied, prefer the
+        # shorter driving time, then the shorter distance.
+        key = (metrics["time_s"], metrics["distance_m"])
+        best_key = (best_metrics["time_s"], best_metrics["distance_m"])
+
+        if key < best_key:
+            best = candidate
+            best_metrics = metrics
+
+    return best
+
+
 def optimise_route(
     distances,
     durations,
@@ -2272,11 +2344,12 @@ def optimise_route(
     mpg,
     locations=None,
 ):
-    """v25.23: proven v25.3 route + conservative local-pocket repair.
+    """v25.24: v25.23 route with one surgical depot-pocket correction.
 
-    The expensive, proven v25.3 route generation stays intact.  We only make
-    a final road-matrix-based repair when it keeps driving cost essentially
-    flat while removing an obvious nearby-job split.
+    The proven v25.23 routing engine and Daily Route Summary are retained.
+    The only routing addition is to keep genuinely depot-adjacent jobs
+    together at the beginning, using live road distance/time rather than
+    postcode order or hard-coded areas.
     """
     route = _optimise_route_v25_3_core(
         distances,
@@ -2289,7 +2362,15 @@ def optimise_route(
     if not route:
         return route
 
-    return _repair_local_pockets(
+    route = _repair_local_pockets(
+        route,
+        distances,
+        durations,
+        fuel_price,
+        mpg,
+    )
+
+    return _repair_depot_pocket(
         route,
         distances,
         durations,
