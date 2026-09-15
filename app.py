@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.16"
+APP_VERSION = "25.17"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2457,6 +2457,210 @@ def repair_local_pockets(route, distances, durations, max_passes=2):
     return best
 
 
+
+def build_dynamic_pocket_block_routes(distances, durations, locations=None, beam_width=220):
+    """
+    V25.17: build routes by completing real road-distance pockets.
+
+    This is deliberately different from simply adding a locality penalty to a
+    finished route.  From the driver's current location we create several
+    possible local blocks, test the order inside each block, and keep a wide
+    beam of complete-route possibilities.  The next pocket is chosen only
+    after the current pocket has been considered as a whole.
+
+    No postcode, village, or fixed area ordering is used.
+    """
+    n = len(distances) - 1
+    if n <= 0:
+        return []
+
+    customers = tuple(range(1, n + 1))
+
+    def miles(m):
+        return m / 1609.344
+
+    def move_cost(a, b):
+        return durations[a][b] / 60.0 + 0.10 * miles(distances[a][b])
+
+    starts = sorted(
+        customers,
+        key=lambda j: (durations[0][j], distances[0][j]),
+    )[:min(12, n)]
+
+    # State = (estimated_score, route_tuple, remaining_tuple)
+    states = []
+    for start in starts:
+        remaining = tuple(j for j in customers if j != start)
+        states.append((move_cost(0, start), (0, start), remaining))
+
+    for _stage in range(n):
+        if not states:
+            break
+
+        expanded = []
+        finished_states = []
+
+        for base_score, route, remaining in states:
+            if not remaining:
+                finished_states.append((base_score, route, remaining))
+                continue
+
+            current = route[-1]
+
+            # Try several possible next anchors.  The anchor is the first job
+            # of the next pocket, but the pocket itself is then solved as a
+            # small road-aware block rather than greedily one stop at a time.
+            anchors = sorted(
+                remaining,
+                key=lambda j: (durations[current][j], distances[current][j]),
+            )[:min(7, len(remaining))]
+
+            for anchor in anchors:
+                rest = [j for j in remaining if j != anchor]
+
+                # A pocket is based on actual road distance from the anchor.
+                # Keep it deliberately small so that local permutations are
+                # useful and the method remains general on larger days.
+                nearby = [
+                    j for j in rest
+                    if miles(distances[anchor][j]) <= 2.00
+                ]
+                nearby.sort(
+                    key=lambda j: (
+                        durations[anchor][j],
+                        distances[anchor][j],
+                    )
+                )
+                pocket = [anchor] + nearby[:4]
+
+                # If the anchor is close to the current position, favour a
+                # larger pocket.  Otherwise do not force distant work into it.
+                if miles(distances[current][anchor]) > 2.25:
+                    pocket = [anchor] + nearby[:2]
+
+                # Remove duplicates while preserving order.
+                pocket = list(dict.fromkeys(pocket))
+
+                # Enumerate the small block.  We score each permutation using
+                # actual road time, distance, and the cost of getting out of
+                # the block.  This is where a Barrowby-like pocket can stay
+                # together instead of being split by a later global repair.
+                import itertools
+                perms = itertools.permutations(pocket)
+                local_options = []
+                remaining_after = [j for j in rest if j not in pocket]
+
+                for perm in perms:
+                    seq = list(perm)
+                    score = move_cost(current, seq[0])
+                    for a, b in zip(seq, seq[1:]):
+                        score += move_cost(a, b)
+
+                    if remaining_after:
+                        exits = sorted(
+                            remaining_after,
+                            key=lambda j: (
+                                durations[seq[-1]][j],
+                                distances[seq[-1]][j],
+                            )
+                        )[:4]
+                        exit_cost = min(
+                            move_cost(seq[-1], j) for j in exits
+                        )
+                        score += exit_cost * 0.28
+                    else:
+                        score += move_cost(seq[-1], 0) * 0.75
+
+                    # Small reward for genuinely completing a compact pocket.
+                    compact_count = sum(
+                        1 for j in seq[1:]
+                        if miles(distances[seq[0]][j]) <= 1.25
+                    )
+                    score -= min(compact_count, 3) * 0.55
+
+                    local_options.append((score, seq))
+
+                local_options.sort(key=lambda x: x[0])
+
+                # Keep several orders, not just the locally cheapest one.
+                for local_score, seq in local_options[:8]:
+                    new_remaining = tuple(
+                        j for j in remaining if j not in seq
+                    )
+                    expanded.append(
+                        (
+                            base_score + local_score,
+                            route + tuple(seq),
+                            new_remaining,
+                        )
+                    )
+
+        if finished_states:
+            # Once all jobs are covered, retain them; otherwise continue
+            # expanding partial routes.
+            states = finished_states
+            break
+
+        if not expanded:
+            break
+
+        # Deduplicate exact route prefixes, then retain a wide beam.
+        best_by_route = {}
+        for state in expanded:
+            key = state[1]
+            old = best_by_route.get(key)
+            if old is None or state[0] < old[0]:
+                best_by_route[key] = state
+
+        states = sorted(
+            best_by_route.values(),
+            key=lambda x: x[0],
+        )[:beam_width]
+
+    completed = []
+    for base_score, route, remaining in states:
+        if remaining:
+            # Safety completion. This should be rare because the block search
+            # normally consumes all jobs.
+            r = list(route)
+            rem = set(remaining)
+            while rem:
+                current = r[-1]
+                nxt = min(
+                    rem,
+                    key=lambda j: (
+                        durations[current][j],
+                        distances[current][j],
+                    )
+                )
+                r.append(nxt)
+                rem.remove(nxt)
+            route = tuple(r)
+
+        route_list = list(route) + [0]
+        metrics = route_metrics(
+            route_list,
+            distances,
+            durations,
+            FUEL_PRICE,
+            MPG,
+        )
+        score = route_score(
+            route_list,
+            distances,
+            durations,
+            FUEL_PRICE,
+            MPG,
+            locations,
+        )
+        completed.append(
+            (score, metrics["time_s"], metrics["distance_m"], route_list)
+        )
+
+    completed.sort(key=lambda x: (x[1], x[2], x[0]))
+    return completed[:60]
+
+
 def optimise_route(
     distances,
     durations,
@@ -2485,6 +2689,50 @@ def optimise_route(
         return [0, 0]
 
     candidate_pool = []
+
+    # --------------------------------------------------------
+    # V25.17 PRIMARY: dynamic road-pocket block search
+    # --------------------------------------------------------
+    # This is the main new route constructor. It tests completing nearby
+    # work as a block before moving to the next pocket.
+    dynamic_pocket_results = build_dynamic_pocket_block_routes(
+        distances,
+        durations,
+        locations,
+        beam_width=220,
+    )
+
+    for _, _, _, candidate in dynamic_pocket_results[:40]:
+        improved = improve_driver_sweep_route(
+            candidate,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+            locations,
+        )
+        metrics = route_metrics(
+            improved,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+        )
+        candidate_pool.append(
+            (
+                route_score(
+                    improved,
+                    distances,
+                    durations,
+                    fuel_price,
+                    mpg,
+                    locations,
+                ),
+                metrics["time_s"],
+                metrics["distance_m"],
+                improved,
+            )
+        )
 
     # --------------------------------------------------------
     # OPENING DEPOT POCKET: explicit live-road alternatives
@@ -2783,15 +3031,26 @@ def optimise_route(
         if x[1] <= fastest[1] + time_window
     ]
 
-    # A route that is only a little slower can win if it removes a clear local
-    # pocket break.  We still keep real road time and distance in the ordering.
+    # Within the small real-time window, use locality as a tie-breaker rather
+    # than allowing a pretty-looking route to become materially slower. A
+    # locality break is expensive for the driver because it usually means
+    # visiting the same road/area twice, so it is worth a modest time premium.
+    def final_driver_cost(item):
+        locality = calculate_driver_locality_penalty(item[3], distances)
+        # Treat each locality-penalty point as roughly 45 seconds of practical
+        # road cost. Distance remains a secondary real-world cost.
+        return (
+            item[1]
+            + locality * 45.0
+            + item[2] / 1609.344 * 0.35
+        )
+
     best = min(
         acceptable,
         key=lambda x: (
-            calculate_driver_locality_penalty(x[3], distances),
+            final_driver_cost(x),
             x[1],
             x[2],
-            x[0],
         ),
     )
 
@@ -3290,8 +3549,43 @@ if st.button(
         "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
     }
 
-    # Do not rerun here.  Keeping this run alive guarantees the Daily Route
+    # Do not rerun here. Keeping this run alive guarantees the Daily Route
     # Summary is rendered immediately after planning, even on Streamlit Cloud.
+
+    # V25.17: render the fresh report in the same execution immediately after
+    # the route is calculated. This avoids depending on a later rerun or on
+    # state being reconstructed before the report is shown.
+    st.markdown("---")
+    st.subheader("💰 Daily Route Summary")
+    st.caption(
+        "Live road route calculated • report generated "
+        + datetime.now().strftime("%d/%m/%Y %H:%M")
+    )
+    r1, r2 = st.columns(2)
+    with r1:
+        st.metric("Take-Home", f"£{take_home:.2f}")
+    with r2:
+        st.metric("Revenue", f"£{revenue:.2f}")
+    r3, r4 = st.columns(2)
+    with r3:
+        st.metric("Driving Distance", f"{metrics['miles']:.1f} miles")
+    with r4:
+        st.metric("Driving Time", format_duration(metrics["time_s"]))
+    r5, r6 = st.columns(2)
+    with r5:
+        st.metric("Fuel Cost", f"£{fuel_cost:.2f}")
+    with r6:
+        st.metric("Fuel Used", f"{metrics['litres']:.1f} litres")
+    r7, r8 = st.columns(2)
+    with r7:
+        st.metric("Jobs", len(valid_rows))
+    with r8:
+        st.metric(
+            "Completed",
+            int(df["Status"].astype(str).str.lower().eq("completed").sum()),
+        )
+    if using_offline:
+        st.warning("Live road routing was unavailable; these figures use the offline estimate.")
 
 
 # ============================================================
