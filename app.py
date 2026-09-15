@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.22"
+APP_VERSION = "25.23"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1945,6 +1945,326 @@ def improve_driver_sweep_route(route, distances, durations, fuel_price, mpg, loc
     return best
 
 
+def _optimise_route_v25_3_core(
+    distances,
+    durations,
+    fuel_price,
+    mpg,
+    locations=None,
+):
+    """General-purpose driver-style route optimiser.
+
+    V23 makes the geographical sweep the primary structure.  It is not tuned
+    to the current 30-address example: all territories are generated from the
+    actual customer coordinates for whatever jobs are supplied.
+    """
+    customer_count = len(distances) - 1
+    if customer_count <= 0:
+        return [0, 0]
+
+    structured_results = []
+    if locations is not None:
+        structured_candidates = build_driver_sweep_routes(
+            locations, distances, durations
+        )
+
+        # Keep the older geographic candidates as additional general-purpose
+        # options, but they are evaluated alongside the new sweep rather than
+        # replacing it with a pure road-distance answer.
+        structured_candidates.extend(
+            directional_sector_routes(locations, distances, durations)
+        )
+        structured_candidates.extend(
+            geographic_zone_routes(locations)
+        )
+
+        seen = set()
+        for candidate in structured_candidates:
+            key = tuple(candidate)
+            if key in seen or len(candidate) != customer_count + 2:
+                continue
+            seen.add(key)
+
+            improved = improve_driver_sweep_route(
+                candidate,
+                distances,
+                durations,
+                fuel_price,
+                mpg,
+                locations,
+            )
+            metrics = route_metrics(
+                improved, distances, durations, fuel_price, mpg
+            )
+            score = route_score(
+                improved, distances, durations, fuel_price, mpg, locations
+            )
+            structured_results.append(
+                (score, metrics["time_s"], metrics["distance_m"], improved)
+            )
+
+    structured_results.sort(key=lambda x: x[0])
+
+    # Road-efficient benchmark.  This is retained so the app can reject a
+    # genuinely absurd sweep caused by an unusual road network.
+    fallback_candidates = []
+    starts = list(range(1, customer_count + 1))
+    starts.sort(key=lambda x: durations[0][x])
+
+    if customer_count > 40:
+        selected = starts[:12] + starts[-12:] + starts[::max(1, customer_count // 12)]
+        starts = list(dict.fromkeys(selected))
+
+    for first_customer in starts:
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "time")
+        )
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "balanced")
+        )
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "distance")
+        )
+
+    insertion = cheapest_insertion_route(distances, durations)
+    if insertion:
+        fallback_candidates.append(insertion)
+        if len(insertion) > 3:
+            fallback_candidates.append([0] + insertion[1:-1][::-1] + [0])
+
+    unique_fallbacks = []
+    seen = set()
+    for candidate in fallback_candidates:
+        key = tuple(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique_fallbacks.append(candidate)
+
+    fallback_results = []
+    for candidate in unique_fallbacks[:80]:
+        improved = improve_route(
+            candidate,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+            locations,
+            preserve_structure=False,
+        )
+        metrics = route_metrics(
+            improved, distances, durations, fuel_price, mpg
+        )
+        score = route_score(
+            improved, distances, durations, fuel_price, mpg, locations
+        )
+        fallback_results.append(
+            (score, metrics["time_s"], metrics["distance_m"], improved)
+        )
+
+    fallback_results.sort(key=lambda x: x[0])
+
+    if not structured_results:
+        return fallback_results[0][3] if fallback_results else None
+    if not fallback_results:
+        return structured_results[0][3]
+
+    best_structured = structured_results[0]
+    best_fallback = fallback_results[0]
+
+    structured_time = best_structured[1]
+    structured_distance = best_structured[2]
+    fallback_time = best_fallback[1]
+    fallback_distance = best_fallback[2]
+
+    time_ratio = structured_time / max(fallback_time, 1.0)
+    distance_ratio = structured_distance / max(fallback_distance, 1.0)
+
+    # V25 gives the geographical sweep a little more authority.  A clean
+    # driver-style territory route is allowed to cost a modest amount more
+    # than the pure road-time benchmark because repeatedly returning to an
+    # area that has already been cleared is expensive in real working time.
+    if time_ratio <= 1.20 and distance_ratio <= 1.20:
+        return best_structured[3]
+
+    combined_ratio = time_ratio * 0.60 + distance_ratio * 0.40
+    if combined_ratio <= 1.16:
+        return best_structured[3]
+
+    return best_fallback[3]
+
+
+
+def _local_pocket_break_cost(route, distances):
+    """Measure nearby customers that are unnecessarily separated in the route.
+
+    This is deliberately road-matrix based.  It does not use postcode order or
+    hard-coded towns/areas.  A nearby pair is considered a pocket when the
+    actual road distance between the two customers is small.
+    """
+    if not route or len(route) < 4:
+        return 0.0
+
+    positions = {}
+    for pos, node in enumerate(route):
+        if node != 0:
+            positions[node] = pos
+
+    customers = list(positions)
+    cost = 0.0
+
+    for i in range(len(customers)):
+        a = customers[i]
+        for j in range(i + 1, len(customers)):
+            b = customers[j]
+            road_m = min(distances[a][b], distances[b][a])
+            gap = abs(positions[a] - positions[b])
+
+            if gap <= 1:
+                continue
+
+            # Very close jobs should normally be consecutive.  A slightly
+            # wider pocket can tolerate one intervening stop, but not a long
+            # excursion away and back.
+            if road_m <= 900.0:
+                cost += (gap - 1) * 6.0
+            elif road_m <= 1600.0 and gap > 2:
+                cost += (gap - 2) * 3.5
+            elif road_m <= 2500.0 and gap > 4:
+                cost += (gap - 4) * 1.5
+
+    return cost
+
+
+def _repair_local_pockets(route, distances, durations, fuel_price, mpg):
+    """Conservative local-pocket repair on top of the proven v25.3 optimiser.
+
+    The core v25.3 optimiser remains responsible for finding the overall road
+    efficient route.  This pass only accepts a change when it materially
+    improves local continuity AND does not create a meaningful driving-cost
+    regression.  Therefore a geographically tidy route cannot win simply by
+    adding lots of extra miles.
+    """
+    if not route or len(route) < 5:
+        return route
+
+    best = route[:]
+    base = route_metrics(best, distances, durations, fuel_price, mpg)
+    best_time = base["time_s"]
+    best_distance = base["distance_m"]
+    best_pocket = _local_pocket_break_cost(best, distances)
+
+    # Also retain the existing v25.3 continuity measure as a secondary guard.
+    best_continuity = calculate_continuity_penalty(best, distances)
+
+    # Very small tolerance only.  The objective is to tidy an obvious local
+    # pocket without sacrificing the strong road-time result we already have.
+    max_time = best_time * 1.006 + 60.0
+    max_distance = best_distance * 1.006 + 1200.0
+
+    for _ in range(3):
+        improved = False
+        positions = {node: pos for pos, node in enumerate(best) if node != 0}
+        customers = list(positions)
+
+        moves = []
+        for ai in range(len(customers)):
+            a = customers[ai]
+            for bi in range(len(customers)):
+                b = customers[bi]
+                if a == b:
+                    continue
+
+                gap = abs(positions[a] - positions[b])
+                if gap <= 1:
+                    continue
+
+                road_m = min(distances[a][b], distances[b][a])
+                if road_m > 2500.0:
+                    continue
+
+                # Only try to pull b directly after a when b is genuinely
+                # nearby.  The closer the pair, the stronger the repair.
+                if road_m <= 900.0:
+                    strength = 3
+                elif road_m <= 1600.0 and gap > 2:
+                    strength = 2
+                elif road_m <= 2500.0 and gap > 4:
+                    strength = 1
+                else:
+                    continue
+
+                moves.append((-strength, road_m, gap, a, b))
+
+        moves.sort()
+
+        accepted = None
+        accepted_key = None
+
+        for _, _, _, a, b in moves:
+            source_pos = best.index(b)
+            candidate = best[:]
+            candidate.pop(source_pos)
+
+            target_pos = candidate.index(a)
+            candidate.insert(target_pos + 1, b)
+
+            metrics = route_metrics(
+                candidate, distances, durations, fuel_price, mpg
+            )
+            new_time = metrics["time_s"]
+            new_distance = metrics["distance_m"]
+
+            if new_time > max_time or new_distance > max_distance:
+                continue
+
+            pocket = _local_pocket_break_cost(candidate, distances)
+            continuity = calculate_continuity_penalty(candidate, distances)
+
+            # A move must actually improve local continuity.  If it also
+            # improves the route itself, accept it immediately.  Otherwise
+            # allow only a tiny road-cost trade-off for a clear pocket repair.
+            pocket_gain = best_pocket - pocket
+            continuity_gain = best_continuity - continuity
+
+            if pocket_gain <= 0.0 and continuity_gain <= 0.0:
+                continue
+
+            time_extra = max(0.0, new_time - best_time)
+            distance_extra = max(0.0, new_distance - best_distance)
+
+            key = (
+                -pocket_gain,
+                -continuity_gain,
+                time_extra,
+                distance_extra,
+            )
+
+            if accepted is None or key < accepted_key:
+                accepted = candidate
+                accepted_key = key
+
+        if accepted is None:
+            break
+
+        best = accepted
+        metrics = route_metrics(best, distances, durations, fuel_price, mpg)
+        best_time = metrics["time_s"]
+        best_distance = metrics["distance_m"]
+        best_pocket = _local_pocket_break_cost(best, distances)
+        best_continuity = calculate_continuity_penalty(best, distances)
+        improved = True
+
+        # Keep the original v25.3 result as the hard reference so repeated
+        # pocket repairs cannot gradually drift into a longer route.
+        max_time = base["time_s"] * 1.006 + 60.0
+        max_distance = base["distance_m"] * 1.006 + 1200.0
+
+        if not improved:
+            break
+
+    return best
+
+
 def optimise_route(
     distances,
     durations,
@@ -1952,100 +2272,34 @@ def optimise_route(
     mpg,
     locations=None,
 ):
-    """Build the route from the driver's actual last completed location.
+    """v25.23: proven v25.3 route + conservative local-pocket repair.
 
-    The previous optimiser generated and then rearranged many complete routes.
-    That meant a later whole-route improvement could move a nearby customer
-    away from the point where the driver had actually just finished.
-
-    This version deliberately uses a much simpler rule:
-
-        current customer -> closest remaining customer -> repeat
-
-    The live road matrix is the authority, so postcode order and fixed
-    geographic zones are not used.  When two remaining customers are very
-    close in driving time, the small tie-break looks at which one leaves the
-    driver closer to another remaining customer.  It never overrides a
-    materially closer next customer just to make a geographic group look
-    tidy.
-
-    The depot is used only for the start and final return.
+    The expensive, proven v25.3 route generation stays intact.  We only make
+    a final road-matrix-based repair when it keeps driving cost essentially
+    flat while removing an obvious nearby-job split.
     """
-    customer_count = len(distances) - 1
-    if customer_count <= 0:
-        return [0, 0]
+    route = _optimise_route_v25_3_core(
+        distances,
+        durations,
+        fuel_price,
+        mpg,
+        locations,
+    )
 
-    remaining = set(range(1, customer_count + 1))
-    route = [0]
-    current = 0
+    if not route:
+        return route
 
-    while remaining:
-        # ------------------------------------------------------------
-        # Primary rule: the closest remaining customer from the actual
-        # last completed location, using live road driving time first.
-        # ------------------------------------------------------------
-        ranked = sorted(
-            remaining,
-            key=lambda j: (
-                float(durations[current][j]),
-                float(distances[current][j]),
-            ),
-        )
+    return _repair_local_pockets(
+        route,
+        distances,
+        durations,
+        fuel_price,
+        mpg,
+    )
 
-        nearest = ranked[0]
-
-        # ------------------------------------------------------------
-        # Very small tie-break only.  If another customer is effectively
-        # the same driving distance away, prefer the one that leaves a
-        # nearby unfinished customer.  This helps finish compact pockets
-        # without overriding the driver's next-nearest rule.
-        # ------------------------------------------------------------
-        candidate = nearest
-        nearest_time = float(durations[current][nearest])
-
-        if len(ranked) > 1:
-            close_limit = max(nearest_time * 1.12, nearest_time + 45.0)
-            close_choices = [
-                j for j in ranked[:6]
-                if float(durations[current][j]) <= close_limit
-            ]
-
-            if len(close_choices) > 1:
-                def continuation_key(j):
-                    future = [k for k in remaining if k != j]
-                    if not future:
-                        return (0.0, 0.0)
-
-                    best_future = min(
-                        future,
-                        key=lambda k: (
-                            float(durations[j][k]),
-                            float(distances[j][k]),
-                        ),
-                    )
-                    return (
-                        float(durations[j][best_future]),
-                        float(distances[j][best_future]),
-                    )
-
-                # Only use continuation as a tie-break between genuinely
-                # close next customers.
-                candidate = min(
-                    close_choices,
-                    key=lambda j: (
-                        float(durations[current][j]),
-                        continuation_key(j),
-                        float(distances[current][j]),
-                    ),
-                )
-
-        route.append(candidate)
-        remaining.remove(candidate)
-        current = candidate
-
-    route.append(0)
-    return route
-
+# ============================================================
+# DESTINATION / WHATSAPP
+# ============================================================
 
 def get_destination(row):
     address = clean_val(row.get("address_text"))
@@ -3089,3 +3343,57 @@ if not export_df.empty:
         color="FFFFFF",
         bold=True,
     )
+
+    summary_ws["A1"].fill = header_fill
+    summary_ws["A1"].font = header_font
+
+    summary_ws.column_dimensions["A"].width = 28
+    summary_ws.column_dimensions["B"].width = 45
+
+    records_ws = workbook.create_sheet("Customer Records")
+
+    for row in dataframe_to_rows(
+        export_df,
+        index=False,
+        header=True,
+    ):
+        records_ws.append(row)
+
+    for cell in records_ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(
+            horizontal="center"
+        )
+
+    for column_cells in records_ws.columns:
+        max_length = 0
+        letter = column_cells[0].column_letter
+
+        for cell in column_cells:
+            try:
+                max_length = max(
+                    max_length,
+                    len(str(cell.value)),
+                )
+            except Exception:
+                pass
+
+        records_ws.column_dimensions[letter].width = min(
+            max_length + 2,
+            50,
+        )
+
+    workbook.save(output)
+
+    st.sidebar.download_button(
+        "⬇️ Download Excel Report",
+        output.getvalue(),
+        f"DanCleanUK_{service_date_str}.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+st.sidebar.caption(
+    f"DanCleanUK Route Optimizer v{APP_VERSION}"
+)
