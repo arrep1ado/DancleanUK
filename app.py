@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.15"
+APP_VERSION = "25.16"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2313,6 +2313,150 @@ def build_depot_pocket_routes(distances, durations, locations=None):
             unique.append(route)
     return unique
 
+
+def calculate_driver_locality_penalty(route, distances):
+    """Measure obvious cases where the driver leaves nearby work behind.
+
+    This is a diagnostic/selection metric rather than a hard routing rule.
+    It uses live road distance from the actual stop, so it generalises to
+    future route files without postcode-specific assumptions.
+    """
+    if len(route) < 5:
+        return 0.0
+
+    penalty = 0.0
+    customer_positions = {}
+    for pos, job in enumerate(route[1:-1], start=1):
+        customer_positions[job] = pos
+
+    for pos in range(1, len(route) - 1):
+        current = route[pos]
+        future = route[pos + 1:-1]
+        if not future:
+            continue
+
+        nearby = [
+            (job, distances[current][job] / 1609.344)
+            for job in future
+            if distances[current][job] / 1609.344 <= 1.75
+        ]
+        if not nearby:
+            continue
+
+        next_job = route[pos + 1]
+        next_miles = distances[current][next_job] / 1609.344
+        if next_job in [job for job, _ in nearby]:
+            continue
+
+        nearest = min(d for _, d in nearby)
+        if next_miles > max(2.0, nearest * 1.8):
+            penalty += min(8.0, next_miles - nearest)
+
+        for job, d in nearby[:5]:
+            gap = customer_positions.get(job, pos) - pos
+            if gap >= 3:
+                penalty += min(3.0, 0.75 + 0.35 * gap) * max(0.5, 1.5 - min(d, 1.5) / 1.5)
+
+    return penalty
+
+
+def repair_local_pockets(route, distances, durations, max_passes=2):
+    """Make conservative one-job moves that complete an actual local pocket.
+
+    Unlike the old aggressive locality repair, this routine will NOT accept a
+    move merely because it looks geographically nicer.  A move must keep the
+    real road journey essentially as good as before.  That protects the user's
+    main objective: less time and distance on the road.
+    """
+    if not route or len(route) < 6:
+        return route[:]
+
+    def route_time(r):
+        return sum(durations[r[i]][r[i + 1]] for i in range(len(r) - 1))
+
+    def route_distance(r):
+        return sum(distances[r[i]][r[i + 1]] for i in range(len(r) - 1))
+
+    best = route[:]
+    best_time = route_time(best)
+    best_distance = route_distance(best)
+    best_locality = calculate_driver_locality_penalty(best, distances)
+
+    for _ in range(max_passes):
+        improved = False
+        positions = list(range(1, len(best) - 1))
+
+        # Work from jobs that are obviously separated from a nearby pocket.
+        targets = []
+        for pos in positions:
+            job = best[pos]
+            for other_pos in positions:
+                if other_pos == pos:
+                    continue
+                other = best[other_pos]
+                if abs(pos - other_pos) < 3:
+                    continue
+                road_miles = distances[job][other] / 1609.344
+                if road_miles <= 1.75:
+                    targets.append((road_miles, pos, other_pos))
+                    break
+
+        targets.sort()
+
+        for _, pos, other_pos in targets[:18]:
+            job = best[pos]
+
+            # Try putting the left-behind job immediately after each nearby
+            # job.  Also try immediately before it; road direction matters.
+            insert_after_positions = [other_pos, other_pos - 1]
+            for anchor in insert_after_positions:
+                if anchor < 1 or anchor >= len(best) - 1:
+                    continue
+
+                candidate = best[:]
+                moved = candidate.pop(pos)
+                if pos <= anchor:
+                    anchor -= 1
+                insert_at = anchor + 1
+                candidate.insert(insert_at, moved)
+
+                new_time = route_time(candidate)
+                new_distance = route_distance(candidate)
+                new_locality = calculate_driver_locality_penalty(candidate, distances)
+
+                # Hard protection around real road cost.  Locality may improve
+                # only when the move is effectively cost-neutral or cheaper.
+                time_limit = best_time + 75.0
+                distance_limit = best_distance + 1200.0
+
+                if (
+                    new_time <= time_limit
+                    and new_distance <= distance_limit
+                    and new_locality < best_locality - 0.50
+                ):
+                    # Prefer genuine road savings when available, otherwise
+                    # accept only a small time/distance trade for a major
+                    # reduction in backtracking.
+                    if (
+                        new_time < best_time - 10.0
+                        or new_distance < best_distance - 500.0
+                        or new_locality < best_locality * 0.70
+                    ):
+                        best = candidate
+                        best_time = new_time
+                        best_distance = new_distance
+                        best_locality = new_locality
+                        improved = True
+                        break
+            if improved:
+                break
+
+        if not improved:
+            break
+
+    return best
+
+
 def optimise_route(
     distances,
     durations,
@@ -2583,40 +2727,71 @@ def optimise_route(
         return None
 
     # --------------------------------------------------------
-    # FINAL: do not blindly choose the heuristic score.
-    #
-    # First minimise real driving time, then real distance, while allowing
-    # locality to break a near-tie.  This is what "time on the road is money"
-    # means in the optimiser.
+    # CONSERVATIVE LOCAL-POCKET REPAIR
     # --------------------------------------------------------
-    candidate_pool.sort(
+    # Apply the pocket repair to a broad set of the best road-time candidates.
+    # It is deliberately conservative: it cannot turn a good road route into
+    # a much longer one simply to make postcode groups look tidy.
+    repaired_pool = []
+    for _, _, _, candidate in sorted(
+        candidate_pool,
+        key=lambda x: (x[1], x[2]),
+    )[:80]:
+        repaired = repair_local_pockets(
+            candidate,
+            distances,
+            durations,
+            max_passes=3,
+        )
+        metrics = route_metrics(
+            repaired,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+        )
+        repaired_pool.append(
+            (
+                route_score(
+                    repaired,
+                    distances,
+                    durations,
+                    fuel_price,
+                    mpg,
+                    locations,
+                ),
+                metrics["time_s"],
+                metrics["distance_m"],
+                repaired,
+            )
+        )
+
+    candidate_pool.extend(repaired_pool)
+
+    # --------------------------------------------------------
+    # FINAL SELECTION
+    # --------------------------------------------------------
+    # Road time is the first objective.  Then, only among routes within a
+    # small real-time window of the fastest route, use locality to choose the
+    # route a human driver is less likely to backtrack on.
+    candidate_pool.sort(key=lambda x: (x[1], x[2]))
+
+    fastest = candidate_pool[0]
+    time_window = max(120.0, fastest[1] * 0.015)  # at most about 1.5%
+    acceptable = [
+        x for x in candidate_pool
+        if x[1] <= fastest[1] + time_window
+    ]
+
+    # A route that is only a little slower can win if it removes a clear local
+    # pocket break.  We still keep real road time and distance in the ordering.
+    best = min(
+        acceptable,
         key=lambda x: (
+            calculate_driver_locality_penalty(x[3], distances),
             x[1],
             x[2],
             x[0],
-        )
-    )
-
-    # Keep a broad shortlist, then use the existing combined score to decide
-    # between genuinely close road-time solutions.  A route must be close in
-    # real driving time before locality can make it win.
-    shortlist = candidate_pool[:30]
-
-    best = min(
-        shortlist,
-        key=lambda x: (
-            x[1] / 60.0 * TIME_PRIORITY
-            + x[2] / 1609.344 * DISTANCE_PRIORITY
-            + (
-                calculate_continuity_penalty(
-                    x[3],
-                    distances,
-                )
-                * CLUSTER_PRIORITY
-                * 7.0
-            ),
-            x[1],
-            x[2],
         ),
     )
 
@@ -3115,7 +3290,8 @@ if st.button(
         "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
     }
 
-    st.rerun()
+    # Do not rerun here.  Keeping this run alive guarantees the Daily Route
+    # Summary is rendered immediately after planning, even on Streamlit Cloud.
 
 
 # ============================================================
