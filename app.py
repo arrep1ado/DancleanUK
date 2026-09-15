@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.3"
+APP_VERSION = "25.21"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1945,189 +1945,179 @@ def improve_driver_sweep_route(route, distances, durations, fuel_price, mpg, loc
     return best
 
 
-def build_driver_current_location_routes(distances, durations, locations=None):
-    """Build routes the way a driver actually works: from the last job.
+def build_nearest_pocket_route(
+    distances,
+    durations,
+    start_customer,
+):
+    """Build a true driver-style route from the last completed customer.
 
-    The router does not use postcode order or a fixed area sequence.  At each
-    stop it looks at the real road time from the current address, keeps nearby
-    unfinished work in consideration, and uses a small look-ahead so that a
-    close job is not casually left behind and revisited later.
+    The primary rule is simple: after every completed job, look from that
+    exact location and take the closest sensible remaining customer using the
+    live road matrix.
 
-    This is deliberately a bounded beam rather than a huge global search.  It
-    gives the route constructor enough freedom to correct obvious backtracking
-    without stacking several expensive optimisers on top of each other.
+    The important addition is an escape gate.  If there is still a genuinely
+    nearby job, the route is not allowed to jump to a distant pocket just
+    because that distant job has a slightly attractive next step.  This is
+    what prevents Grantham -> Lincoln -> Grantham -> Lincoln style bouncing.
+
+    This is deliberately construction logic, not a post-route penalty.  The
+    route is therefore built in the order a driver would actually make the
+    decisions on the road.
     """
     customer_count = len(distances) - 1
     if customer_count <= 0:
-        return [[0, 0]]
+        return [0, 0]
 
-    BEAM_WIDTH = 90
-    FIRST_CHOICES = min(7, customer_count)
-    NEIGHBOUR_LIMIT = 14
-    LOCAL_MILES = 2.25
-    VERY_LOCAL_MILES = 1.25
+    route = [0, start_customer]
+    remaining = set(range(1, customer_count + 1))
+    remaining.discard(start_customer)
+    current = start_customer
 
-    def miles(m):
-        return m / 1609.344
+    # Road-distance thresholds.  They are intentionally broad enough to work
+    # in towns as well as villages, while still stopping obvious area jumps.
+    HARD_LOCAL_MILES = 2.00
+    EXPANDED_LOCAL_MILES = 3.50
+    ESCAPE_RATIO = 1.80
+    ESCAPE_EXTRA_MILES = 1.00
 
-    def transition_cost(route, candidate, remaining):
-        current = route[-1]
-        direct_t = float(durations[current][candidate])
-        direct_d = float(distances[current][candidate])
-        direct_m = miles(direct_d)
-
-        # Small look-ahead: after choosing this job, what is the nearest
-        # sensible remaining job?  This stops a locally attractive choice from
-        # creating an unnecessary long hop immediately afterwards.
-        if remaining:
-            next_t = min(float(durations[candidate][j]) for j in remaining)
-            next_d = min(float(distances[candidate][j]) for j in remaining)
-        else:
-            next_t = float(durations[candidate][0])
-            next_d = float(distances[candidate][0])
-
-        cost = direct_t + 0.32 * next_t + 0.00012 * direct_d + 0.000035 * next_d
-
-        if remaining:
-            nearest_m = min(miles(distances[current][j]) for j in remaining)
-
-            # If there is genuinely close work still sitting beside us, make
-            # leaving it behind expensive.  This is the core fix for cases
-            # such as three Barrowby jobs followed by a distant job and then
-            # another Barrowby return.
-            if nearest_m <= VERY_LOCAL_MILES and direct_m > max(2.0, nearest_m * 2.2):
-                cost += 360.0
-            elif nearest_m <= LOCAL_MILES and direct_m > max(3.0, nearest_m * 2.4):
-                cost += 150.0
-
-            # Reward staying inside the current pocket, but only modestly.
-            # Actual road time remains dominant.
-            nearby_left = sum(
-                1 for j in remaining
-                if miles(distances[current][j]) <= LOCAL_MILES
-            )
-            if nearby_left and direct_m <= LOCAL_MILES:
-                cost -= min(nearby_left, 5) * 24.0
-
-        # When the route is nearly finished, the return to the depot matters.
-        if len(remaining) <= 5:
-            cost += 0.22 * float(durations[candidate][0])
-            cost += 0.00005 * float(distances[candidate][0])
-
-        return cost
-
-    # A state is (route, remaining, partial_cost).  Remaining is a frozenset
-    # so states can be cheaply compared/deduplicated.
-    starts = sorted(
-        range(1, customer_count + 1),
-        key=lambda j: (durations[0][j], distances[0][j]),
-    )[:FIRST_CHOICES]
-
-    beam = []
-    all_customers = frozenset(range(1, customer_count + 1))
-
-    for first in starts:
-        remaining = all_customers - {first}
-        beam.append(
-            ([0, first], remaining, float(durations[0][first]))
+    while remaining:
+        # Always calculate the actual nearest remaining customer from the
+        # address just completed.  Road distance is the primary reference.
+        nearest = min(
+            remaining,
+            key=lambda j: (distances[current][j], durations[current][j], j),
         )
+        nearest_miles = distances[current][nearest] / 1609.344
 
-    for _ in range(customer_count - 1):
-        expanded = []
+        # Build the local pocket around the current address.
+        local = [
+            j for j in remaining
+            if distances[current][j] / 1609.344 <= HARD_LOCAL_MILES
+        ]
+        if not local:
+            local = [
+                j for j in remaining
+                if distances[current][j] / 1609.344 <= EXPANDED_LOCAL_MILES
+            ]
+        if not local:
+            local = [nearest]
 
-        for route, remaining, partial_cost in beam:
-            current = route[-1]
-            if not remaining:
-                expanded.append((route, remaining, partial_cost))
-                continue
-
-            ordered = sorted(
-                remaining,
-                key=lambda j: (
-                    durations[current][j],
-                    distances[current][j],
-                ),
+        # If nearby work exists, a distant jump must have a strong road-time
+        # reason.  This is the core protection against leaving one job behind.
+        if nearest_miles <= HARD_LOCAL_MILES:
+            allowed_miles = max(
+                nearest_miles * ESCAPE_RATIO,
+                nearest_miles + ESCAPE_EXTRA_MILES,
             )
+            gated = [
+                j for j in remaining
+                if distances[current][j] / 1609.344 <= allowed_miles
+            ]
+            if gated:
+                local = gated
+            else:
+                local = [nearest]
 
-            # Always inspect the closest road-time choices, plus every job in
-            # the current local pocket.  This is deliberately based on the
-            # current address, not on postcode labels.
-            candidates = ordered[:NEIGHBOUR_LIMIT]
-            for j in ordered:
-                if miles(distances[current][j]) <= LOCAL_MILES:
-                    candidates.append(j)
-                if len(candidates) >= NEIGHBOUR_LIMIT + 8:
-                    break
+        candidates = []
+        for candidate in local:
+            direct_t = durations[current][candidate]
+            direct_d = distances[current][candidate]
 
-            # Near the depot, explicitly retain all very close depot jobs so
-            # an obvious opening pocket cannot be lost by beam pruning.
-            if len(route) <= 2:
-                for j in ordered:
-                    if distances[0][j] <= 1200:
-                        candidates.append(j)
-
-            candidates = list(dict.fromkeys(candidates))
-
-            for candidate in candidates:
-                new_remaining = remaining - {candidate}
-                step = transition_cost(route, candidate, new_remaining)
-                expanded.append(
-                    (
-                        route + [candidate],
-                        new_remaining,
-                        partial_cost + step,
-                    )
+            future = remaining.difference({candidate})
+            if future:
+                next_job = min(
+                    future,
+                    key=lambda j: (
+                        durations[candidate][j],
+                        distances[candidate][j],
+                        j,
+                    ),
                 )
+                next_t = durations[candidate][next_job]
+                next_d = distances[candidate][next_job]
+            else:
+                next_t = durations[candidate][0]
+                next_d = distances[candidate][0]
 
-        # Keep the best states, but also retain diversity in the current
-        # location.  Otherwise several nearly identical states can crowd out
-        # a route that has sensibly moved into a different pocket.
-        expanded.sort(key=lambda x: x[2])
-        next_beam = []
-        per_current = {}
-        seen_routes = set()
+            # Count work that would remain close to the candidate.  This is a
+            # small tie-breaker: direct travel from the last completed job
+            # remains dominant.
+            nearby_after = sum(
+                1 for j in future
+                if distances[candidate][j] / 1609.344 <= HARD_LOCAL_MILES
+            )
 
-        for state in expanded:
-            route, remaining, cost = state
-            key = tuple(route)
-            if key in seen_routes:
-                continue
-            seen_routes.add(key)
+            # If choosing this customer would strand a very close job, make
+            # that choice expensive unless the road-time difference is real.
+            stranded_penalty = 0.0
+            close_remaining = [
+                j for j in future
+                if distances[candidate][j] / 1609.344 <= HARD_LOCAL_MILES
+            ]
+            if close_remaining:
+                closest_after = min(
+                    distances[candidate][j] / 1609.344
+                    for j in close_remaining
+                )
+                candidate_miles = direct_d / 1609.344
+                if candidate_miles > closest_after * 2.0 + 0.75:
+                    stranded_penalty = 300.0
 
-            current = route[-1]
-            count = per_current.get(current, 0)
-            if count >= 10:
-                continue
-            per_current[current] = count + 1
-            next_beam.append(state)
+            score = (
+                direct_t
+                + next_t * 0.16
+                + direct_d * 0.00010
+                + next_d * 0.000025
+                - nearby_after * 65.0
+                + stranded_penalty
+            )
+            candidates.append((score, direct_t, direct_d, candidate))
 
-            if len(next_beam) >= BEAM_WIDTH:
-                break
+        candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        chosen = candidates[0][3]
+        route.append(chosen)
+        remaining.remove(chosen)
+        current = chosen
 
-        beam = next_beam
+    route.append(0)
+    return route
 
-    results = []
-    for route, remaining, _ in beam:
-        if remaining:
+
+def route_locality_breaks(route, distances):
+    """Count obvious leave-an-area-and-return-later situations.
+
+    A break is recorded when, from a completed customer, another unvisited
+    customer is close by but the chosen next stop is substantially farther
+    away, and that nearby customer is eventually visited later.
+    """
+    if len(route) < 5:
+        return 0
+
+    remaining = set(route[1:-1])
+    breaks = 0
+
+    for pos in range(1, len(route) - 1):
+        current = route[pos]
+        nxt = route[pos + 1]
+        remaining.discard(current)
+        if not remaining:
             continue
-        results.append(route + [0])
 
-    # Add a few direct nearest-neighbour routes as safety candidates.
-    for first in starts[:3]:
-        results.append(
-            build_greedy_route(first, distances, durations, "time")
+        nearest = min(
+            remaining,
+            key=lambda j: distances[current][j],
         )
+        nearest_miles = distances[current][nearest] / 1609.344
+        next_miles = distances[current][nxt] / 1609.344
 
-    unique = []
-    seen = set()
-    for route in results:
-        key = tuple(route)
-        if key in seen or len(route) != customer_count + 2:
-            continue
-        seen.add(key)
-        unique.append(route)
+        if nearest_miles <= 2.0 and next_miles > max(
+            nearest_miles * 1.80,
+            nearest_miles + 1.0,
+        ):
+            breaks += 1
 
-    return unique
+    return breaks
 
 
 def optimise_route(
@@ -2137,25 +2127,29 @@ def optimise_route(
     mpg,
     locations=None,
 ):
-    """General-purpose driver-style route optimiser.
+    """v25.21: v25.3 benchmark + true last-location pocket routing.
 
-    V23 makes the geographical sweep the primary structure.  It is not tuned
-    to the current 30-address example: all territories are generated from the
-    actual customer coordinates for whatever jobs are supplied.
+    v25.3 remains the benchmark and all of its existing route builders are
+    retained.  The new driver route is built from the last completed address,
+    using live road distance as the primary next-customer rule.  A limited
+    lookahead only breaks ties and helps finish a compact pocket.
+
+    The final choice is made on real road time/distance first, with locality
+    used to reject routes that repeatedly leave nearby work behind.  This is
+    intentionally not a hard geographic ordering.
     """
     customer_count = len(distances) - 1
     if customer_count <= 0:
         return [0, 0]
 
+    # ------------------------------------------------------------
+    # 1. Build the proven v25.3 candidates.
+    # ------------------------------------------------------------
     structured_results = []
     if locations is not None:
         structured_candidates = build_driver_sweep_routes(
             locations, distances, durations
         )
-
-        # Keep the older geographic candidates as additional general-purpose
-        # options, but they are evaluated alongside the new sweep rather than
-        # replacing it with a pure road-distance answer.
         structured_candidates.extend(
             directional_sector_routes(locations, distances, durations)
         )
@@ -2190,8 +2184,9 @@ def optimise_route(
 
     structured_results.sort(key=lambda x: x[0])
 
-    # Road-efficient benchmark.  This is retained so the app can reject a
-    # genuinely absurd sweep caused by an unusual road network.
+    # ------------------------------------------------------------
+    # 2. v25.3 road-efficient benchmark candidates.
+    # ------------------------------------------------------------
     fallback_candidates = []
     starts = list(range(1, customer_count + 1))
     starts.sort(key=lambda x: durations[0][x])
@@ -2248,34 +2243,88 @@ def optimise_route(
 
     fallback_results.sort(key=lambda x: x[0])
 
-    if not structured_results:
-        return fallback_results[0][3] if fallback_results else None
-    if not fallback_results:
-        return structured_results[0][3]
+    # ------------------------------------------------------------
+    # 3. Build true current-location driver routes.
+    # ------------------------------------------------------------
+    # Testing every possible first stop is unnecessary and expensive.  The
+    # first customer is still chosen from the live depot driving times, with a
+    # small spread so the depot is not allowed to dictate the whole day.
+    driver_starts = starts[:min(8, len(starts))]
+    driver_results = []
 
-    best_structured = structured_results[0]
-    best_fallback = fallback_results[0]
+    for first_customer in driver_starts:
+        driver_route = build_nearest_pocket_route(
+            distances,
+            durations,
+            first_customer,
+        )
+        metrics = route_metrics(
+            driver_route, distances, durations, fuel_price, mpg
+        )
+        breaks = route_locality_breaks(driver_route, distances)
+        score = route_score(
+            driver_route, distances, durations, fuel_price, mpg, locations
+        )
+        driver_results.append(
+            (breaks, score, metrics["time_s"], metrics["distance_m"], driver_route)
+        )
 
-    structured_time = best_structured[1]
-    structured_distance = best_structured[2]
-    fallback_time = best_fallback[1]
-    fallback_distance = best_fallback[2]
+    driver_results.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
 
-    time_ratio = structured_time / max(fallback_time, 1.0)
-    distance_ratio = structured_distance / max(fallback_distance, 1.0)
+    if not structured_results and not fallback_results:
+        return driver_results[0][4] if driver_results else None
+    if not driver_results:
+        if structured_results and fallback_results:
+            best_structured = structured_results[0]
+            best_fallback = fallback_results[0]
+            time_ratio = best_structured[1] / max(best_fallback[1], 1.0)
+            distance_ratio = best_structured[2] / max(best_fallback[2], 1.0)
+            if time_ratio <= 1.20 and distance_ratio <= 1.20:
+                return best_structured[3]
+            if time_ratio * 0.60 + distance_ratio * 0.40 <= 1.16:
+                return best_structured[3]
+            return best_fallback[3]
+        return structured_results[0][3] if structured_results else fallback_results[0][3]
 
-    # V25 gives the geographical sweep a little more authority.  A clean
-    # driver-style territory route is allowed to cost a modest amount more
-    # than the pure road-time benchmark because repeatedly returning to an
-    # area that has already been cleared is expensive in real working time.
-    if time_ratio <= 1.20 and distance_ratio <= 1.20:
-        return best_structured[3]
+    # ------------------------------------------------------------
+    # 4. Compare by road efficiency first, then route shape.
+    # ------------------------------------------------------------
+    best_driver = driver_results[0]
+    driver_breaks, driver_score, driver_time, driver_distance, driver_route = best_driver
 
-    combined_ratio = time_ratio * 0.60 + distance_ratio * 0.40
-    if combined_ratio <= 1.16:
-        return best_structured[3]
+    benchmark_results = []
+    benchmark_results.extend(structured_results[:1])
+    benchmark_results.extend(fallback_results[:1])
 
-    return best_fallback[3]
+    benchmark_results = [x for x in benchmark_results if x]
+    if not benchmark_results:
+        return driver_route
+
+    # Find the best benchmark by actual road time/distance, not by a shape
+    # penalty alone.  This keeps v25.3's 110.8-mile / 3h33 benchmark meaningful.
+    benchmark = min(
+        benchmark_results,
+        key=lambda x: (x[1], x[2], x[0]),
+    )
+    benchmark_time = benchmark[1]
+    benchmark_distance = benchmark[2]
+
+    # Driver route is preferred when it materially reduces locality breaks and
+    # does not create a large real-road penalty.  A 6% ceiling is deliberate:
+    # time on the road is money, so route shape cannot justify a large detour.
+    benchmark_breaks = route_locality_breaks(benchmark[3], distances)
+    time_ratio = driver_time / max(benchmark_time, 1.0)
+    distance_ratio = driver_distance / max(benchmark_distance, 1.0)
+
+    if driver_breaks < benchmark_breaks and time_ratio <= 1.06 and distance_ratio <= 1.06:
+        return driver_route
+
+    # If locality is tied, only use the driver construction when it is at least
+    # as efficient on both real road measures.
+    if driver_breaks <= benchmark_breaks and time_ratio <= 1.00 and distance_ratio <= 1.00:
+        return driver_route
+
+    return benchmark[3]
 
 
 # ============================================================
@@ -2765,7 +2814,9 @@ if st.button(
         "persisted_only": False,
     }
 
-    # Do not rerun here: render the freshly calculated summary immediately.
+    # Render the Daily Route Summary immediately in this run.  Do not rerun
+    # after planning: the route data above is already in session state and the
+    # dashboard below can display it without risking the summary being hidden.
 
 
 # ============================================================
