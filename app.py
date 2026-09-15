@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.14"
+APP_VERSION = "25.15"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2203,6 +2203,116 @@ def build_optimal_driver_beam_routes(
     return completed[:40]
 
 
+
+def build_depot_pocket_routes(distances, durations, locations=None):
+    """
+    V25.15: explicitly search for routes that sensibly clear the opening
+    depot pocket before the driver commits to a distant area.
+
+    This is NOT a hard rule that all depot-near jobs must be first.  We build
+    several alternatives using the live road matrix and let the final route
+    comparison decide.  The important difference from v25.14 is that the
+    optimiser now has complete-pocket candidates available, rather than
+    relying on the general beam to discover them by chance.
+    """
+    customer_count = len(distances) - 1
+    if customer_count <= 0:
+        return []
+
+    def miles(m):
+        return m / 1609.344
+
+    customers = list(range(1, customer_count + 1))
+    depot_ranked = sorted(
+        customers,
+        key=lambda j: (durations[0][j], distances[0][j]),
+    )
+
+    starts = depot_ranked[:min(8, customer_count)]
+    results = []
+
+    # Try several pocket radii.  The radius is road distance, not postcode or
+    # straight-line distance, so the method remains useful on other days.
+    for pocket_radius in (0.70, 0.95, 1.25):
+        for start in starts:
+            route = [0, start]
+            remaining = set(customers)
+            remaining.discard(start)
+            current = start
+
+            # Opening pocket: repeatedly choose a nearby unfinished job while
+            # one exists.  We still use time/distance and a small look-ahead,
+            # so this is not simply "sort all depot jobs first".
+            while remaining:
+                nearby = [
+                    j for j in remaining
+                    if miles(distances[current][j]) <= pocket_radius
+                ]
+
+                depot_near = [
+                    j for j in remaining
+                    if miles(distances[0][j]) <= pocket_radius
+                ]
+
+                pool = nearby or depot_near
+                if not pool:
+                    break
+
+                def move_key(j):
+                    direct_t = durations[current][j] / 60.0
+                    direct_d = miles(distances[current][j])
+                    future = [x for x in remaining if x != j]
+                    if future:
+                        next_t = min(
+                            durations[j][x] / 60.0 for x in future
+                        )
+                    else:
+                        next_t = durations[j][0] / 60.0
+                    # Prefer road-efficient moves, but reward leaving the van
+                    # in a useful position for another nearby job.
+                    local_left = sum(
+                        1 for x in future
+                        if miles(distances[j][x]) <= pocket_radius
+                    )
+                    return (
+                        direct_t * 1.00
+                        + direct_d * 0.18
+                        + next_t * 0.20
+                        - min(local_left, 4) * 0.80
+                    )
+
+                nxt = min(pool, key=move_key)
+                route.append(nxt)
+                remaining.remove(nxt)
+                current = nxt
+
+            # Finish the rest with a current-location nearest-neighbour chain.
+            while remaining:
+                nxt = min(
+                    remaining,
+                    key=lambda j: (
+                        durations[current][j],
+                        distances[current][j],
+                    ),
+                )
+                route.append(nxt)
+                remaining.remove(nxt)
+                current = nxt
+
+            route.append(0)
+            if len(route) == customer_count + 2:
+                results.append(route)
+
+    # Deduplicate while preserving alternatives.
+    unique = []
+    seen = set()
+    for route in results:
+        key = tuple(route)
+        if key not in seen:
+            seen.add(key)
+            unique.append(route)
+    return unique
+
 def optimise_route(
     distances,
     durations,
@@ -2231,6 +2341,43 @@ def optimise_route(
         return [0, 0]
 
     candidate_pool = []
+
+    # --------------------------------------------------------
+    # OPENING DEPOT POCKET: explicit live-road alternatives
+    # --------------------------------------------------------
+    depot_candidates = build_depot_pocket_routes(
+        distances,
+        durations,
+        locations,
+    )
+
+    for candidate in depot_candidates:
+        improved = improve_driver_sweep_route(
+            candidate,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+            locations,
+        )
+        metrics = route_metrics(
+            improved,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+        )
+        score = route_score(
+            improved,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+            locations,
+        )
+        candidate_pool.append(
+            (score, metrics["time_s"], metrics["distance_m"], improved)
+        )
 
     # --------------------------------------------------------
     # PRIMARY: wide driver-first beam search
@@ -2961,6 +3108,11 @@ if st.button(
             .sum()
         ),
         "persisted_only": False,
+        "route_miles": metrics["miles"],
+        "route_time_s": metrics["time_s"],
+        "route_litres": metrics["litres"],
+        "route_fuel_cost": metrics["fuel_cost"],
+        "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
     }
 
     st.rerun()
@@ -2975,6 +3127,9 @@ route_data = st.session_state.get("route_data")
 if route_data:
     st.markdown("---")
     st.subheader("💰 Daily Route Summary")
+
+    if route_data.get("generated_at"):
+        st.caption(f"Route report generated: {route_data['generated_at']}")
 
     customer_df = df.copy()
 
