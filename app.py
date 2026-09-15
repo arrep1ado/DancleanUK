@@ -2137,48 +2137,25 @@ def optimise_route(
     mpg,
     locations=None,
 ):
-    """Primary route optimiser: current-location driver routing.
+    """General-purpose driver-style route optimiser.
 
-    The previous versions accumulated multiple independent search/repair
-    systems.  This version uses one bounded driver-style search as the main
-    constructor and keeps the proven v25.3 candidates as a safety net.
-
-    Priority is real road driving time and distance.  Locality is used to
-    prevent obvious backtracking, not to force a fixed geographical order.
+    V23 makes the geographical sweep the primary structure.  It is not tuned
+    to the current 30-address example: all territories are generated from the
+    actual customer coordinates for whatever jobs are supplied.
     """
     customer_count = len(distances) - 1
     if customer_count <= 0:
         return [0, 0]
 
-    candidates = []
-
-    # --------------------------------------------------------
-    # PRIMARY: current-location / local-pocket driver search
-    # --------------------------------------------------------
-    driver_routes = build_driver_current_location_routes(
-        distances,
-        durations,
-        locations,
-    )
-
-    for route in driver_routes:
-        metrics = route_metrics(route, distances, durations, fuel_price, mpg)
-        candidates.append(
-            (
-                route_score(route, distances, durations, fuel_price, mpg, locations),
-                metrics["time_s"],
-                metrics["distance_m"],
-                route,
-            )
-        )
-
-    # --------------------------------------------------------
-    # SAFETY NET: retain the proven v25.3 structured candidates
-    # --------------------------------------------------------
+    structured_results = []
     if locations is not None:
         structured_candidates = build_driver_sweep_routes(
             locations, distances, durations
         )
+
+        # Keep the older geographic candidates as additional general-purpose
+        # options, but they are evaluated alongside the new sweep rather than
+        # replacing it with a pure road-distance answer.
         structured_candidates.extend(
             directional_sector_routes(locations, distances, durations)
         )
@@ -2187,14 +2164,14 @@ def optimise_route(
         )
 
         seen = set()
-        for route in structured_candidates:
-            key = tuple(route)
-            if key in seen or len(route) != customer_count + 2:
+        for candidate in structured_candidates:
+            key = tuple(candidate)
+            if key in seen or len(candidate) != customer_count + 2:
                 continue
             seen.add(key)
 
             improved = improve_driver_sweep_route(
-                route,
+                candidate,
                 distances,
                 durations,
                 fuel_price,
@@ -2204,59 +2181,101 @@ def optimise_route(
             metrics = route_metrics(
                 improved, distances, durations, fuel_price, mpg
             )
-            candidates.append(
-                (
-                    route_score(
-                        improved,
-                        distances,
-                        durations,
-                        fuel_price,
-                        mpg,
-                        locations,
-                    ),
-                    metrics["time_s"],
-                    metrics["distance_m"],
-                    improved,
-                )
+            score = route_score(
+                improved, distances, durations, fuel_price, mpg, locations
+            )
+            structured_results.append(
+                (score, metrics["time_s"], metrics["distance_m"], improved)
             )
 
-    # --------------------------------------------------------
-    # SAFETY NET: a small road-time benchmark
-    # --------------------------------------------------------
-    starts = sorted(
-        range(1, customer_count + 1),
-        key=lambda j: (durations[0][j], distances[0][j]),
-    )
-    for first in starts[:8]:
-        for mode in ("time", "balanced"):
-            route = build_greedy_route(first, distances, durations, mode)
-            metrics = route_metrics(route, distances, durations, fuel_price, mpg)
-            candidates.append(
-                (
-                    route_score(route, distances, durations, fuel_price, mpg, locations),
-                    metrics["time_s"],
-                    metrics["distance_m"],
-                    route,
-                )
-            )
+    structured_results.sort(key=lambda x: x[0])
 
-    if not candidates:
-        return None
+    # Road-efficient benchmark.  This is retained so the app can reject a
+    # genuinely absurd sweep caused by an unusual road network.
+    fallback_candidates = []
+    starts = list(range(1, customer_count + 1))
+    starts.sort(key=lambda x: durations[0][x])
 
-    # First minimise the actual route score.  If two routes are very close,
-    # prefer the one with less real road time, then less distance.  This means
-    # locality can fix an unnecessary return without allowing a pretty-looking
-    # route to become materially slower.
-    candidates.sort(key=lambda x: (x[0], x[1], x[2]))
-    best = candidates[0]
+    if customer_count > 40:
+        selected = starts[:12] + starts[-12:] + starts[::max(1, customer_count // 12)]
+        starts = list(dict.fromkeys(selected))
 
-    # Also compare against the fastest few candidates.  A small score
-    # difference should never hide a meaningful road-time improvement.
-    fastest = min(candidates, key=lambda x: (x[1], x[2]))
-    if fastest[1] < best[1] - 90:
-        return fastest[3]
+    for first_customer in starts:
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "time")
+        )
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "balanced")
+        )
+        fallback_candidates.append(
+            build_greedy_route(first_customer, distances, durations, "distance")
+        )
 
-    return best[3]
+    insertion = cheapest_insertion_route(distances, durations)
+    if insertion:
+        fallback_candidates.append(insertion)
+        if len(insertion) > 3:
+            fallback_candidates.append([0] + insertion[1:-1][::-1] + [0])
+
+    unique_fallbacks = []
+    seen = set()
+    for candidate in fallback_candidates:
+        key = tuple(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique_fallbacks.append(candidate)
+
+    fallback_results = []
+    for candidate in unique_fallbacks[:80]:
+        improved = improve_route(
+            candidate,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+            locations,
+            preserve_structure=False,
+        )
+        metrics = route_metrics(
+            improved, distances, durations, fuel_price, mpg
+        )
+        score = route_score(
+            improved, distances, durations, fuel_price, mpg, locations
+        )
+        fallback_results.append(
+            (score, metrics["time_s"], metrics["distance_m"], improved)
+        )
+
+    fallback_results.sort(key=lambda x: x[0])
+
+    if not structured_results:
+        return fallback_results[0][3] if fallback_results else None
+    if not fallback_results:
+        return structured_results[0][3]
+
+    best_structured = structured_results[0]
+    best_fallback = fallback_results[0]
+
+    structured_time = best_structured[1]
+    structured_distance = best_structured[2]
+    fallback_time = best_fallback[1]
+    fallback_distance = best_fallback[2]
+
+    time_ratio = structured_time / max(fallback_time, 1.0)
+    distance_ratio = structured_distance / max(fallback_distance, 1.0)
+
+    # V25 gives the geographical sweep a little more authority.  A clean
+    # driver-style territory route is allowed to cost a modest amount more
+    # than the pure road-time benchmark because repeatedly returning to an
+    # area that has already been cleared is expensive in real working time.
+    if time_ratio <= 1.20 and distance_ratio <= 1.20:
+        return best_structured[3]
+
+    combined_ratio = time_ratio * 0.60 + distance_ratio * 0.40
+    if combined_ratio <= 1.16:
+        return best_structured[3]
+
+    return best_fallback[3]
 
 
 # ============================================================
@@ -2746,7 +2765,7 @@ if st.button(
         "persisted_only": False,
     }
 
-    st.rerun()
+    # Do not rerun here: render the freshly calculated summary immediately.
 
 
 # ============================================================
