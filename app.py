@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.27"
+APP_VERSION = "25.28"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2958,6 +2958,117 @@ if route_data:
         st.success(
             "✅ Route calculated using live road distance and driving time."
         )
+
+
+# ============================================================
+# ROUTE LEG DIAGNOSTICS — v25.28
+# ============================================================
+# Diagnostic only. This does NOT alter the selected route.
+# It uses the same live ORS matrix and the exact route selected by the
+# existing optimiser, so we can identify genuine weak road-time decisions
+# before making another routing change.
+if (
+    "route" in locals()
+    and route
+    and "distances" in locals()
+    and "durations" in locals()
+    and "locations" in locals()
+):
+    with st.expander("🔎 Route Leg Diagnostics (v25.28)", expanded=False):
+        diagnostic_rows = []
+
+        def _diag_minutes(seconds):
+            if seconds is None:
+                return "—"
+            return f"{float(seconds) / 60.0:.1f} min"
+
+        def _diag_miles(meters):
+            if meters is None:
+                return "—"
+            return f"{float(meters) / 1609.344:.2f} mi"
+
+        for pos in range(len(route) - 1):
+            current_idx = route[pos]
+            chosen_idx = route[pos + 1]
+
+            visited = set(route[: pos + 1])
+            unvisited = [
+                j for j in range(1, len(locations))
+                if j not in visited
+            ]
+
+            chosen_t = float(durations[current_idx][chosen_idx])
+            chosen_d = float(distances[current_idx][chosen_idx])
+
+            alternatives = []
+            for cand in unvisited:
+                if cand == chosen_idx:
+                    continue
+                try:
+                    t = float(durations[current_idx][cand])
+                    d = float(distances[current_idx][cand])
+                    alternatives.append((t, d, cand))
+                except Exception:
+                    continue
+
+            if alternatives:
+                alternatives.sort(key=lambda x: (x[0], x[1]))
+                alt_t, alt_d, alt_idx = alternatives[0]
+                delta_t = chosen_t - alt_t
+                delta_d = chosen_d - alt_d
+                alt_name = str(locations[alt_idx])
+            else:
+                alt_t = alt_d = None
+                delta_t = delta_d = None
+                alt_name = "—"
+
+            # Descriptive only: how much useful work remains close to the
+            # chosen destination using the same live road-distance matrix.
+            close_remaining = 0
+            for other in unvisited:
+                if other == chosen_idx:
+                    continue
+                try:
+                    if float(distances[chosen_idx][other]) <= 3218.688:
+                        close_remaining += 1
+                except Exception:
+                    pass
+
+            diagnostic_rows.append({
+                "Leg": pos + 1,
+                "From": str(locations[current_idx]),
+                "Chosen": str(locations[chosen_idx]),
+                "Chosen time": _diag_minutes(chosen_t),
+                "Chosen distance": _diag_miles(chosen_d),
+                "Fastest alternative": alt_name,
+                "Alt time": _diag_minutes(alt_t),
+                "Time delta": (
+                    f"+{delta_t / 60.0:.1f} min"
+                    if delta_t is not None and delta_t > 0.05
+                    else "—"
+                ),
+                "Distance delta": (
+                    f"+{delta_d / 1609.344:.2f} mi"
+                    if delta_d is not None and delta_d > 1.0
+                    else "—"
+                ),
+                "Jobs within 2 mi of chosen": close_remaining,
+            })
+
+        if diagnostic_rows:
+            diagnostic_df = pd.DataFrame(diagnostic_rows)
+            st.dataframe(
+                diagnostic_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.caption(
+                "Diagnostic only — the route is unchanged. A positive time "
+                "delta means another unvisited job was quicker to reach directly "
+                "from the current stop. That is not automatically a better overall "
+                "move because the existing optimiser also considers the rest of the route."
+            )
 
 
 # ============================================================
