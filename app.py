@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.28"
+APP_VERSION = "25.29"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2114,7 +2114,62 @@ def build_nearest_pocket_route(
         candidates.sort(
             key=lambda x: (x[0], x[1], x[2], x[3], x[4], x[5])
         )
+
+        # v25.29: targeted road-cost anomaly guard.
+        #
+        # If the scoring model selects a first leg that is materially more
+        # expensive than the nearest remaining road-time option, test the
+        # nearest option first.  This is deliberately narrow: it does not
+        # force geographic clusters, postcode order, or town completion.
+        #
+        # The guard only activates for a genuinely large anomaly:
+        #   - chosen leg is at least 4 minutes slower than nearest, AND
+        #   - chosen leg is at least 2.5 miles longer than nearest.
+        #
+        # This is aimed at the kind of +7.6 min / +5.17 mile anomaly found
+        # in the v25.28 diagnostics, while leaving normal small detours alone.
         chosen = candidates[0][5]
+        chosen_t = durations[current][chosen]
+        chosen_d = distances[current][chosen]
+
+        nearest_road = min(
+            local,
+            key=lambda j: (
+                durations[current][j],
+                distances[current][j],
+                j,
+            ),
+        )
+        nearest_road_t = durations[current][nearest_road]
+        nearest_road_d = distances[current][nearest_road]
+
+        if (
+            nearest_road != chosen
+            and chosen_t - nearest_road_t >= 240.0
+            and (chosen_d - nearest_road_d) / 1609.344 >= 2.50
+        ):
+            # Prefer the nearest road-time option only when its immediate
+            # follow-up is not itself an obvious stranded move.  This keeps
+            # the correction focused on large first-leg anomalies.
+            nearest_future = remaining.difference({nearest_road})
+            nearest_next = nearest_job(nearest_road, nearest_future)
+            anomaly_safe = True
+            if nearest_next is not None and nearest_future:
+                nearest_next_t = durations[nearest_road][nearest_next]
+                chosen_next = nearest_job(chosen, future)
+                chosen_next_t = (
+                    durations[chosen][chosen_next]
+                    if chosen_next is not None else 0.0
+                )
+                # Do not apply the repair if the nearest option creates an
+                # immediate follow-up that is more than 6 minutes worse.
+                if nearest_next_t - chosen_next_t > 360.0:
+                    anomaly_safe = False
+
+            if anomaly_safe:
+                chosen = nearest_road
+
+        route.append(chosen)
         route.append(chosen)
         remaining.remove(chosen)
         current = chosen
