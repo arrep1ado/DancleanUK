@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.29"
+APP_VERSION = "25.30"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -626,13 +626,28 @@ def get_coords(query_string, postcode):
         "User-Agent": "DanCleanUKRouteOptimizer/24.0"
     }
 
+    # Known legacy Grantham postcodes must not accept an unverified remote
+    # Nominatim result. These postcodes already have safe Grantham fallback
+    # coordinates below, so clearly remote results are rejected.
+    legacy_coord = LEGACY_POSTCODE_COORDS.get(postcode)
+
     for candidate in geocode_candidates(query, postcode):
         coords = nominatim_search(candidate, headers)
         if coords is not None:
-            st.session_state.geocode_cache[key] = coords
-            return coords
+            if legacy_coord is not None:
+                # Reject a result that is clearly outside the known postcode
+                # area. This protects against an unrelated UK search match.
+                if haversine_km(
+                    legacy_coord[0], legacy_coord[1],
+                    coords[0], coords[1],
+                ) > 8.0:
+                    coords = None
 
-        # Public Nominatim service asks clients to be considerate.  Keep the
+            if coords is not None:
+                st.session_state.geocode_cache[key] = coords
+                return coords
+
+        # Public Nominatim service asks clients to be considerate. Keep the
         # existing short spacing between uncached requests.
         time.sleep(0.35)
 
@@ -1952,14 +1967,18 @@ def build_nearest_pocket_route(
 ):
     """Build a true driver-style route from the last completed customer.
 
-    v25.27 is a surgical refinement of the proven v25.21 driver construction.
+    The primary rule is simple: after every completed job, look from that
+    exact location and take the closest sensible remaining customer using the
+    live road matrix.
 
-    The last completed address remains the primary reference. The route still
-    considers nearby unfinished work and a short road-aware lookahead, but the
-    lookahead cannot trade a nearby road-time job for a substantially longer
-    first leg simply because the following stop looks attractive.
+    The important addition is an escape gate.  If there is still a genuinely
+    nearby job, the route is not allowed to jump to a distant pocket just
+    because that distant job has a slightly attractive next step.  This is
+    what prevents Grantham -> Lincoln -> Grantham -> Lincoln style bouncing.
 
-    No town, village, postcode or fixed geographic ordering is used.
+    This is deliberately construction logic, not a post-route penalty.  The
+    route is therefore built in the order a driver would actually make the
+    decisions on the road.
     """
     customer_count = len(distances) - 1
     if customer_count <= 0:
@@ -1970,46 +1989,23 @@ def build_nearest_pocket_route(
     remaining.discard(start_customer)
     current = start_customer
 
-    # Keep the proven v25.21 locality envelope.
+    # Road-distance thresholds.  They are intentionally broad enough to work
+    # in towns as well as villages, while still stopping obvious area jumps.
     HARD_LOCAL_MILES = 2.00
     EXPANDED_LOCAL_MILES = 3.50
     ESCAPE_RATIO = 1.80
     ESCAPE_EXTRA_MILES = 1.00
 
-    # Small lookahead weights. Direct road time remains dominant.
-    NEXT1_WEIGHT = 0.10
-    NEXT2_WEIGHT = 0.04
-    DIRECT_DISTANCE_WEIGHT = 0.00010
-    FUTURE_DISTANCE_WEIGHT = 0.000012
-    NEARBY_BONUS = 55.0
-    STRANDED_PENALTY = 300.0
-
-    def nearest_job(from_job, jobs):
-        if not jobs:
-            return None
-        return min(
-            jobs,
-            key=lambda j: (
-                durations[from_job][j],
-                distances[from_job][j],
-                j,
-            ),
-        )
-
     while remaining:
-        # Last completed customer is always the main reference.
+        # Always calculate the actual nearest remaining customer from the
+        # address just completed.  Road distance is the primary reference.
         nearest = min(
             remaining,
-            key=lambda j: (
-                distances[current][j],
-                durations[current][j],
-                j,
-            ),
+            key=lambda j: (distances[current][j], durations[current][j], j),
         )
         nearest_miles = distances[current][nearest] / 1609.344
-        nearest_time = durations[current][nearest]
 
-        # Build the same broad local pocket as v25.21.
+        # Build the local pocket around the current address.
         local = [
             j for j in remaining
             if distances[current][j] / 1609.344 <= HARD_LOCAL_MILES
@@ -2022,7 +2018,8 @@ def build_nearest_pocket_route(
         if not local:
             local = [nearest]
 
-        # Preserve v25.21's escape gate.
+        # If nearby work exists, a distant jump must have a strong road-time
+        # reason.  This is the core protection against leaving one job behind.
         if nearest_miles <= HARD_LOCAL_MILES:
             allowed_miles = max(
                 nearest_miles * ESCAPE_RATIO,
@@ -2037,52 +2034,37 @@ def build_nearest_pocket_route(
             else:
                 local = [nearest]
 
-        # v25.27's targeted change: a lookahead candidate must be close in
-        # direct road time to the nearest available job. This stops the
-        # lookahead from creating a longer detour while still allowing a
-        # sensible alternative when the road times are genuinely similar.
-        direct_time_allowance = max(60.0, nearest_time * 0.12)
-        time_gated = [
-            j for j in local
-            if durations[current][j] <= nearest_time + direct_time_allowance
-        ]
-        if time_gated:
-            local = time_gated
-
         candidates = []
         for candidate in local:
             direct_t = durations[current][candidate]
             direct_d = distances[current][candidate]
+
             future = remaining.difference({candidate})
-
-            # First road-aware lookahead.
-            next1 = nearest_job(candidate, future)
-            if next1 is not None:
-                next1_t = durations[candidate][next1]
-                next1_d = distances[candidate][next1]
+            if future:
+                next_job = min(
+                    future,
+                    key=lambda j: (
+                        durations[candidate][j],
+                        distances[candidate][j],
+                        j,
+                    ),
+                )
+                next_t = durations[candidate][next_job]
+                next_d = distances[candidate][next_job]
             else:
-                next1 = 0
-                next1_t = durations[candidate][0]
-                next1_d = distances[candidate][0]
+                next_t = durations[candidate][0]
+                next_d = distances[candidate][0]
 
-            # Second lookahead is only a tie-breaker; it is deliberately small.
-            future2 = future.difference({next1}) if next1 != 0 else set()
-            next2 = nearest_job(next1, future2) if future2 else None
-            if next2 is not None:
-                next2_t = durations[next1][next2]
-                next2_d = distances[next1][next2]
-            else:
-                next2_t = durations[next1][0] if next1 != 0 else 0.0
-                next2_d = distances[next1][0] if next1 != 0 else 0.0
-
-            # Gentle reward for useful unfinished work around the candidate.
+            # Count work that would remain close to the candidate.  This is a
+            # small tie-breaker: direct travel from the last completed job
+            # remains dominant.
             nearby_after = sum(
-                1
-                for j in future
+                1 for j in future
                 if distances[candidate][j] / 1609.344 <= HARD_LOCAL_MILES
             )
 
-            # Penalise a move which leaves an extremely close job stranded.
+            # If choosing this customer would strand a very close job, make
+            # that choice expensive unless the road-time difference is real.
             stranded_penalty = 0.0
             close_remaining = [
                 j for j in future
@@ -2095,81 +2077,20 @@ def build_nearest_pocket_route(
                 )
                 candidate_miles = direct_d / 1609.344
                 if candidate_miles > closest_after * 2.0 + 0.75:
-                    stranded_penalty = STRANDED_PENALTY
+                    stranded_penalty = 300.0
 
             score = (
                 direct_t
-                + next1_t * NEXT1_WEIGHT
-                + next2_t * NEXT2_WEIGHT
-                + direct_d * DIRECT_DISTANCE_WEIGHT
-                + (next1_d + next2_d) * FUTURE_DISTANCE_WEIGHT
-                - nearby_after * NEARBY_BONUS
+                + next_t * 0.16
+                + direct_d * 0.00010
+                + next_d * 0.000025
+                - nearby_after * 65.0
                 + stranded_penalty
             )
+            candidates.append((score, direct_t, direct_d, candidate))
 
-            candidates.append(
-                (score, direct_t, direct_d, next1_t, next2_t, candidate)
-            )
-
-        candidates.sort(
-            key=lambda x: (x[0], x[1], x[2], x[3], x[4], x[5])
-        )
-
-        # v25.29: targeted road-cost anomaly guard.
-        #
-        # If the scoring model selects a first leg that is materially more
-        # expensive than the nearest remaining road-time option, test the
-        # nearest option first.  This is deliberately narrow: it does not
-        # force geographic clusters, postcode order, or town completion.
-        #
-        # The guard only activates for a genuinely large anomaly:
-        #   - chosen leg is at least 4 minutes slower than nearest, AND
-        #   - chosen leg is at least 2.5 miles longer than nearest.
-        #
-        # This is aimed at the kind of +7.6 min / +5.17 mile anomaly found
-        # in the v25.28 diagnostics, while leaving normal small detours alone.
-        chosen = candidates[0][5]
-        chosen_t = durations[current][chosen]
-        chosen_d = distances[current][chosen]
-
-        nearest_road = min(
-            local,
-            key=lambda j: (
-                durations[current][j],
-                distances[current][j],
-                j,
-            ),
-        )
-        nearest_road_t = durations[current][nearest_road]
-        nearest_road_d = distances[current][nearest_road]
-
-        if (
-            nearest_road != chosen
-            and chosen_t - nearest_road_t >= 240.0
-            and (chosen_d - nearest_road_d) / 1609.344 >= 2.50
-        ):
-            # Prefer the nearest road-time option only when its immediate
-            # follow-up is not itself an obvious stranded move.  This keeps
-            # the correction focused on large first-leg anomalies.
-            nearest_future = remaining.difference({nearest_road})
-            nearest_next = nearest_job(nearest_road, nearest_future)
-            anomaly_safe = True
-            if nearest_next is not None and nearest_future:
-                nearest_next_t = durations[nearest_road][nearest_next]
-                chosen_next = nearest_job(chosen, future)
-                chosen_next_t = (
-                    durations[chosen][chosen_next]
-                    if chosen_next is not None else 0.0
-                )
-                # Do not apply the repair if the nearest option creates an
-                # immediate follow-up that is more than 6 minutes worse.
-                if nearest_next_t - chosen_next_t > 360.0:
-                    anomaly_safe = False
-
-            if anomaly_safe:
-                chosen = nearest_road
-
-        route.append(chosen)
+        candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        chosen = candidates[0][3]
         route.append(chosen)
         remaining.remove(chosen)
         current = chosen
@@ -3013,117 +2934,6 @@ if route_data:
         st.success(
             "✅ Route calculated using live road distance and driving time."
         )
-
-
-# ============================================================
-# ROUTE LEG DIAGNOSTICS — v25.28
-# ============================================================
-# Diagnostic only. This does NOT alter the selected route.
-# It uses the same live ORS matrix and the exact route selected by the
-# existing optimiser, so we can identify genuine weak road-time decisions
-# before making another routing change.
-if (
-    "route" in locals()
-    and route
-    and "distances" in locals()
-    and "durations" in locals()
-    and "locations" in locals()
-):
-    with st.expander("🔎 Route Leg Diagnostics (v25.28)", expanded=False):
-        diagnostic_rows = []
-
-        def _diag_minutes(seconds):
-            if seconds is None:
-                return "—"
-            return f"{float(seconds) / 60.0:.1f} min"
-
-        def _diag_miles(meters):
-            if meters is None:
-                return "—"
-            return f"{float(meters) / 1609.344:.2f} mi"
-
-        for pos in range(len(route) - 1):
-            current_idx = route[pos]
-            chosen_idx = route[pos + 1]
-
-            visited = set(route[: pos + 1])
-            unvisited = [
-                j for j in range(1, len(locations))
-                if j not in visited
-            ]
-
-            chosen_t = float(durations[current_idx][chosen_idx])
-            chosen_d = float(distances[current_idx][chosen_idx])
-
-            alternatives = []
-            for cand in unvisited:
-                if cand == chosen_idx:
-                    continue
-                try:
-                    t = float(durations[current_idx][cand])
-                    d = float(distances[current_idx][cand])
-                    alternatives.append((t, d, cand))
-                except Exception:
-                    continue
-
-            if alternatives:
-                alternatives.sort(key=lambda x: (x[0], x[1]))
-                alt_t, alt_d, alt_idx = alternatives[0]
-                delta_t = chosen_t - alt_t
-                delta_d = chosen_d - alt_d
-                alt_name = str(locations[alt_idx])
-            else:
-                alt_t = alt_d = None
-                delta_t = delta_d = None
-                alt_name = "—"
-
-            # Descriptive only: how much useful work remains close to the
-            # chosen destination using the same live road-distance matrix.
-            close_remaining = 0
-            for other in unvisited:
-                if other == chosen_idx:
-                    continue
-                try:
-                    if float(distances[chosen_idx][other]) <= 3218.688:
-                        close_remaining += 1
-                except Exception:
-                    pass
-
-            diagnostic_rows.append({
-                "Leg": pos + 1,
-                "From": str(locations[current_idx]),
-                "Chosen": str(locations[chosen_idx]),
-                "Chosen time": _diag_minutes(chosen_t),
-                "Chosen distance": _diag_miles(chosen_d),
-                "Fastest alternative": alt_name,
-                "Alt time": _diag_minutes(alt_t),
-                "Time delta": (
-                    f"+{delta_t / 60.0:.1f} min"
-                    if delta_t is not None and delta_t > 0.05
-                    else "—"
-                ),
-                "Distance delta": (
-                    f"+{delta_d / 1609.344:.2f} mi"
-                    if delta_d is not None and delta_d > 1.0
-                    else "—"
-                ),
-                "Jobs within 2 mi of chosen": close_remaining,
-            })
-
-        if diagnostic_rows:
-            diagnostic_df = pd.DataFrame(diagnostic_rows)
-            st.dataframe(
-                diagnostic_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.caption(
-                "Diagnostic only — the route is unchanged. A positive time "
-                "delta means another unvisited job was quicker to reach directly "
-                "from the current stop. That is not automatically a better overall "
-                "move because the existing optimiser also considers the rest of the route."
-            )
 
 
 # ============================================================
