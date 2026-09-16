@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.26"
+APP_VERSION = "25.27"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1952,14 +1952,14 @@ def build_nearest_pocket_route(
 ):
     """Build a true driver-style route from the last completed customer.
 
-    v25.26 keeps the proven v25.21 route framework and changes only the
-    current-location decision: a shallow two-step live-road lookahead helps
-    choose between similarly sensible next jobs.
+    v25.27 is a surgical refinement of the proven v25.21 driver construction.
 
-    Road time remains dominant. Nearby unfinished work is rewarded when it
-    remains useful from the new position, while moves that strand a nearby
-    job are penalised. No geographic ordering or hard-coded locality names
-    are used.
+    The last completed address remains the primary reference. The route still
+    considers nearby unfinished work and a short road-aware lookahead, but the
+    lookahead cannot trade a nearby road-time job for a substantially longer
+    first leg simply because the following stop looks attractive.
+
+    No town, village, postcode or fixed geographic ordering is used.
     """
     customer_count = len(distances) - 1
     if customer_count <= 0:
@@ -1970,18 +1970,18 @@ def build_nearest_pocket_route(
     remaining.discard(start_customer)
     current = start_customer
 
+    # Keep the proven v25.21 locality envelope.
     HARD_LOCAL_MILES = 2.00
     EXPANDED_LOCAL_MILES = 3.50
     ESCAPE_RATIO = 1.80
     ESCAPE_EXTRA_MILES = 1.00
 
-    # Direct road time is deliberately dominant. These smaller terms only
-    # separate candidates that are already reasonably close.
-    NEXT1_WEIGHT = 0.16
-    NEXT2_WEIGHT = 0.07
+    # Small lookahead weights. Direct road time remains dominant.
+    NEXT1_WEIGHT = 0.10
+    NEXT2_WEIGHT = 0.04
     DIRECT_DISTANCE_WEIGHT = 0.00010
-    FUTURE_DISTANCE_WEIGHT = 0.000020
-    NEARBY_BONUS = 65.0
+    FUTURE_DISTANCE_WEIGHT = 0.000012
+    NEARBY_BONUS = 55.0
     STRANDED_PENALTY = 300.0
 
     def nearest_job(from_job, jobs):
@@ -1997,6 +1997,7 @@ def build_nearest_pocket_route(
         )
 
     while remaining:
+        # Last completed customer is always the main reference.
         nearest = min(
             remaining,
             key=lambda j: (
@@ -2006,7 +2007,9 @@ def build_nearest_pocket_route(
             ),
         )
         nearest_miles = distances[current][nearest] / 1609.344
+        nearest_time = durations[current][nearest]
 
+        # Build the same broad local pocket as v25.21.
         local = [
             j for j in remaining
             if distances[current][j] / 1609.344 <= HARD_LOCAL_MILES
@@ -2019,8 +2022,7 @@ def build_nearest_pocket_route(
         if not local:
             local = [nearest]
 
-        # Preserve v25.21's escape gate: don't leave genuinely close work
-        # for a distant candidate unless the road-distance envelope permits it.
+        # Preserve v25.21's escape gate.
         if nearest_miles <= HARD_LOCAL_MILES:
             allowed_miles = max(
                 nearest_miles * ESCAPE_RATIO,
@@ -2035,45 +2037,52 @@ def build_nearest_pocket_route(
             else:
                 local = [nearest]
 
-        candidates = []
+        # v25.27's targeted change: a lookahead candidate must be close in
+        # direct road time to the nearest available job. This stops the
+        # lookahead from creating a longer detour while still allowing a
+        # sensible alternative when the road times are genuinely similar.
+        direct_time_allowance = max(60.0, nearest_time * 0.12)
+        time_gated = [
+            j for j in local
+            if durations[current][j] <= nearest_time + direct_time_allowance
+        ]
+        if time_gated:
+            local = time_gated
 
+        candidates = []
         for candidate in local:
             direct_t = durations[current][candidate]
             direct_d = distances[current][candidate]
-
             future = remaining.difference({candidate})
 
-            # First lookahead: where would the driver naturally go next?
+            # First road-aware lookahead.
             next1 = nearest_job(candidate, future)
             if next1 is not None:
                 next1_t = durations[candidate][next1]
                 next1_d = distances[candidate][next1]
             else:
-                next1 = None
+                next1 = 0
                 next1_t = durations[candidate][0]
                 next1_d = distances[candidate][0]
 
-            # Second lookahead: and where does that next move lead?
-            future2 = future.difference({next1}) if next1 is not None else set()
-            next2 = nearest_job(next1, future2) if next1 is not None else None
+            # Second lookahead is only a tie-breaker; it is deliberately small.
+            future2 = future.difference({next1}) if next1 != 0 else set()
+            next2 = nearest_job(next1, future2) if future2 else None
             if next2 is not None:
                 next2_t = durations[next1][next2]
                 next2_d = distances[next1][next2]
-            elif next1 is not None:
-                next2_t = durations[next1][0]
-                next2_d = distances[next1][0]
             else:
-                next2_t = 0.0
-                next2_d = 0.0
+                next2_t = durations[next1][0] if next1 != 0 else 0.0
+                next2_d = distances[next1][0] if next1 != 0 else 0.0
 
-            # Reward candidates that leave useful nearby work around the new
-            # position. This is a soft preference, not forced clustering.
+            # Gentle reward for useful unfinished work around the candidate.
             nearby_after = sum(
                 1
                 for j in future
                 if distances[candidate][j] / 1609.344 <= HARD_LOCAL_MILES
             )
 
+            # Penalise a move which leaves an extremely close job stranded.
             stranded_penalty = 0.0
             close_remaining = [
                 j for j in future
@@ -2106,7 +2115,6 @@ def build_nearest_pocket_route(
             key=lambda x: (x[0], x[1], x[2], x[3], x[4], x[5])
         )
         chosen = candidates[0][5]
-
         route.append(chosen)
         remaining.remove(chosen)
         current = chosen
