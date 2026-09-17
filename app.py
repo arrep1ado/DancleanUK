@@ -2440,11 +2440,6 @@ def optimise_route(
         return driver_route
 
     return benchmark[3]
-# v25.34 surgical polish: accept only complete-route improvements in BOTH live time and distance.
-best_route = _micro_polish_route(best_route, distances, durations)
-return best_route# v25.34 surgical polish: accept only complete-route improvements in BOTH live time and distance.
-best_route = _micro_polish_route(best_route, distances, durations)
-return best_route
 
 def surgical_route_polish(route, distances, durations, max_passes=2):
     """Safely polish the already-selected route without changing its strategy.
