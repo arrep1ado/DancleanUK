@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.31.1"
+APP_VERSION = "25.32"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2099,6 +2099,87 @@ def build_nearest_pocket_route(
     return route
 
 
+def pareto_road_polish(route, distances, durations):
+    """Make only strictly safer road-efficiency improvements.
+
+    This is deliberately conservative.  The winning v25.30 route is already
+    a strong benchmark, so a change is accepted only when it reduces BOTH live
+    road driving time and live road distance.  No locality/geographic score is
+    involved here and the depot endpoints are never moved.
+
+    The search checks the complete 2-opt, relocate and swap neighbourhood for
+    a small number of passes.  Because each move is evaluated against the
+    actual matrix, this can only keep the route unchanged or make it strictly
+    better on both road measures.
+    """
+    if not route or len(route) < 5:
+        return route[:]
+
+    def route_totals(r):
+        total_t = 0.0
+        total_d = 0.0
+        for i in range(len(r) - 1):
+            a, b = r[i], r[i + 1]
+            total_t += durations[a][b]
+            total_d += distances[a][b]
+        return total_t, total_d
+
+    best = route[:]
+    best_t, best_d = route_totals(best)
+
+    # A handful of complete neighbourhood passes is enough for a 33-job day.
+    for _ in range(4):
+        changed = False
+        best_candidate = None
+        candidate_t = best_t
+        candidate_d = best_d
+
+        # 2-opt: reverse any customer segment.
+        for i in range(1, len(best) - 2):
+            for j in range(i + 1, len(best) - 1):
+                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
+                t, d = route_totals(candidate)
+                if t < candidate_t - 0.5 and d < candidate_d - 0.5:
+                    if best_candidate is None or (t, d) < (candidate_t, candidate_d):
+                        best_candidate = candidate
+                        candidate_t, candidate_d = t, d
+
+        # Relocate: move one customer to another position.
+        for i in range(1, len(best) - 1):
+            customer = best[i]
+            shortened = best[:i] + best[i + 1:]
+            for j in range(1, len(shortened)):
+                candidate = shortened[:j] + [customer] + shortened[j:]
+                t, d = route_totals(candidate)
+                if t < candidate_t - 0.5 and d < candidate_d - 0.5:
+                    if best_candidate is None or (t, d) < (candidate_t, candidate_d):
+                        best_candidate = candidate
+                        candidate_t, candidate_d = t, d
+
+        # Swap: exchange any two customers.
+        for i in range(1, len(best) - 2):
+            for j in range(i + 1, len(best) - 1):
+                candidate = best[:]
+                candidate[i], candidate[j] = candidate[j], candidate[i]
+                t, d = route_totals(candidate)
+                if t < candidate_t - 0.5 and d < candidate_d - 0.5:
+                    if best_candidate is None or (t, d) < (candidate_t, candidate_d):
+                        best_candidate = candidate
+                        candidate_t, candidate_d = t, d
+
+        if best_candidate is None:
+            break
+
+        best = best_candidate
+        best_t, best_d = candidate_t, candidate_d
+        changed = True
+
+        if not changed:
+            break
+
+    return best
+
+
 def route_locality_breaks(route, distances):
     """Count obvious leave-an-area-and-return-later situations.
 
@@ -2287,7 +2368,7 @@ def optimise_route(
     driver_results.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
 
     if not structured_results and not fallback_results:
-        return driver_results[0][4] if driver_results else None
+        return pareto_road_polish(driver_results[0][4], distances, durations) if driver_results else None
     if not driver_results:
         if structured_results and fallback_results:
             best_structured = structured_results[0]
@@ -2295,11 +2376,12 @@ def optimise_route(
             time_ratio = best_structured[1] / max(best_fallback[1], 1.0)
             distance_ratio = best_structured[2] / max(best_fallback[2], 1.0)
             if time_ratio <= 1.20 and distance_ratio <= 1.20:
-                return best_structured[3]
+                return pareto_road_polish(best_structured[3], distances, durations)
             if time_ratio * 0.60 + distance_ratio * 0.40 <= 1.16:
-                return best_structured[3]
-            return best_fallback[3]
-        return structured_results[0][3] if structured_results else fallback_results[0][3]
+                return pareto_road_polish(best_structured[3], distances, durations)
+            return pareto_road_polish(best_fallback[3], distances, durations)
+        base = structured_results[0][3] if structured_results else fallback_results[0][3]
+        return pareto_road_polish(base, distances, durations)
 
     # ------------------------------------------------------------
     # 4. Compare by road efficiency first, then route shape.
@@ -2313,7 +2395,7 @@ def optimise_route(
 
     benchmark_results = [x for x in benchmark_results if x]
     if not benchmark_results:
-        return driver_route
+        return pareto_road_polish(driver_route, distances, durations)
 
     # Find the best benchmark by actual road time/distance, not by a shape
     # penalty alone.  This keeps v25.3's 110.8-mile / 3h33 benchmark meaningful.
@@ -2331,15 +2413,16 @@ def optimise_route(
     time_ratio = driver_time / max(benchmark_time, 1.0)
     distance_ratio = driver_distance / max(benchmark_distance, 1.0)
 
+    # Keep the existing v25.21/v25.30 selection rules exactly as the first
+    # decision.  The only change is that whichever route wins is then given
+    # the strict Pareto polish below.
+    final_route = benchmark[3]
     if driver_breaks < benchmark_breaks and time_ratio <= 1.06 and distance_ratio <= 1.06:
-        return driver_route
+        final_route = driver_route
+    elif driver_breaks <= benchmark_breaks and time_ratio <= 1.00 and distance_ratio <= 1.00:
+        final_route = driver_route
 
-    # If locality is tied, only use the driver construction when it is at least
-    # as efficient on both real road measures.
-    if driver_breaks <= benchmark_breaks and time_ratio <= 1.00 and distance_ratio <= 1.00:
-        return driver_route
-
-    return benchmark[3]
+    return pareto_road_polish(final_route, distances, durations)
 
 
 # ============================================================
@@ -2935,143 +3018,6 @@ if route_data:
             "✅ Route calculated using live road distance and driving time."
         )
 
-
-# ============================================================
-# ROUTE DECISION DIAGNOSTICS — v25.31.1
-# ============================================================
-
-def build_route_decision_diagnostics(route, distances, durations, routing_df):
-    """Analyse the existing route without changing it.
-
-    This is diagnostic only. Any diagnostic problem is contained here so it
-    can never prevent the normal route summary/dashboard from rendering.
-    """
-    try:
-        if not route or len(route) < 3:
-            return pd.DataFrame()
-
-        records = []
-
-        def safe_num(matrix, a, b, default=0.0):
-            try:
-                value = float(matrix[a][b])
-                if math.isfinite(value):
-                    return value
-            except Exception:
-                pass
-            return default
-
-        def label(idx):
-            if idx == 0:
-                return "GRANTHAM DEPOT"
-            try:
-                row = routing_df.iloc[int(idx)]
-                address = str(row.get("Address", "")).strip()
-                postcode = str(row.get("Postcode", "")).strip()
-                if address and address.lower() != "nan":
-                    return f"{address} ({postcode})" if postcode and postcode.lower() != "nan" else address
-                return postcode if postcode and postcode.lower() != "nan" else f"STOP {idx}"
-            except Exception:
-                return f"STOP {idx}"
-
-        for pos in range(1, len(route) - 1):
-            current = int(route[pos])
-            chosen = int(route[pos + 1])
-            remaining = {int(x) for x in route[pos + 1:-1]}
-            remaining.discard(chosen)
-
-            alternatives = sorted(
-                remaining,
-                key=lambda j: (
-                    safe_num(durations, current, j, 1e99),
-                    safe_num(distances, current, j, 1e99),
-                    j,
-                ),
-            )[:5]
-
-            chosen_direct_t = safe_num(durations, current, chosen)
-            chosen_direct_d = safe_num(distances, current, chosen)
-
-            def best_continuation(candidate, pool):
-                if not pool:
-                    return 0.0, 0.0, None
-                nxt = min(
-                    pool,
-                    key=lambda j: (
-                        safe_num(durations, candidate, j, 1e99),
-                        safe_num(distances, candidate, j, 1e99),
-                        j,
-                    ),
-                )
-                return (
-                    safe_num(durations, candidate, nxt),
-                    safe_num(distances, candidate, nxt),
-                    nxt,
-                )
-
-            chosen_next_t, chosen_next_d, chosen_next = best_continuation(
-                chosen, remaining
-            )
-
-            for rank, alternative in enumerate(alternatives, start=1):
-                alt_pool = set(remaining)
-                alt_pool.discard(alternative)
-                alt_next_t, alt_next_d, alt_next = best_continuation(
-                    alternative, alt_pool
-                )
-
-                records.append({
-                    "Route Stop": pos,
-                    "Current": label(current),
-                    "Chosen Next": label(chosen),
-                    "Chosen Leg (min)": round(chosen_direct_t / 60.0, 1),
-                    "Chosen Leg (mi)": round(chosen_direct_d / 1609.344, 2),
-                    "Alternative Rank": rank,
-                    "Alternative": label(alternative),
-                    "Alt Leg (min)": round(safe_num(durations, current, alternative) / 60.0, 1),
-                    "Alt Leg (mi)": round(safe_num(distances, current, alternative) / 1609.344, 2),
-                    "Alt vs Chosen (min)": round((safe_num(durations, current, alternative) - chosen_direct_t) / 60.0, 1),
-                    "Alt vs Chosen (mi)": round((safe_num(distances, current, alternative) - chosen_direct_d) / 1609.344, 2),
-                    "Chosen Next Leg (min)": round(chosen_next_t / 60.0, 1),
-                    "Alt Next Leg (min)": round(alt_next_t / 60.0, 1),
-                    "2-Step Time Δ (min)": round((safe_num(durations, current, alternative) + alt_next_t - chosen_direct_t - chosen_next_t) / 60.0, 1),
-                    "Alt Continuation": label(alt_next) if alt_next is not None else "—",
-                    "Chosen Continuation": label(chosen_next) if chosen_next is not None else "—",
-                })
-
-        return pd.DataFrame(records)
-    except Exception:
-        return pd.DataFrame()
-
-
-# ============================================================
-# ROUTE DECISION DIAGNOSTICS UI
-# ============================================================
-
-if route_data and "route" in locals() and route:
-    with st.expander("🔎 Route Decision Diagnostics (v25.31.1)", expanded=False):
-        try:
-            diagnostic_df = build_route_decision_diagnostics(
-                route,
-                distances,
-                durations,
-                routing_df,
-            )
-            if diagnostic_df.empty:
-                st.info("No route decision diagnostics are available.")
-            else:
-                st.caption(
-                    "Diagnostic only — this does not change the route. "
-                    "It compares the chosen next stop with up to five road-time "
-                    "alternatives and checks the best immediate continuation."
-                )
-                st.dataframe(
-                    diagnostic_df,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-        except Exception:
-            st.info("Route diagnostics could not be displayed, but the route and Daily Route Summary are unaffected.")
 
 # ============================================================
 # FAILED ADDRESSES
