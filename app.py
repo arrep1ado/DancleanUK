@@ -19,7 +19,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.34"
+APP_VERSION = "25.35"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2142,28 +2142,40 @@ def optimise_route(
     mpg,
     locations=None,
 ):
-    """v25.21: v25.3 benchmark + true last-location pocket routing.
+    """Build a deterministic route and select the best real-road candidate.
 
-    v25.3 remains the benchmark and all of its existing route builders are
-    retained.  The new driver route is built from the last completed address,
-    using live road distance as the primary next-customer rule.  A limited
-    lookahead only breaks ties and helps finish a compact pocket.
+    v25.35 keeps the deterministic candidate generation from v25.34 but fixes
+    an important selection weakness: the optimiser previously compared only
+    the single best structured route and single best fallback route.  A good
+    route could therefore exist in the candidate pool but never reach the
+    final comparison.
 
-    The final choice is made on real road time/distance first, with locality
-    used to reject routes that repeatedly leave nearby work behind.  This is
-    intentionally not a hard geographic ordering.
+    The final selection now considers a broad, deterministic shortlist and
+    ranks it by live road driving time first, then live road distance, with
+    locality breaks used only as a tie-break.  This keeps the optimisation
+    dynamic for new daily addresses while avoiding postcode/address-specific
+    rules.
     """
     customer_count = len(distances) - 1
     if customer_count <= 0:
         return [0, 0]
 
+    candidates = []
+
+    def add_candidate(candidate):
+        if not candidate or len(candidate) != customer_count + 2:
+            return
+        if candidate[0] != 0 or candidate[-1] != 0:
+            return
+        candidates.append(candidate)
+
     # ------------------------------------------------------------
-    # 1. Build the proven v25.3 candidates.
+    # 1. Geographic / territory candidates.
     # ------------------------------------------------------------
-    structured_results = []
     if locations is not None:
-        structured_candidates = build_driver_sweep_routes(
-            locations, distances, durations
+        structured_candidates = []
+        structured_candidates.extend(
+            build_driver_sweep_routes(locations, distances, durations)
         )
         structured_candidates.extend(
             directional_sector_routes(locations, distances, durations)
@@ -2175,41 +2187,25 @@ def optimise_route(
         seen = set()
         for candidate in structured_candidates:
             key = tuple(candidate)
-            if key in seen or len(candidate) != customer_count + 2:
+            if key in seen:
                 continue
             seen.add(key)
-
             improved = improve_driver_sweep_route(
-                candidate,
-                distances,
-                durations,
-                fuel_price,
-                mpg,
-                locations,
+                candidate, distances, durations, fuel_price, mpg, locations
             )
-            metrics = route_metrics(
-                improved, distances, durations, fuel_price, mpg
-            )
-            score = route_score(
-                improved, distances, durations, fuel_price, mpg, locations
-            )
-            structured_results.append(
-                (score, metrics["time_s"], metrics["distance_m"], improved)
-            )
-
-    structured_results.sort(key=lambda x: x[0])
+            add_candidate(improved)
 
     # ------------------------------------------------------------
-    # 2. v25.3 road-efficient benchmark candidates.
+    # 2. Road-efficient greedy candidates from multiple starts.
     # ------------------------------------------------------------
-    fallback_candidates = []
     starts = list(range(1, customer_count + 1))
-    starts.sort(key=lambda x: durations[0][x])
+    starts.sort(key=lambda x: (durations[0][x], distances[0][x], x))
 
     if customer_count > 40:
         selected = starts[:12] + starts[-12:] + starts[::max(1, customer_count // 12)]
         starts = list(dict.fromkeys(selected))
 
+    fallback_candidates = []
     for first_customer in starts:
         fallback_candidates.append(
             build_greedy_route(first_customer, distances, durations, "time")
@@ -2227,16 +2223,12 @@ def optimise_route(
         if len(insertion) > 3:
             fallback_candidates.append([0] + insertion[1:-1][::-1] + [0])
 
-    unique_fallbacks = []
     seen = set()
     for candidate in fallback_candidates:
         key = tuple(candidate)
-        if key not in seen:
-            seen.add(key)
-            unique_fallbacks.append(candidate)
-
-    fallback_results = []
-    for candidate in unique_fallbacks[:80]:
+        if key in seen:
+            continue
+        seen.add(key)
         improved = improve_route(
             candidate,
             distances,
@@ -2246,100 +2238,64 @@ def optimise_route(
             locations,
             preserve_structure=False,
         )
-        metrics = route_metrics(
-            improved, distances, durations, fuel_price, mpg
-        )
-        score = route_score(
-            improved, distances, durations, fuel_price, mpg, locations
-        )
-        fallback_results.append(
-            (score, metrics["time_s"], metrics["distance_m"], improved)
-        )
-
-    fallback_results.sort(key=lambda x: x[0])
+        add_candidate(improved)
 
     # ------------------------------------------------------------
-    # 3. Build true current-location driver routes.
+    # 3. True current-location driver routes.
     # ------------------------------------------------------------
-    # Testing every possible first stop is unnecessary and expensive.  The
-    # first customer is still chosen from the live depot driving times, with a
-    # small spread so the depot is not allowed to dictate the whole day.
-    driver_starts = starts[:min(8, len(starts))]
-    driver_results = []
-
+    driver_starts = starts[:min(12, len(starts))]
     for first_customer in driver_starts:
         driver_route = build_nearest_pocket_route(
-            distances,
-            durations,
-            first_customer,
+            distances, durations, first_customer
         )
-        metrics = route_metrics(
-            driver_route, distances, durations, fuel_price, mpg
-        )
-        breaks = route_locality_breaks(driver_route, distances)
-        score = route_score(
-            driver_route, distances, durations, fuel_price, mpg, locations
-        )
-        driver_results.append(
-            (breaks, score, metrics["time_s"], metrics["distance_m"], driver_route)
-        )
+        add_candidate(driver_route)
 
-    driver_results.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-
-    if not structured_results and not fallback_results:
-        return driver_results[0][4] if driver_results else None
-    if not driver_results:
-        if structured_results and fallback_results:
-            best_structured = structured_results[0]
-            best_fallback = fallback_results[0]
-            time_ratio = best_structured[1] / max(best_fallback[1], 1.0)
-            distance_ratio = best_structured[2] / max(best_fallback[2], 1.0)
-            if time_ratio <= 1.20 and distance_ratio <= 1.20:
-                return best_structured[3]
-            if time_ratio * 0.60 + distance_ratio * 0.40 <= 1.16:
-                return best_structured[3]
-            return best_fallback[3]
-        return structured_results[0][3] if structured_results else fallback_results[0][3]
+    if not candidates:
+        return None
 
     # ------------------------------------------------------------
-    # 4. Compare by road efficiency first, then route shape.
+    # 4. Deterministic de-duplication and real-road ranking.
     # ------------------------------------------------------------
-    best_driver = driver_results[0]
-    driver_breaks, driver_score, driver_time, driver_distance, driver_route = best_driver
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        key = tuple(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
 
-    benchmark_results = []
-    benchmark_results.extend(structured_results[:1])
-    benchmark_results.extend(fallback_results[:1])
+    def candidate_key(route):
+        total_time = sum(
+            float(durations[route[i]][route[i + 1]])
+            for i in range(len(route) - 1)
+        )
+        total_distance = sum(
+            float(distances[route[i]][route[i + 1]])
+            for i in range(len(route) - 1)
+        )
+        breaks = route_locality_breaks(route, distances)
+        # Time is the primary road-efficiency measure, distance the second.
+        # Locality is deliberately only a tie-break so it cannot create a
+        # large mileage/time detour. The route tuple makes final ties stable.
+        return (total_time, total_distance, breaks, tuple(route))
 
-    benchmark_results = [x for x in benchmark_results if x]
-    if not benchmark_results:
-        return driver_route
+    unique.sort(key=candidate_key)
 
-    # Find the best benchmark by actual road time/distance, not by a shape
-    # penalty alone.  This keeps v25.3's 110.8-mile / 3h33 benchmark meaningful.
-    benchmark = min(
-        benchmark_results,
-        key=lambda x: (x[1], x[2], x[0]),
-    )
-    benchmark_time = benchmark[1]
-    benchmark_distance = benchmark[2]
+    # Keep a small deterministic shortlist and let the safe polish stage make
+    # final local improvements.  This avoids changing the result based on the
+    # order in which candidate builders happen to be evaluated.
+    shortlist = unique[:24]
 
-    # Driver route is preferred when it materially reduces locality breaks and
-    # does not create a large real-road penalty.  A 6% ceiling is deliberate:
-    # time on the road is money, so route shape cannot justify a large detour.
-    benchmark_breaks = route_locality_breaks(benchmark[3], distances)
-    time_ratio = driver_time / max(benchmark_time, 1.0)
-    distance_ratio = driver_distance / max(benchmark_distance, 1.0)
+    best_route = shortlist[0]
+    best_key = candidate_key(best_route)
 
-    if driver_breaks < benchmark_breaks and time_ratio <= 1.06 and distance_ratio <= 1.06:
-        return driver_route
+    for candidate in shortlist[1:]:
+        key = candidate_key(candidate)
+        if key < best_key:
+            best_route = candidate
+            best_key = key
 
-    # If locality is tied, only use the driver construction when it is at least
-    # as efficient on both real road measures.
-    if driver_breaks <= benchmark_breaks and time_ratio <= 1.00 and distance_ratio <= 1.00:
-        return driver_route
-
-    return benchmark[3]
+    return best_route
 
 
 def surgical_route_polish(route, distances, durations, max_passes=2):
