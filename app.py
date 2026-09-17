@@ -1,6 +1,5 @@
 import io
 import math
-import random
 import sqlite3
 import time
 from datetime import datetime, date
@@ -20,7 +19,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.33"
+APP_VERSION = "25.34"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1241,14 +1240,14 @@ def build_greedy_route(
     customer_count = len(distances) - 1
 
     route = [0, first_customer]
-    remaining = set(range(1, customer_count + 1))
-    remaining.discard(first_customer)
+    remaining = list(range(1, customer_count + 1))
+    remaining.remove(first_customer)
     current = first_customer
 
     while remaining:
         candidates = []
 
-        for candidate in remaining:
+        for candidate in sorted(remaining):
             direct_time = durations[current][candidate]
             direct_distance = distances[current][candidate]
 
@@ -1258,7 +1257,7 @@ def build_greedy_route(
                 # inside a dense local group.
                 nearest_future = min(
                     future,
-                    key=lambda x: durations[candidate][x]
+                    key=lambda x: (durations[candidate][x], distances[candidate][x], x)
                 )
                 future_time = durations[candidate][nearest_future]
                 future_distance = distances[candidate][nearest_future]
@@ -1295,7 +1294,7 @@ def build_greedy_route(
 
             candidates.append((score, candidate))
 
-        candidates.sort(key=lambda x: x[0])
+        candidates.sort(key=lambda x: (x[0], x[1]))
         next_customer = candidates[0][1]
         route.append(next_customer)
         remaining.remove(next_customer)
@@ -1485,13 +1484,13 @@ def cheapest_insertion_route(
 
     for first in seeds:
         route = [0, first, 0]
-        remaining = set(range(1, customer_count + 1))
+        remaining = list(range(1, customer_count + 1))
         remaining.remove(first)
 
         while remaining:
             best_choice = None
 
-            for customer in remaining:
+            for customer in sorted(remaining):
                 for position in range(1, len(route)):
                     before = route[position - 1]
                     after = route[position]
@@ -1503,7 +1502,7 @@ def cheapest_insertion_route(
 
                     # Reward inserting beside nearby unvisited work.
                     neighbour_bonus = 0.0
-                    for other in remaining:
+                    for other in sorted(remaining):
                         if other == customer:
                             continue
                         if distances[customer][other] <= 8000:
@@ -1515,7 +1514,7 @@ def cheapest_insertion_route(
                         - neighbour_bonus
                     )
 
-                    if best_choice is None or increase < best_choice[0]:
+                    if best_choice is None or (increase, customer, position) < best_choice:
                         best_choice = (increase, customer, position)
 
             _, customer, position = best_choice
@@ -1830,7 +1829,7 @@ def build_driver_sweep_routes(locations, distances=None, durations=None):
 
     def nearest_first(members, start):
         """Order a small geographic territory without crossing the whole day."""
-        remaining = set(members)
+        remaining = sorted(members)
         result = []
         current = start
         while remaining:
@@ -1839,6 +1838,7 @@ def build_driver_sweep_routes(locations, distances=None, durations=None):
                 key=lambda x: (
                     road_cost(current, x),
                     radii[x],
+                    x,
                 ),
             )
             result.append(nxt)
@@ -1985,8 +1985,8 @@ def build_nearest_pocket_route(
         return [0, 0]
 
     route = [0, start_customer]
-    remaining = set(range(1, customer_count + 1))
-    remaining.discard(start_customer)
+    remaining = list(range(1, customer_count + 1))
+    remaining.remove(start_customer)
     current = start_customer
 
     # Road-distance thresholds.  They are intentionally broad enough to work
@@ -2035,11 +2035,11 @@ def build_nearest_pocket_route(
                 local = [nearest]
 
         candidates = []
-        for candidate in local:
+        for candidate in sorted(local):
             direct_t = durations[current][candidate]
             direct_d = distances[current][candidate]
 
-            future = remaining.difference({candidate})
+            future = [x for x in remaining if x != candidate]
             if future:
                 next_job = min(
                     future,
@@ -2121,7 +2121,7 @@ def route_locality_breaks(route, distances):
 
         nearest = min(
             remaining,
-            key=lambda j: distances[current][j],
+            key=lambda j: (distances[current][j], j),
         )
         nearest_miles = distances[current][nearest] / 1609.344
         next_miles = distances[current][nxt] / 1609.344
