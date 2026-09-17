@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.32"
+APP_VERSION = "25.33"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2099,87 +2099,6 @@ def build_nearest_pocket_route(
     return route
 
 
-def pareto_road_polish(route, distances, durations):
-    """Make only strictly safer road-efficiency improvements.
-
-    This is deliberately conservative.  The winning v25.30 route is already
-    a strong benchmark, so a change is accepted only when it reduces BOTH live
-    road driving time and live road distance.  No locality/geographic score is
-    involved here and the depot endpoints are never moved.
-
-    The search checks the complete 2-opt, relocate and swap neighbourhood for
-    a small number of passes.  Because each move is evaluated against the
-    actual matrix, this can only keep the route unchanged or make it strictly
-    better on both road measures.
-    """
-    if not route or len(route) < 5:
-        return route[:]
-
-    def route_totals(r):
-        total_t = 0.0
-        total_d = 0.0
-        for i in range(len(r) - 1):
-            a, b = r[i], r[i + 1]
-            total_t += durations[a][b]
-            total_d += distances[a][b]
-        return total_t, total_d
-
-    best = route[:]
-    best_t, best_d = route_totals(best)
-
-    # A handful of complete neighbourhood passes is enough for a 33-job day.
-    for _ in range(4):
-        changed = False
-        best_candidate = None
-        candidate_t = best_t
-        candidate_d = best_d
-
-        # 2-opt: reverse any customer segment.
-        for i in range(1, len(best) - 2):
-            for j in range(i + 1, len(best) - 1):
-                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
-                t, d = route_totals(candidate)
-                if t < candidate_t - 0.5 and d < candidate_d - 0.5:
-                    if best_candidate is None or (t, d) < (candidate_t, candidate_d):
-                        best_candidate = candidate
-                        candidate_t, candidate_d = t, d
-
-        # Relocate: move one customer to another position.
-        for i in range(1, len(best) - 1):
-            customer = best[i]
-            shortened = best[:i] + best[i + 1:]
-            for j in range(1, len(shortened)):
-                candidate = shortened[:j] + [customer] + shortened[j:]
-                t, d = route_totals(candidate)
-                if t < candidate_t - 0.5 and d < candidate_d - 0.5:
-                    if best_candidate is None or (t, d) < (candidate_t, candidate_d):
-                        best_candidate = candidate
-                        candidate_t, candidate_d = t, d
-
-        # Swap: exchange any two customers.
-        for i in range(1, len(best) - 2):
-            for j in range(i + 1, len(best) - 1):
-                candidate = best[:]
-                candidate[i], candidate[j] = candidate[j], candidate[i]
-                t, d = route_totals(candidate)
-                if t < candidate_t - 0.5 and d < candidate_d - 0.5:
-                    if best_candidate is None or (t, d) < (candidate_t, candidate_d):
-                        best_candidate = candidate
-                        candidate_t, candidate_d = t, d
-
-        if best_candidate is None:
-            break
-
-        best = best_candidate
-        best_t, best_d = candidate_t, candidate_d
-        changed = True
-
-        if not changed:
-            break
-
-    return best
-
-
 def route_locality_breaks(route, distances):
     """Count obvious leave-an-area-and-return-later situations.
 
@@ -2368,7 +2287,7 @@ def optimise_route(
     driver_results.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
 
     if not structured_results and not fallback_results:
-        return pareto_road_polish(driver_results[0][4], distances, durations) if driver_results else None
+        return driver_results[0][4] if driver_results else None
     if not driver_results:
         if structured_results and fallback_results:
             best_structured = structured_results[0]
@@ -2376,12 +2295,11 @@ def optimise_route(
             time_ratio = best_structured[1] / max(best_fallback[1], 1.0)
             distance_ratio = best_structured[2] / max(best_fallback[2], 1.0)
             if time_ratio <= 1.20 and distance_ratio <= 1.20:
-                return pareto_road_polish(best_structured[3], distances, durations)
+                return best_structured[3]
             if time_ratio * 0.60 + distance_ratio * 0.40 <= 1.16:
-                return pareto_road_polish(best_structured[3], distances, durations)
-            return pareto_road_polish(best_fallback[3], distances, durations)
-        base = structured_results[0][3] if structured_results else fallback_results[0][3]
-        return pareto_road_polish(base, distances, durations)
+                return best_structured[3]
+            return best_fallback[3]
+        return structured_results[0][3] if structured_results else fallback_results[0][3]
 
     # ------------------------------------------------------------
     # 4. Compare by road efficiency first, then route shape.
@@ -2395,7 +2313,7 @@ def optimise_route(
 
     benchmark_results = [x for x in benchmark_results if x]
     if not benchmark_results:
-        return pareto_road_polish(driver_route, distances, durations)
+        return driver_route
 
     # Find the best benchmark by actual road time/distance, not by a shape
     # penalty alone.  This keeps v25.3's 110.8-mile / 3h33 benchmark meaningful.
@@ -2413,16 +2331,108 @@ def optimise_route(
     time_ratio = driver_time / max(benchmark_time, 1.0)
     distance_ratio = driver_distance / max(benchmark_distance, 1.0)
 
-    # Keep the existing v25.21/v25.30 selection rules exactly as the first
-    # decision.  The only change is that whichever route wins is then given
-    # the strict Pareto polish below.
-    final_route = benchmark[3]
     if driver_breaks < benchmark_breaks and time_ratio <= 1.06 and distance_ratio <= 1.06:
-        final_route = driver_route
-    elif driver_breaks <= benchmark_breaks and time_ratio <= 1.00 and distance_ratio <= 1.00:
-        final_route = driver_route
+        return driver_route
 
-    return pareto_road_polish(final_route, distances, durations)
+    # If locality is tied, only use the driver construction when it is at least
+    # as efficient on both real road measures.
+    if driver_breaks <= benchmark_breaks and time_ratio <= 1.00 and distance_ratio <= 1.00:
+        return driver_route
+
+    return benchmark[3]
+
+
+def surgical_route_polish(route, distances, durations, max_passes=2):
+    """Safely polish the already-selected route without changing its strategy.
+
+    This is deliberately applied AFTER the v25.30 route has been selected.
+    A change is accepted only when the COMPLETE route gets shorter in both
+    real road driving time and real road distance.  There is no shape score,
+    postcode rule, zone rule, or alternate-route selection here.
+
+    The purpose is to catch small local ordering mistakes, such as a long
+    leg where moving one nearby job across the leg or reversing a short section
+    genuinely saves road time and mileage.  If no strict improvement exists,
+    the original v25.30 route is returned byte-for-byte in ordering.
+    """
+    if not route or len(route) < 5:
+        return route[:] if route else route
+
+    def totals(candidate):
+        total_time = 0.0
+        total_distance = 0.0
+        for i in range(len(candidate) - 1):
+            a = candidate[i]
+            b = candidate[i + 1]
+            total_time += float(durations[a][b])
+            total_distance += float(distances[a][b])
+        return total_time, total_distance
+
+    best = route[:]
+    best_time, best_distance = totals(best)
+
+    for _ in range(max_passes):
+        found = False
+
+        # --------------------------------------------------------
+        # 1. Single-customer relocation.
+        # --------------------------------------------------------
+        # Only move a stop if doing so improves the COMPLETE route in
+        # BOTH driving time and driving distance.
+        for i in range(1, len(best) - 1):
+            customer = best[i]
+            shortened = best[:i] + best[i + 1:]
+
+            for j in range(1, len(shortened)):
+                if j == i:
+                    continue
+
+                candidate = shortened[:j] + [customer] + shortened[j:]
+                candidate_time, candidate_distance = totals(candidate)
+
+                if (
+                    candidate_time < best_time - 0.5
+                    and candidate_distance < best_distance - 1.0
+                ):
+                    best = candidate
+                    best_time = candidate_time
+                    best_distance = candidate_distance
+                    found = True
+                    break
+
+            if found:
+                break
+
+        if found:
+            continue
+
+        # --------------------------------------------------------
+        # 2. Short 2-opt reversals.
+        # --------------------------------------------------------
+        # Restrict the reversal to at most four customer positions.
+        # This cannot reorganise the whole day.
+        for i in range(1, len(best) - 2):
+            for j in range(i + 1, min(len(best) - 1, i + 5)):
+                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
+                candidate_time, candidate_distance = totals(candidate)
+
+                if (
+                    candidate_time < best_time - 0.5
+                    and candidate_distance < best_distance - 1.0
+                ):
+                    best = candidate
+                    best_time = candidate_time
+                    best_distance = candidate_distance
+                    found = True
+                    break
+
+            if found:
+                break
+
+        if not found:
+            break
+
+    return best
 
 
 # ============================================================
@@ -2853,6 +2863,15 @@ if st.button(
     if not route:
         st.error("The route optimiser could not create a route.")
         st.stop()
+
+    # v25.33: surgical polish ONLY after the proven v25.30 route has been
+    # selected.  It can only replace the route when the COMPLETE route is
+    # strictly better in both live road time and live road distance.
+    route = surgical_route_polish(
+        route,
+        distances,
+        durations,
+    )
 
     metrics = route_metrics(
         route,
