@@ -2185,6 +2185,56 @@ def _micro_polish_route(route, distances, durations):
     return best
 
 
+def _route_time_distance(route, distances, durations):
+    """Return total live road distance and driving time for a route."""
+    total_d = 0.0
+    total_t = 0.0
+    for a, b in zip(route[:-1], route[1:]):
+        total_d += distances[a][b]
+        total_t += durations[a][b]
+    return total_d, total_t
+
+
+def _micro_polish_route(route, distances, durations):
+    """Conservative final polish; only accept improvements in both metrics."""
+    if not route or len(route) < 6:
+        return route[:]
+
+    best = route[:]
+    best_d, best_t = _route_time_distance(best, distances, durations)
+
+    for _ in range(2):
+        changed = False
+
+        # Adjacent swaps: safest possible local change.
+        for i in range(1, len(best) - 2):
+            candidate = best[:]
+            candidate[i], candidate[i + 1] = candidate[i + 1], candidate[i]
+            cand_d, cand_t = _route_time_distance(candidate, distances, durations)
+            if cand_t < best_t - 0.01 and cand_d < best_d - 0.01:
+                best, best_d, best_t = candidate, cand_d, cand_t
+                changed = True
+
+        # Move a stop by only one or two positions.
+        for i in range(1, len(best) - 1):
+            for shift in (-2, -1, 1, 2):
+                j = i + shift
+                if j < 1 or j >= len(best) - 1:
+                    continue
+                candidate = best[:]
+                customer = candidate.pop(i)
+                candidate.insert(j, customer)
+                cand_d, cand_t = _route_time_distance(candidate, distances, durations)
+                if cand_t < best_t - 0.01 and cand_d < best_d - 0.01:
+                    best, best_d, best_t = candidate, cand_d, cand_t
+                    changed = True
+
+        if not changed:
+            break
+
+    return best
+
+
 def optimise_route(
     distances,
     durations,
@@ -2391,6 +2441,8 @@ def optimise_route(
 
     return benchmark[3]
 # v25.34 surgical polish: accept only complete-route improvements in BOTH live time and distance.
+best_route = _micro_polish_route(best_route, distances, durations)
+return best_route# v25.34 surgical polish: accept only complete-route improvements in BOTH live time and distance.
 best_route = _micro_polish_route(best_route, distances, durations)
 return best_route
 
