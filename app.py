@@ -19,7 +19,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.35"
+APP_VERSION = "25.36"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2190,6 +2190,11 @@ def optimise_route(
             if key in seen:
                 continue
             seen.add(key)
+            # Keep the original construction candidate as well as its
+            # locally-improved version.  The local-search score is useful for
+            # improving a route, but it must never be allowed to hide a raw
+            # candidate that has better real road time/distance.
+            add_candidate(candidate)
             improved = improve_driver_sweep_route(
                 candidate, distances, durations, fuel_price, mpg, locations
             )
@@ -2229,6 +2234,10 @@ def optimise_route(
         if key in seen:
             continue
         seen.add(key)
+        # Preserve the raw greedy/insertion candidate too.  A weighted local
+        # search can improve its shape score while accidentally increasing
+        # the actual complete-route mileage or time.
+        add_candidate(candidate)
         improved = improve_route(
             candidate,
             distances,
@@ -2281,21 +2290,33 @@ def optimise_route(
 
     unique.sort(key=candidate_key)
 
-    # Keep a small deterministic shortlist and let the safe polish stage make
-    # final local improvements.  This avoids changing the result based on the
-    # order in which candidate builders happen to be evaluated.
-    shortlist = unique[:24]
+    # V25.36: do not throw away good raw candidates before the final comparison.
+    # The previous version kept only 24 routes after local-search processing.
+    # A candidate could have excellent complete-route mileage/time but be lost
+    # because improve_route preferred a different intermediate score.
+    #
+    # We therefore keep a broader deterministic shortlist and compare every
+    # retained route directly on the live road matrix.  No postcode or
+    # address-specific rules are involved.
+    shortlist = unique[:60]
 
-    best_route = shortlist[0]
-    best_key = candidate_key(best_route)
+    # Give each shortlisted route the same safe, complete-route polish.  This
+    # is deliberately done before the final ranking so a route that is already
+    # good but needs one small relocation/reversal is not overlooked.
+    polished = []
+    seen_polished = set()
+    for candidate in shortlist:
+        polished_candidate = surgical_route_polish(
+            candidate, distances, durations, max_passes=2
+        )
+        for version in (candidate, polished_candidate):
+            key = tuple(version)
+            if key not in seen_polished:
+                seen_polished.add(key)
+                polished.append(version)
 
-    for candidate in shortlist[1:]:
-        key = candidate_key(candidate)
-        if key < best_key:
-            best_route = candidate
-            best_key = key
-
-    return best_route
+    polished.sort(key=candidate_key)
+    return polished[0] if polished else shortlist[0]
 
 
 def surgical_route_polish(route, distances, durations, max_passes=2):
