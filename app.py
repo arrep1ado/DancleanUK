@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.31"
+APP_VERSION = "25.31.1"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2937,110 +2937,111 @@ if route_data:
 
 
 # ============================================================
-# ROUTE DECISION DIAGNOSTICS — v25.31
+# ROUTE DECISION DIAGNOSTICS — v25.31.1
 # ============================================================
 
 def build_route_decision_diagnostics(route, distances, durations, routing_df):
     """Analyse the existing route without changing it.
 
-    For every customer-to-customer decision, compare the chosen next stop
-    against the best road-time alternatives, including the best immediate
-    continuation after each alternative.  This is diagnostic only: it never
-    modifies the route or the optimiser's decision.
+    This is diagnostic only. Any diagnostic problem is contained here so it
+    can never prevent the normal route summary/dashboard from rendering.
     """
-    if not route or len(route) < 3:
-        return pd.DataFrame()
+    try:
+        if not route or len(route) < 3:
+            return pd.DataFrame()
 
-    records = []
-    customer_count = len(distances) - 1
+        records = []
 
-    def label(idx):
-        if idx == 0:
-            return "GRANTHAM DEPOT"
-        try:
-            row = routing_df.iloc[idx]
-            address = str(row.get("Address", "")).strip()
-            postcode = str(row.get("Postcode", "")).strip()
-            if address and address.lower() != "nan":
-                return f"{address} ({postcode})" if postcode else address
-            return postcode or f"STOP {idx}"
-        except Exception:
-            return f"STOP {idx}"
+        def safe_num(matrix, a, b, default=0.0):
+            try:
+                value = float(matrix[a][b])
+                if math.isfinite(value):
+                    return value
+            except Exception:
+                pass
+            return default
 
-    for pos in range(1, len(route) - 1):
-        current = route[pos]
-        chosen = route[pos + 1]
-        remaining = set(route[pos + 1:-1])
-        remaining.discard(chosen)
+        def label(idx):
+            if idx == 0:
+                return "GRANTHAM DEPOT"
+            try:
+                row = routing_df.iloc[int(idx)]
+                address = str(row.get("Address", "")).strip()
+                postcode = str(row.get("Postcode", "")).strip()
+                if address and address.lower() != "nan":
+                    return f"{address} ({postcode})" if postcode and postcode.lower() != "nan" else address
+                return postcode if postcode and postcode.lower() != "nan" else f"STOP {idx}"
+            except Exception:
+                return f"STOP {idx}"
 
-        alternatives = sorted(
-            remaining,
-            key=lambda j: (durations[current][j], distances[current][j], j),
-        )[:5]
+        for pos in range(1, len(route) - 1):
+            current = int(route[pos])
+            chosen = int(route[pos + 1])
+            remaining = {int(x) for x in route[pos + 1:-1]}
+            remaining.discard(chosen)
 
-        chosen_direct_t = durations[current][chosen]
-        chosen_direct_d = distances[current][chosen]
+            alternatives = sorted(
+                remaining,
+                key=lambda j: (
+                    safe_num(durations, current, j, 1e99),
+                    safe_num(distances, current, j, 1e99),
+                    j,
+                ),
+            )[:5]
 
-        def best_continuation(candidate, pool):
-            if not pool:
-                return 0.0, 0.0, None
-            nxt = min(
-                pool,
-                key=lambda j: (durations[candidate][j], distances[candidate][j], j),
+            chosen_direct_t = safe_num(durations, current, chosen)
+            chosen_direct_d = safe_num(distances, current, chosen)
+
+            def best_continuation(candidate, pool):
+                if not pool:
+                    return 0.0, 0.0, None
+                nxt = min(
+                    pool,
+                    key=lambda j: (
+                        safe_num(durations, candidate, j, 1e99),
+                        safe_num(distances, candidate, j, 1e99),
+                        j,
+                    ),
+                )
+                return (
+                    safe_num(durations, candidate, nxt),
+                    safe_num(distances, candidate, nxt),
+                    nxt,
+                )
+
+            chosen_next_t, chosen_next_d, chosen_next = best_continuation(
+                chosen, remaining
             )
-            return durations[candidate][nxt], distances[candidate][nxt], nxt
 
-        chosen_next_t, chosen_next_d, chosen_next = best_continuation(
-            chosen, remaining
-        )
+            for rank, alternative in enumerate(alternatives, start=1):
+                alt_pool = set(remaining)
+                alt_pool.discard(alternative)
+                alt_next_t, alt_next_d, alt_next = best_continuation(
+                    alternative, alt_pool
+                )
 
-        for rank, alternative in enumerate(alternatives, start=1):
-            alt_pool = set(remaining)
-            alt_pool.discard(alternative)
-            alt_next_t, alt_next_d, alt_next = best_continuation(
-                alternative, alt_pool
-            )
+                records.append({
+                    "Route Stop": pos,
+                    "Current": label(current),
+                    "Chosen Next": label(chosen),
+                    "Chosen Leg (min)": round(chosen_direct_t / 60.0, 1),
+                    "Chosen Leg (mi)": round(chosen_direct_d / 1609.344, 2),
+                    "Alternative Rank": rank,
+                    "Alternative": label(alternative),
+                    "Alt Leg (min)": round(safe_num(durations, current, alternative) / 60.0, 1),
+                    "Alt Leg (mi)": round(safe_num(distances, current, alternative) / 1609.344, 2),
+                    "Alt vs Chosen (min)": round((safe_num(durations, current, alternative) - chosen_direct_t) / 60.0, 1),
+                    "Alt vs Chosen (mi)": round((safe_num(distances, current, alternative) - chosen_direct_d) / 1609.344, 2),
+                    "Chosen Next Leg (min)": round(chosen_next_t / 60.0, 1),
+                    "Alt Next Leg (min)": round(alt_next_t / 60.0, 1),
+                    "2-Step Time Δ (min)": round((safe_num(durations, current, alternative) + alt_next_t - chosen_direct_t - chosen_next_t) / 60.0, 1),
+                    "Alt Continuation": label(alt_next) if alt_next is not None else "—",
+                    "Chosen Continuation": label(chosen_next) if chosen_next is not None else "—",
+                })
 
-            records.append({
-                "Route Stop": pos,
-                "Current": label(current),
-                "Chosen Next": label(chosen),
-                "Chosen Leg (min)": round(chosen_direct_t / 60.0, 1),
-                "Chosen Leg (mi)": round(chosen_direct_d / 1609.344, 2),
-                "Alternative Rank": rank,
-                "Alternative": label(alternative),
-                "Alt Leg (min)": round(durations[current][alternative] / 60.0, 1),
-                "Alt Leg (mi)": round(distances[current][alternative] / 1609.344, 2),
-                "Alt vs Chosen (min)": round(
-                    (durations[current][alternative] - chosen_direct_t) / 60.0, 1
-                ),
-                "Alt vs Chosen (mi)": round(
-                    (distances[current][alternative] - chosen_direct_d) / 1609.344, 2
-                ),
-                "Chosen Next Leg (min)": round(chosen_next_t / 60.0, 1),
-                "Alt Next Leg (min)": round(alt_next_t / 60.0, 1),
-                "2-Step Time Δ (min)": round(
-                    (
-                        durations[current][alternative]
-                        + alt_next_t
-                        - chosen_direct_t
-                        - chosen_next_t
-                    ) / 60.0,
-                    1,
-                ),
-                "Alt Continuation": label(alt_next) if alt_next is not None else "—",
-                "Chosen Continuation": label(chosen_next) if chosen_next is not None else "—",
-            })
-
-    if not records:
+        return pd.DataFrame(records)
+    except Exception:
         return pd.DataFrame()
-
-    result = pd.DataFrame(records)
-    result = result.sort_values(
-        ["Route Stop", "Alternative Rank"],
-        ascending=[True, True],
-    )
-    return result
 
 
 # ============================================================
@@ -3048,28 +3049,29 @@ def build_route_decision_diagnostics(route, distances, durations, routing_df):
 # ============================================================
 
 if route_data and "route" in locals() and route:
-    with st.expander("🔎 Route Decision Diagnostics (v25.31)", expanded=False):
-        diagnostic_df = build_route_decision_diagnostics(
-            route,
-            distances,
-            durations,
-            routing_df,
-        )
-
-        if diagnostic_df.empty:
-            st.info("No route decision diagnostics are available.")
-        else:
-            st.caption(
-                "Diagnostic only — this does not change the route. "
-                "It compares the chosen next stop with up to five road-time "
-                "alternatives and checks the best immediate continuation."
+    with st.expander("🔎 Route Decision Diagnostics (v25.31.1)", expanded=False):
+        try:
+            diagnostic_df = build_route_decision_diagnostics(
+                route,
+                distances,
+                durations,
+                routing_df,
             )
-            st.dataframe(
-                diagnostic_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
+            if diagnostic_df.empty:
+                st.info("No route decision diagnostics are available.")
+            else:
+                st.caption(
+                    "Diagnostic only — this does not change the route. "
+                    "It compares the chosen next stop with up to five road-time "
+                    "alternatives and checks the best immediate continuation."
+                )
+                st.dataframe(
+                    diagnostic_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        except Exception:
+            st.info("Route diagnostics could not be displayed, but the route and Daily Route Summary are unaffected.")
 
 # ============================================================
 # FAILED ADDRESSES
