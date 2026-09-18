@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.42"
+APP_VERSION = "25.43"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -3010,6 +3010,15 @@ if st.button(
     progress.empty()
 
     if failed_rows:
+        # Failed geocodes must never retain an old route position.
+        # Keep the customer in the database, but remove it from the route
+        # until its address can be located successfully.
+        for failed_idx in failed_rows:
+            df.at[failed_idx, "route_order"] = None
+            df.at[failed_idx, "latitude"] = None
+            df.at[failed_idx, "longitude"] = None
+            df.at[failed_idx, "geo_query"] = ""
+
         st.session_state.failed_jobs = (
             df.loc[failed_rows].copy()
         )
@@ -3166,6 +3175,7 @@ if st.button(
         "time": metrics["time_s"],
         "offline": using_offline,
         "jobs": len(valid_rows),
+        "unlocated": len(failed_rows),
         "completed": int(
             df["Status"]
             .astype(str)
@@ -3256,7 +3266,7 @@ if route_data:
 
     c7, c8, c9 = st.columns(3)
     with c7:
-        st.metric("Jobs", total_jobs)
+        st.metric("Jobs Routed", route_data.get("jobs", 0))
     with c8:
         st.metric("Completed", completed_jobs)
     with c9:
@@ -3363,8 +3373,12 @@ st.markdown("---")
 st.subheader("📍 Planned Route")
 
 # Completed jobs are kept in records but displayed separately.
+# Only located customers with a current route position belong in the
+# Planned Route. Unlocated customers stay in the database and appear only
+# in the unlocated-customer section.
 route_df = df[
-    df["Status"].astype(str).str.lower() != "completed"
+    (df["Status"].astype(str).str.lower() != "completed")
+    & df["route_order"].notna()
 ].copy()
 
 if "route_order" in route_df.columns:
