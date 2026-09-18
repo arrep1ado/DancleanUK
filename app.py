@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.43"
+APP_VERSION = "25.44"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -507,11 +507,13 @@ def cache_key_for(query, postcode):
 
 
 def ors_exact_geocode(query, postcode, expected_house_number="", expected_street=""):
-    """Find an address-level coordinate without silently using the postcode centroid.
+    """Find a genuine address-level coordinate using the current ORS Pelias API.
 
-    ORS/Pelias supports both structured and unstructured forward geocoding.
-    We try both forms and accept a result only when the returned label/address
-    is consistent with the requested house number and street.
+    V25.43 was calling the old/non-existent geocoding path.  That caused the
+    exact-address lookup to fail and then the postcode fallback returned the
+    same centroid for every house sharing a postcode.  V25.44 uses the current
+    api.heigit.org Pelias endpoints and never accepts a postcode-only result as
+    an exact house match.
     """
     expected_house_number = clean_val(expected_house_number)
     expected_street = clean_val(expected_street).lower()
@@ -553,9 +555,13 @@ def ors_exact_geocode(query, postcode, expected_house_number="", expected_street
         returned_street = clean_val(
             props.get("street")
             or props.get("streetname")
+            or props.get("address")
             or props.get("name")
         ).lower()
 
+        # Pelias can expose the house number/street in either structured
+        # properties or the returned label.  Accept either, but never accept
+        # a postcode-only result for a house-level request.
         house_match = (
             not expected_house_number
             or returned_house == expected_house_number
@@ -578,26 +584,33 @@ def ors_exact_geocode(query, postcode, expected_house_number="", expected_street
 
         return None
 
+    search_params = {
+        "text": query,
+        "size": 20,
+        "layers": "address",
+        "boundary.country": "GBR",
+    }
+
+    structured_params = {
+        "address": (
+            f"{expected_house_number} {expected_street}".strip()
+            if expected_house_number or expected_street
+            else query
+        ),
+        "postalcode": postcode_clean,
+        "country": "GBR",
+        "size": 20,
+        "layers": "address",
+    }
+
     endpoints = [
         (
-            "https://api.heigit.org/openrouteservice/geocode/search/structured",
-            {
-                "api_key": API_KEY,
-                "address": query,
-                "postalcode": postcode_clean,
-                "country": "GB",
-                "size": 20,
-                "layers": "address",
-            },
+            "https://api.heigit.org/pelias/v1/search/structured",
+            structured_params,
         ),
         (
-            "https://api.heigit.org/openrouteservice/geocode/search",
-            {
-                "api_key": API_KEY,
-                "text": query,
-                "size": 20,
-                "layers": "address",
-            },
+            "https://api.heigit.org/pelias/v1/search",
+            search_params,
         ),
     ]
 
@@ -627,7 +640,7 @@ def ors_exact_geocode(query, postcode, expected_house_number="", expected_street
 
 
 def geocode_candidates(query, postcode):
-    """Build address-first geocoding queries from today's imported record."""
+    """Build progressively broader address-first searches."""
     query = str(query or "").strip()
     postcode = normalise_postcode(postcode)
 
@@ -639,6 +652,12 @@ def geocode_candidates(query, postcode):
             candidates.append(value)
 
     add(query)
+
+    # A large number of UK address spreadsheets contain only house/street and
+    # postcode.  Adding Grantham for NG31 addresses helps Pelias/Nominatim
+    # resolve the street while the postcode still constrains the search.
+    if postcode.startswith("NG31") and "grantham" not in query.lower():
+        add(f"{query}, Grantham, United Kingdom")
 
     if postcode:
         street_part = query.replace(postcode, "").strip(" ,")
@@ -652,6 +671,7 @@ def geocode_candidates(query, postcode):
         add(f"{street_part}, United Kingdom")
 
     if postcode:
+        add(f"{street_part}, {postcode}, United Kingdom")
         add(f"{postcode}, United Kingdom")
 
     return candidates
@@ -664,7 +684,7 @@ def nominatim_search(
     expected_street=None,
     postcode=None,
 ):
-    """Address-aware Nominatim lookup with structured + free-text searches."""
+    """Address-aware Nominatim lookup with several exact-address forms."""
     expected_house_number = clean_val(expected_house_number)
     expected_street = clean_val(expected_street).lower()
     postcode = normalise_postcode(postcode or "")
@@ -674,8 +694,9 @@ def nominatim_search(
             "q": query,
             "format": "jsonv2",
             "addressdetails": 1,
-            "limit": 20,
+            "limit": 50,
             "countrycodes": "gb",
+            "dedupe": 0,
         },
     ]
 
@@ -691,7 +712,8 @@ def nominatim_search(
                 "country": "United Kingdom",
                 "format": "jsonv2",
                 "addressdetails": 1,
-                "limit": 20,
+                "limit": 50,
+                "dedupe": 0,
             }
         )
 
@@ -711,9 +733,7 @@ def nominatim_search(
                 address = item.get("address") or {}
                 display = clean_val(item.get("display_name")).lower()
 
-                returned_house = clean_val(
-                    address.get("house_number")
-                )
+                returned_house = clean_val(address.get("house_number"))
                 returned_road = clean_val(
                     address.get("road")
                     or address.get("pedestrian")
@@ -741,10 +761,7 @@ def nominatim_search(
                     continue
 
                 try:
-                    return (
-                        float(item["lat"]),
-                        float(item["lon"]),
-                    )
+                    return float(item["lat"]), float(item["lon"])
                 except Exception:
                     continue
 
@@ -754,30 +771,23 @@ def nominatim_search(
     return None
 
 
-# Legacy postcode coordinates are kept as an empty fallback map.
-# House-level addresses must never be silently collapsed onto a postcode
-# centroid. Exact address geocoding is required when a house number is given.
 LEGACY_POSTCODE_COORDS = {}
 
-def get_coords(query_string, postcode):
-    """Locate a customer with exact-address priority.
 
-    The route engine must not inherit stale coordinates or confuse several
-    houses sharing one postcode. Exact house/street matches are attempted
-    first. A postcode coordinate is only a last-resort fallback.
-    """
+def get_coords(query_string, postcode):
+    """Locate an address without collapsing house-level jobs to a postcode."""
     query = str(query_string or "").strip()
     postcode = normalise_postcode(postcode)
     key = cache_key_for(query, postcode)
 
-    if key in st.session_state.geocode_cache:
-        return st.session_state.geocode_cache[key]
+    cached = st.session_state.geocode_cache.get(key)
+    if cached is not None:
+        return cached
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/25.40"
+        "User-Agent": "DanCleanUKRouteOptimizer/25.44"
     }
 
-    # Extract a likely house number and street from the imported address.
     house_match = re.search(r"(?<!\d)(\d+[A-Za-z]?)\b", query)
     expected_house = house_match.group(1) if house_match else ""
 
@@ -786,26 +796,16 @@ def get_coords(query_string, postcode):
         tail = query[house_match.end():]
         expected_street = tail.split(",")[0].strip()
 
-    legacy_coord = LEGACY_POSTCODE_COORDS.get(postcode)
-
-    # First try ORS/Pelias with the exact house number + street + postcode.
-    # This avoids collapsing several houses onto one postcode centroid.
+    # Exact house lookup first.  This is the critical V25.44 fix.
     exact_ors = ors_exact_geocode(
         query,
         postcode,
         expected_house_number=expected_house,
         expected_street=expected_street,
     )
-
     if exact_ors is not None:
-        if legacy_coord is None or haversine_km(
-            legacy_coord[0],
-            legacy_coord[1],
-            exact_ors[0],
-            exact_ors[1],
-        ) <= 8.0:
-            st.session_state.geocode_cache[key] = exact_ors
-            return exact_ors
+        st.session_state.geocode_cache[key] = exact_ors
+        return exact_ors
 
     for candidate in geocode_candidates(query, postcode):
         coords = nominatim_search(
@@ -813,27 +813,17 @@ def get_coords(query_string, postcode):
             headers,
             expected_house_number=expected_house,
             expected_street=expected_street,
+            postcode=postcode,
         )
-
         if coords is not None:
-            if legacy_coord is not None:
-                if haversine_km(
-                    legacy_coord[0],
-                    legacy_coord[1],
-                    coords[0],
-                    coords[1],
-                ) > 8.0:
-                    coords = None
-
-            if coords is not None:
-                st.session_state.geocode_cache[key] = coords
-                return coords
-
+            st.session_state.geocode_cache[key] = coords
+            return coords
         time.sleep(0.35)
 
-    # Last resort: postcode coordinate. This is intentionally not preferred
-    # over an exact house result.
-    if postcode:
+    # Postcode coordinates are useful only when the spreadsheet contains no
+    # house number.  A house-level customer must never be silently assigned
+    # the postcode centroid because that collapses different houses together.
+    if not expected_house and postcode:
         for pc in dict.fromkeys([postcode, postcode.replace(" ", "")]):
             try:
                 response = requests.get(
@@ -851,14 +841,6 @@ def get_coords(query_string, postcode):
                             return coords
             except Exception:
                 pass
-
-    # Never silently collapse a house-level customer address onto a postcode
-    # centroid. That was the cause of 180/190/194/196 Queensway becoming one
-    # location. Postcode fallback is allowed only when no house number exists.
-    if not expected_house and postcode in LEGACY_POSTCODE_COORDS:
-        coords = LEGACY_POSTCODE_COORDS[postcode]
-        st.session_state.geocode_cache[key] = coords
-        return coords
 
     return None
 
