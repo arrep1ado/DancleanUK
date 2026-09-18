@@ -1,5 +1,6 @@
 import io
 import math
+import re
 import sqlite3
 import time
 from datetime import datetime, date
@@ -19,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.38"
+APP_VERSION = "25.39"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
