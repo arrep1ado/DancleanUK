@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.40"
+APP_VERSION = "25.41"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -507,98 +507,121 @@ def cache_key_for(query, postcode):
 
 
 def ors_exact_geocode(query, postcode, expected_house_number="", expected_street=""):
-    """Use the same ORS/Pelias service as routing for exact UK addresses.
+    """Find an address-level coordinate without silently using the postcode centroid.
 
-    This is attempted before Nominatim because the app already has an ORS API
-    key and ORS can return address-level geometry from its Pelias geocoder.
-    A result is accepted only when the returned address still matches the
-    requested house number/street.
+    ORS/Pelias supports both structured and unstructured forward geocoding.
+    We try both forms and accept a result only when the returned label/address
+    is consistent with the requested house number and street.
     """
     expected_house_number = clean_val(expected_house_number)
     expected_street = clean_val(expected_street).lower()
+    postcode_clean = normalise_postcode(postcode)
 
-    params = {
-        "api_key": API_KEY,
-        "address": query,
-        "postalcode": normalise_postcode(postcode),
-        "country": "GB",
-        "size": 8,
-        "layers": "address",
+    headers = {
+        "Authorization": API_KEY,
+        "Accept": "application/json",
     }
 
-    try:
-        response = requests.get(
-            "https://api.openrouteservice.org/geocode/search/structured",
-            params=params,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            timeout=20,
-        )
-
-        if response.status_code != 200:
+    def valid_feature(feature):
+        geometry = feature.get("geometry") or {}
+        coords = geometry.get("coordinates") or []
+        if len(coords) < 2:
             return None
 
-        data = response.json() or {}
-        features = data.get("features") or []
+        try:
+            lon = float(coords[0])
+            lat = float(coords[1])
+        except Exception:
+            return None
 
-        for feature in features:
-            geometry = feature.get("geometry") or {}
-            coords = geometry.get("coordinates") or []
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return None
 
-            if len(coords) < 2:
-                continue
+        props = feature.get("properties") or {}
+        label = clean_val(
+            props.get("label")
+            or props.get("name")
+            or feature.get("label")
+        ).lower()
 
-            try:
-                lon = float(coords[0])
-                lat = float(coords[1])
-            except Exception:
-                continue
+        returned_house = clean_val(
+            props.get("housenumber")
+            or props.get("house_number")
+            or props.get("number")
+        )
 
-            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                continue
+        returned_street = clean_val(
+            props.get("street")
+            or props.get("streetname")
+            or props.get("name")
+        ).lower()
 
-            props = feature.get("properties") or {}
-
-            returned_house = clean_val(
-                props.get("housenumber")
-                or props.get("house_number")
-                or props.get("number")
-            )
-
-            returned_street = clean_val(
-                props.get("street")
-                or props.get("streetname")
-                or props.get("name")
-            ).lower()
-
-            label = clean_val(
-                props.get("label")
-                or props.get("name")
-                or feature.get("label")
-            ).lower()
-
-            house_match = (
-                not expected_house_number
-                or returned_house == expected_house_number
-                or re.search(
-                    rf"\b{re.escape(expected_house_number)}\b",
+        house_match = (
+            not expected_house_number
+            or returned_house == expected_house_number
+            or bool(
+                re.search(
+                    rf"(?<!\d){re.escape(expected_house_number)}(?!\d)",
                     label,
                 )
             )
+        )
 
-            street_match = (
-                not expected_street
-                or expected_street in returned_street
-                or expected_street in label
+        street_match = (
+            not expected_street
+            or expected_street in returned_street
+            or expected_street in label
+        )
+
+        if house_match and street_match:
+            return (lat, lon)
+
+        return None
+
+    endpoints = [
+        (
+            "https://api.heigit.org/openrouteservice/geocode/search/structured",
+            {
+                "api_key": API_KEY,
+                "address": query,
+                "postalcode": postcode_clean,
+                "country": "GB",
+                "size": 20,
+                "layers": "address",
+            },
+        ),
+        (
+            "https://api.heigit.org/openrouteservice/geocode/search",
+            {
+                "api_key": API_KEY,
+                "text": query,
+                "size": 20,
+                "layers": "address",
+            },
+        ),
+    ]
+
+    for endpoint, params in endpoints:
+        try:
+            response = requests.get(
+                endpoint,
+                params=params,
+                headers=headers,
+                timeout=20,
             )
 
-            if house_match and street_match:
-                return (lat, lon)
+            if response.status_code != 200:
+                continue
 
-    except Exception:
-        pass
+            data = response.json() or {}
+
+            for feature in data.get("features") or []:
+                coords = valid_feature(feature)
+                if coords is not None:
+                    return coords
+
+        except Exception:
+            continue
 
     return None
 
@@ -634,98 +657,101 @@ def geocode_candidates(query, postcode):
     return candidates
 
 
-def nominatim_search(query, headers, expected_house_number=None, expected_street=None):
-    """Query Nominatim and prefer a result matching the supplied address.
-
-    A postcode can cover several houses.  For routing, silently turning
-    different house addresses into one postcode-centre coordinate is dangerous.
-    When a house number/street is available, only a result matching that
-    address is accepted as the exact geocode.
-    """
+def nominatim_search(
+    query,
+    headers,
+    expected_house_number=None,
+    expected_street=None,
+    postcode=None,
+):
+    """Address-aware Nominatim lookup with structured + free-text searches."""
     expected_house_number = clean_val(expected_house_number)
     expected_street = clean_val(expected_street).lower()
+    postcode = normalise_postcode(postcode or "")
 
-    for attempt in range(2):
+    searches = [
+        {
+            "q": query,
+            "format": "jsonv2",
+            "addressdetails": 1,
+            "limit": 20,
+            "countrycodes": "gb",
+        },
+    ]
+
+    if expected_street and postcode:
+        searches.append(
+            {
+                "street": (
+                    f"{expected_house_number} {expected_street}"
+                    if expected_house_number
+                    else expected_street
+                ),
+                "postalcode": postcode,
+                "country": "United Kingdom",
+                "format": "jsonv2",
+                "addressdetails": 1,
+                "limit": 20,
+            }
+        )
+
+    for params in searches:
         try:
             response = requests.get(
                 "https://nominatim.openstreetmap.org/search",
-                params={
-                    "q": query,
-                    "format": "json",
-                    "limit": 8,
-                    "countrycodes": "gb",
-                    "addressdetails": 1,
-                },
+                params=params,
                 headers=headers,
-                timeout=15,
+                timeout=20,
             )
 
-            if response.status_code == 200:
-                data = response.json() or []
-                valid = []
+            if response.status_code != 200:
+                continue
 
-                for item in data:
-                    try:
-                        lat = float(item["lat"])
-                        lon = float(item["lon"])
-                    except Exception:
-                        continue
+            for item in response.json() or []:
+                address = item.get("address") or {}
+                display = clean_val(item.get("display_name")).lower()
 
-                    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                        continue
+                returned_house = clean_val(
+                    address.get("house_number")
+                )
+                returned_road = clean_val(
+                    address.get("road")
+                    or address.get("pedestrian")
+                    or address.get("residential")
+                ).lower()
 
-                    address = item.get("address") or {}
-                    house = clean_val(
-                        address.get("house_number")
-                        or address.get("house")
-                    )
-                    road = clean_val(
-                        address.get("road")
-                        or address.get("pedestrian")
-                        or address.get("residential")
-                    ).lower()
-
-                    display = clean_val(item.get("display_name")).lower()
-
-                    house_match = (
-                        not expected_house_number
-                        or house == expected_house_number
-                        or re.search(
-                            rf"\b{re.escape(expected_house_number)}\b",
+                house_match = (
+                    not expected_house_number
+                    or returned_house == expected_house_number
+                    or bool(
+                        re.search(
+                            rf"(?<!\d){re.escape(expected_house_number)}(?!\d)",
                             display,
                         )
                     )
-                    street_match = (
-                        not expected_street
-                        or expected_street in road
-                        or expected_street in display
+                )
+
+                street_match = (
+                    not expected_street
+                    or expected_street in returned_road
+                    or expected_street in display
+                )
+
+                if not (house_match and street_match):
+                    continue
+
+                try:
+                    return (
+                        float(item["lat"]),
+                        float(item["lon"]),
                     )
-
-                    if house_match and street_match:
-                        valid.append((lat, lon))
-
-                if valid:
-                    return valid[0]
-
-            if response.status_code in (429, 500, 502, 503, 504):
-                time.sleep(1.5 * (attempt + 1))
-                continue
+                except Exception:
+                    continue
 
         except Exception:
-            if attempt == 0:
-                time.sleep(1.0)
+            continue
 
     return None
-
-
-# These are legacy Grantham postcodes that are no longer in use but may still
-# appear on genuine customer records.  The coordinates are postcode-area
-# coordinates, used only after the live geocoders fail.  This prevents a real
-# customer being silently removed from the route.
-LEGACY_POSTCODE_COORDS = {
-    "NG31 7AN": (52.909806, -0.640572),
-    "NG31 9EH": (52.909052, -0.630469),
-}
 
 
 def get_coords(query_string, postcode):
@@ -821,7 +847,10 @@ def get_coords(query_string, postcode):
             except Exception:
                 pass
 
-    if postcode in LEGACY_POSTCODE_COORDS:
+    # Never silently collapse a house-level customer address onto a postcode
+    # centroid. That was the cause of 180/190/194/196 Queensway becoming one
+    # location. Postcode fallback is allowed only when no house number exists.
+    if not expected_house and postcode in LEGACY_POSTCODE_COORDS:
         coords = LEGACY_POSTCODE_COORDS[postcode]
         st.session_state.geocode_cache[key] = coords
         return coords
@@ -892,7 +921,7 @@ def offline_matrix(locations):
 def get_ors_matrix(locations):
     try:
         response = requests.post(
-            "https://api.openrouteservice.org/v2/matrix/driving-car",
+            "https://api.heigit.org/openrouteservice/v2/matrix/driving-car",
             json={
                 "locations": locations,
                 "metrics": ["distance", "duration"],
