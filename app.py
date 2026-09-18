@@ -19,7 +19,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.37"
+APP_VERSION = "25.38"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -215,10 +215,11 @@ init_db()
 # ============================================================
 
 if st.session_state.get("app_version") != APP_VERSION:
-    old_cache = st.session_state.get("geocode_cache", {})
+    # Geocoding is part of route correctness. Never carry coordinates from an
+    # older app version into a new geocoding/route engine.
     st.session_state.clear()
     st.session_state.app_version = APP_VERSION
-    st.session_state.geocode_cache = old_cache
+    st.session_state.geocode_cache = {}
 
 if "geocode_cache" not in st.session_state:
     st.session_state.geocode_cache = {}
@@ -504,13 +505,7 @@ def cache_key_for(query, postcode):
 
 
 def geocode_candidates(query, postcode):
-    """Build several sensible geocoding queries.
-
-    Older/terminated postcodes are a particular problem in Grantham.  A
-    postcode can be perfectly valid historical customer data but no longer
-    be returned by postcodes.io.  In that situation we deliberately try the
-    street + town before giving up.
-    """
+    """Build address-first geocoding queries from today's imported record."""
     query = str(query or "").strip()
     postcode = normalise_postcode(postcode)
 
@@ -523,27 +518,34 @@ def geocode_candidates(query, postcode):
 
     add(query)
 
-    # If the imported address contains a postcode, remove it and explicitly
-    # add Grantham. This is much more reliable for old Grantham postcodes.
-    street_part = query
     if postcode:
-        street_part = street_part.replace(postcode, "").strip(" ,")
-        street_part = street_part.replace(postcode.replace(" ", ""), "").strip(" ,")
+        street_part = query.replace(postcode, "").strip(" ,")
+        street_part = street_part.replace(
+            postcode.replace(" ", ""), ""
+        ).strip(" ,")
+    else:
+        street_part = query
 
     if street_part:
-        add(f"{street_part}, Grantham, Lincolnshire, United Kingdom")
-        add(f"{street_part}, Grantham, United Kingdom")
+        add(f"{street_part}, United Kingdom")
 
     if postcode:
-        add(f"{postcode}, Grantham, Lincolnshire, United Kingdom")
-        add(f"{postcode}, Grantham, United Kingdom")
         add(f"{postcode}, United Kingdom")
 
     return candidates
 
 
-def nominatim_search(query, headers):
-    """Query Nominatim with a couple of retries and basic validation."""
+def nominatim_search(query, headers, expected_house_number=None, expected_street=None):
+    """Query Nominatim and prefer a result matching the supplied address.
+
+    A postcode can cover several houses.  For routing, silently turning
+    different house addresses into one postcode-centre coordinate is dangerous.
+    When a house number/street is available, only a result matching that
+    address is accepted as the exact geocode.
+    """
+    expected_house_number = clean_val(expected_house_number)
+    expected_street = clean_val(expected_street).lower()
+
     for attempt in range(2):
         try:
             response = requests.get(
@@ -551,7 +553,7 @@ def nominatim_search(query, headers):
                 params={
                     "q": query,
                     "format": "json",
-                    "limit": 3,
+                    "limit": 8,
                     "countrycodes": "gb",
                     "addressdetails": 1,
                 },
@@ -560,18 +562,51 @@ def nominatim_search(query, headers):
             )
 
             if response.status_code == 200:
-                data = response.json()
-                if data:
-                    # Prefer results that look like a UK/Grantham address.
-                    for item in data:
-                        try:
-                            lat = float(item["lat"])
-                            lon = float(item["lon"])
-                        except Exception:
-                            continue
+                data = response.json() or []
+                valid = []
 
-                        if -90 <= lat <= 90 and -180 <= lon <= 180:
-                            return (lat, lon)
+                for item in data:
+                    try:
+                        lat = float(item["lat"])
+                        lon = float(item["lon"])
+                    except Exception:
+                        continue
+
+                    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                        continue
+
+                    address = item.get("address") or {}
+                    house = clean_val(
+                        address.get("house_number")
+                        or address.get("house")
+                    )
+                    road = clean_val(
+                        address.get("road")
+                        or address.get("pedestrian")
+                        or address.get("residential")
+                    ).lower()
+
+                    display = clean_val(item.get("display_name")).lower()
+
+                    house_match = (
+                        not expected_house_number
+                        or house == expected_house_number
+                        or re.search(
+                            rf"\b{re.escape(expected_house_number)}\b",
+                            display,
+                        )
+                    )
+                    street_match = (
+                        not expected_street
+                        or expected_street in road
+                        or expected_street in display
+                    )
+
+                    if house_match and street_match:
+                        valid.append((lat, lon))
+
+                if valid:
+                    return valid[0]
 
             if response.status_code in (429, 500, 502, 503, 504):
                 time.sleep(1.5 * (attempt + 1))
@@ -595,18 +630,11 @@ LEGACY_POSTCODE_COORDS = {
 
 
 def get_coords(query_string, postcode):
-    """Locate a customer using address-first geocoding with fallbacks.
+    """Locate a customer with exact-address priority.
 
-    V24 changes only the geocoding priority used by V23:
-      1. cached successful result
-      2. Nominatim full address / street candidates
-      3. postcodes.io postcode centroid
-      4. known legacy-postcode coordinate fallback
-
-    The important difference is that customers sharing a postcode are now
-    given a chance to receive different coordinates when their full street
-    addresses are known.  This is especially important for multiple houses
-    on the same postcode, such as 180/190/194/196 Queensway.
+    The route engine must not inherit stale coordinates or confuse several
+    houses sharing one postcode. Exact house/street matches are attempted
+    first. A postcode coordinate is only a last-resort fallback.
     """
     query = str(query_string or "").strip()
     postcode = normalise_postcode(postcode)
@@ -615,30 +643,36 @@ def get_coords(query_string, postcode):
     if key in st.session_state.geocode_cache:
         return st.session_state.geocode_cache[key]
 
-    # --------------------------------------------------------
-    # 1-3. NOMINATIM FIRST - FULL ADDRESS / STREET CANDIDATES
-    # --------------------------------------------------------
-    # Try the complete customer address before falling back to a postcode
-    # centroid.  This prevents several different houses in the same postcode
-    # from automatically sharing one coordinate.
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/24.0"
+        "User-Agent": "DanCleanUKRouteOptimizer/25.38"
     }
 
-    # Known legacy Grantham postcodes must not accept an unverified remote
-    # Nominatim result. These postcodes already have safe Grantham fallback
-    # coordinates below, so clearly remote results are rejected.
+    # Extract a likely house number and street from the imported address.
+    house_match = re.search(r"(?<!\d)(\d+[A-Za-z]?)\b", query)
+    expected_house = house_match.group(1) if house_match else ""
+
+    expected_street = ""
+    if house_match:
+        tail = query[house_match.end():]
+        expected_street = tail.split(",")[0].strip()
+
     legacy_coord = LEGACY_POSTCODE_COORDS.get(postcode)
 
     for candidate in geocode_candidates(query, postcode):
-        coords = nominatim_search(candidate, headers)
+        coords = nominatim_search(
+            candidate,
+            headers,
+            expected_house_number=expected_house,
+            expected_street=expected_street,
+        )
+
         if coords is not None:
             if legacy_coord is not None:
-                # Reject a result that is clearly outside the known postcode
-                # area. This protects against an unrelated UK search match.
                 if haversine_km(
-                    legacy_coord[0], legacy_coord[1],
-                    coords[0], coords[1],
+                    legacy_coord[0],
+                    legacy_coord[1],
+                    coords[0],
+                    coords[1],
                 ) > 8.0:
                     coords = None
 
@@ -646,15 +680,10 @@ def get_coords(query_string, postcode):
                 st.session_state.geocode_cache[key] = coords
                 return coords
 
-        # Public Nominatim service asks clients to be considerate. Keep the
-        # existing short spacing between uncached requests.
         time.sleep(0.35)
 
-    # --------------------------------------------------------
-    # 4. POSTCODES.IO POSTCODE FALLBACK
-    # --------------------------------------------------------
-    # If the exact address cannot be located, use the normal postcode
-    # coordinate rather than losing the customer from the route.
+    # Last resort: postcode coordinate. This is intentionally not preferred
+    # over an exact house result.
     if postcode:
         for pc in dict.fromkeys([postcode, postcode.replace(" ", "")]):
             try:
@@ -674,9 +703,6 @@ def get_coords(query_string, postcode):
             except Exception:
                 pass
 
-    # --------------------------------------------------------
-    # 5. LEGACY POSTCODE FALLBACK
-    # --------------------------------------------------------
     if postcode in LEGACY_POSTCODE_COORDS:
         coords = LEGACY_POSTCODE_COORDS[postcode]
         st.session_state.geocode_cache[key] = coords
@@ -2244,7 +2270,7 @@ def optimise_route(
     mpg,
     locations=None,
 ):
-    """v25.37 FINAL: optimise the complete day on the real road matrix.
+    """v25.38 FINAL: optimise the complete day on the real road matrix.
 
     The optimiser is intentionally address-agnostic. Every day it receives
     the addresses uploaded for that day, builds many different complete-route
@@ -2868,6 +2894,38 @@ if st.button(
         )
 
     routing_df = pd.DataFrame(rows)
+
+    # Detect multiple different customer records receiving the same coordinate.
+    # This is a data-quality warning, not a hard-coded route rule.
+    coordinate_groups = {}
+    for idx in range(1, len(locations)):
+        coord_key = (
+            round(float(locations[idx][0]), 6),
+            round(float(locations[idx][1]), 6),
+        )
+        coordinate_groups.setdefault(coord_key, []).append(idx)
+
+    duplicate_groups = [
+        group for group in coordinate_groups.values()
+        if len(group) > 1
+    ]
+
+    if duplicate_groups:
+        duplicate_labels = []
+        for group in duplicate_groups:
+            labels = []
+            for idx in group:
+                labels.append(
+                    str(routing_df.iloc[idx].get("address_text", "customer"))
+                )
+            duplicate_labels.append(" / ".join(labels))
+
+        st.warning(
+            "⚠️ Multiple customer addresses resolved to the same map "
+            "coordinate. The route will use that coordinate, but exact "
+            "house-level routing could not be confirmed for: "
+            + "; ".join(duplicate_labels)
+        )
 
     with st.spinner(
         "🛣️ Getting actual road distances and driving times..."
