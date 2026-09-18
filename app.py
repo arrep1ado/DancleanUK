@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.39"
+APP_VERSION = "25.40"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -505,6 +505,104 @@ def cache_key_for(query, postcode):
     return (str(query).strip() + "|" + str(postcode).strip()).lower()
 
 
+
+def ors_exact_geocode(query, postcode, expected_house_number="", expected_street=""):
+    """Use the same ORS/Pelias service as routing for exact UK addresses.
+
+    This is attempted before Nominatim because the app already has an ORS API
+    key and ORS can return address-level geometry from its Pelias geocoder.
+    A result is accepted only when the returned address still matches the
+    requested house number/street.
+    """
+    expected_house_number = clean_val(expected_house_number)
+    expected_street = clean_val(expected_street).lower()
+
+    params = {
+        "api_key": API_KEY,
+        "address": query,
+        "postalcode": normalise_postcode(postcode),
+        "country": "GB",
+        "size": 8,
+        "layers": "address",
+    }
+
+    try:
+        response = requests.get(
+            "https://api.openrouteservice.org/geocode/search/structured",
+            params=params,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            return None
+
+        data = response.json() or {}
+        features = data.get("features") or []
+
+        for feature in features:
+            geometry = feature.get("geometry") or {}
+            coords = geometry.get("coordinates") or []
+
+            if len(coords) < 2:
+                continue
+
+            try:
+                lon = float(coords[0])
+                lat = float(coords[1])
+            except Exception:
+                continue
+
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                continue
+
+            props = feature.get("properties") or {}
+
+            returned_house = clean_val(
+                props.get("housenumber")
+                or props.get("house_number")
+                or props.get("number")
+            )
+
+            returned_street = clean_val(
+                props.get("street")
+                or props.get("streetname")
+                or props.get("name")
+            ).lower()
+
+            label = clean_val(
+                props.get("label")
+                or props.get("name")
+                or feature.get("label")
+            ).lower()
+
+            house_match = (
+                not expected_house_number
+                or returned_house == expected_house_number
+                or re.search(
+                    rf"\b{re.escape(expected_house_number)}\b",
+                    label,
+                )
+            )
+
+            street_match = (
+                not expected_street
+                or expected_street in returned_street
+                or expected_street in label
+            )
+
+            if house_match and street_match:
+                return (lat, lon)
+
+    except Exception:
+        pass
+
+    return None
+
+
 def geocode_candidates(query, postcode):
     """Build address-first geocoding queries from today's imported record."""
     query = str(query or "").strip()
@@ -645,7 +743,7 @@ def get_coords(query_string, postcode):
         return st.session_state.geocode_cache[key]
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/25.38"
+        "User-Agent": "DanCleanUKRouteOptimizer/25.40"
     }
 
     # Extract a likely house number and street from the imported address.
@@ -658,6 +756,25 @@ def get_coords(query_string, postcode):
         expected_street = tail.split(",")[0].strip()
 
     legacy_coord = LEGACY_POSTCODE_COORDS.get(postcode)
+
+    # First try ORS/Pelias with the exact house number + street + postcode.
+    # This avoids collapsing several houses onto one postcode centroid.
+    exact_ors = ors_exact_geocode(
+        query,
+        postcode,
+        expected_house_number=expected_house,
+        expected_street=expected_street,
+    )
+
+    if exact_ors is not None:
+        if legacy_coord is None or haversine_km(
+            legacy_coord[0],
+            legacy_coord[1],
+            exact_ors[0],
+            exact_ors[1],
+        ) <= 8.0:
+            st.session_state.geocode_cache[key] = exact_ors
+            return exact_ors
 
     for candidate in geocode_candidates(query, postcode):
         coords = nominatim_search(
