@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.41"
+APP_VERSION = "25.42"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -753,6 +753,11 @@ def nominatim_search(
 
     return None
 
+
+# Legacy postcode coordinates are kept as an empty fallback map.
+# House-level addresses must never be silently collapsed onto a postcode
+# centroid. Exact address geocoding is required when a house number is given.
+LEGACY_POSTCODE_COORDS = {}
 
 def get_coords(query_string, postcode):
     """Locate a customer with exact-address priority.
@@ -3785,4 +3790,3 @@ if not export_df.empty:
 
 st.sidebar.caption(
     f"DanCleanUK Route Optimizer v{APP_VERSION}"
-)
