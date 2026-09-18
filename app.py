@@ -19,7 +19,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.36"
+APP_VERSION = "25.37"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2135,6 +2135,108 @@ def route_locality_breaks(route, distances):
     return breaks
 
 
+def _complete_route_metrics(route, distances, durations):
+    """Return exact whole-route driving time and distance from the road matrix."""
+    total_time = 0.0
+    total_distance = 0.0
+    for i in range(len(route) - 1):
+        a = route[i]
+        b = route[i + 1]
+        total_time += float(durations[a][b])
+        total_distance += float(distances[a][b])
+    return total_time, total_distance
+
+
+def _practical_route_key(route, distances, durations):
+    """Whole-day objective used by the final optimiser.
+
+    Time remains the strongest factor, but mileage is deliberately included.
+    The coefficient means that a meaningful mileage saving can justify a small
+    time increase, while a large time increase cannot be hidden by a few miles.
+    This is a route-planning objective, not a postcode/geography rule.
+    """
+    total_time, total_distance = _complete_route_metrics(
+        route, distances, durations
+    )
+    # 0.18 seconds of objective weight per metre ~= 4.83 minutes per mile.
+    practical_score = total_time + (total_distance * 0.18)
+    return (
+        practical_score,
+        total_time,
+        total_distance,
+        route_locality_breaks(route, distances),
+        tuple(route),
+    )
+
+
+def _route_search(route, distances, durations, max_rounds=3):
+    """Deep deterministic whole-route improvement.
+
+    Unlike the old neighbouring-stop polish, this searches the complete route
+    for 2-opt reversals and Or-opt relocations.  A move may therefore move a
+    customer across a large part of the day when that genuinely improves the
+    complete road journey.  Depot remains fixed at both ends.
+    """
+    if not route or len(route) < 5:
+        return route[:]
+
+    best = route[:]
+    best_key = _practical_route_key(best, distances, durations)
+    n = len(best)
+
+    for _ in range(max_rounds):
+        changed = False
+
+        # 2-opt: reverse every possible internal section.  This is the main
+        # anti-zigzag move because it changes the order of an entire pocket.
+        for i in range(1, n - 2):
+            for j in range(i + 1, n - 1):
+                candidate = best[:]
+                candidate[i:j + 1] = reversed(candidate[i:j + 1])
+                key = _practical_route_key(candidate, distances, durations)
+                if key < best_key:
+                    best = candidate
+                    best_key = key
+                    changed = True
+
+        # Or-opt: move one, two, or three consecutive jobs to another place.
+        # This is particularly useful when a sweep has one address stranded
+        # on the wrong side of a territory.
+        for block_size in (1, 2, 3):
+            if block_size >= n - 2:
+                continue
+            i = 1
+            while i + block_size < n - 1:
+                block = best[i:i + block_size]
+                remainder = best[:i] + best[i + block_size:]
+                moved = False
+
+                for j in range(1, len(remainder)):
+                    if j == i:
+                        continue
+                    candidate = remainder[:j] + block + remainder[j:]
+                    key = _practical_route_key(candidate, distances, durations)
+                    if key < best_key:
+                        best = candidate
+                        best_key = key
+                        n = len(best)
+                        changed = True
+                        moved = True
+                        break
+
+                if moved:
+                    # Restart the scan from the beginning after every accepted
+                    # relocation so improvements are never missed.
+                    i = 1
+                    continue
+                i += 1
+
+        if not changed:
+            break
+
+    return best
+
+
 def optimise_route(
     distances,
     durations,
@@ -2142,19 +2244,18 @@ def optimise_route(
     mpg,
     locations=None,
 ):
-    """Build a deterministic route and select the best real-road candidate.
+    """v25.37 FINAL: optimise the complete day on the real road matrix.
 
-    v25.35 keeps the deterministic candidate generation from v25.34 but fixes
-    an important selection weakness: the optimiser previously compared only
-    the single best structured route and single best fallback route.  A good
-    route could therefore exist in the candidate pool but never reach the
-    final comparison.
+    The optimiser is intentionally address-agnostic. Every day it receives
+    the addresses uploaded for that day, builds many different complete-route
+    starting solutions, then performs a deeper whole-route search on the best
+    candidates. There are no rules for Queensway, Grantham, particular
+    postcodes, villages, or a fixed maximum driving time.
 
-    The final selection now considers a broad, deterministic shortlist and
-    ranks it by live road driving time first, then live road distance, with
-    locality breaks used only as a tie-break.  This keeps the optimisation
-    dynamic for new daily addresses while avoiding postcode/address-specific
-    rules.
+    The depot is always the first and last node. Every customer is visited
+    exactly once. Final selection uses the same practical time+mileage
+    objective as the improvement search, with exact road time as the next
+    tie-break and mileage after that.
     """
     customer_count = len(distances) - 1
     if customer_count <= 0:
@@ -2163,160 +2264,117 @@ def optimise_route(
     candidates = []
 
     def add_candidate(candidate):
-        if not candidate or len(candidate) != customer_count + 2:
+        if not candidate:
+            return
+        if len(candidate) != customer_count + 2:
             return
         if candidate[0] != 0 or candidate[-1] != 0:
             return
-        candidates.append(candidate)
+        if set(candidate[1:-1]) != set(range(1, customer_count + 1)):
+            return
+        candidates.append(candidate[:])
 
-    # ------------------------------------------------------------
-    # 1. Geographic / territory candidates.
-    # ------------------------------------------------------------
+    # 1. Keep all existing address-agnostic route families.  These provide
+    # different whole-day structures rather than relying on one greedy rule.
     if locations is not None:
-        structured_candidates = []
-        structured_candidates.extend(
+        structured = []
+        structured.extend(
             build_driver_sweep_routes(locations, distances, durations)
         )
-        structured_candidates.extend(
+        structured.extend(
             directional_sector_routes(locations, distances, durations)
         )
-        structured_candidates.extend(
+        structured.extend(
             geographic_zone_routes(locations)
         )
+        for route in structured:
+            add_candidate(route)
 
-        seen = set()
-        for candidate in structured_candidates:
-            key = tuple(candidate)
-            if key in seen:
-                continue
-            seen.add(key)
-            # Keep the original construction candidate as well as its
-            # locally-improved version.  The local-search score is useful for
-            # improving a route, but it must never be allowed to hide a raw
-            # candidate that has better real road time/distance.
-            add_candidate(candidate)
-            improved = improve_driver_sweep_route(
-                candidate, distances, durations, fuel_price, mpg, locations
-            )
-            add_candidate(improved)
-
-    # ------------------------------------------------------------
-    # 2. Road-efficient greedy candidates from multiple starts.
-    # ------------------------------------------------------------
+    # 2. Multi-start road greedy routes.  For small/medium daily lists we can
+    # afford every possible first customer.  For larger lists we sample the
+    # starts deterministically from both ends of depot proximity plus evenly
+    # spaced positions.
     starts = list(range(1, customer_count + 1))
     starts.sort(key=lambda x: (durations[0][x], distances[0][x], x))
 
-    if customer_count > 40:
-        selected = starts[:12] + starts[-12:] + starts[::max(1, customer_count // 12)]
-        starts = list(dict.fromkeys(selected))
+    if customer_count > 60:
+        picks = starts[:20] + starts[-20:]
+        step = max(1, customer_count // 20)
+        picks.extend(starts[::step])
+        starts = list(dict.fromkeys(picks))
 
-    fallback_candidates = []
     for first_customer in starts:
-        fallback_candidates.append(
-            build_greedy_route(first_customer, distances, durations, "time")
-        )
-        fallback_candidates.append(
-            build_greedy_route(first_customer, distances, durations, "balanced")
-        )
-        fallback_candidates.append(
-            build_greedy_route(first_customer, distances, durations, "distance")
-        )
+        for mode in ("time", "balanced", "distance"):
+            add_candidate(
+                build_greedy_route(
+                    first_customer,
+                    distances,
+                    durations,
+                    mode,
+                )
+            )
 
+    # 3. Cheapest insertion gives a different construction family and often
+    # finds routes greedy construction cannot reach.
     insertion = cheapest_insertion_route(distances, durations)
     if insertion:
-        fallback_candidates.append(insertion)
+        add_candidate(insertion)
         if len(insertion) > 3:
-            fallback_candidates.append([0] + insertion[1:-1][::-1] + [0])
+            add_candidate([0] + insertion[1:-1][::-1] + [0])
 
-    seen = set()
-    for candidate in fallback_candidates:
-        key = tuple(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-        # Preserve the raw greedy/insertion candidate too.  A weighted local
-        # search can improve its shape score while accidentally increasing
-        # the actual complete-route mileage or time.
-        add_candidate(candidate)
-        improved = improve_route(
-            candidate,
-            distances,
-            durations,
-            fuel_price,
-            mpg,
-            locations,
-            preserve_structure=False,
+    # 4. Driver-style pocket routes from multiple starts.  They are retained
+    # as candidates, not treated as the final truth.
+    for first_customer in starts[:min(20, len(starts))]:
+        add_candidate(
+            build_nearest_pocket_route(
+                distances,
+                durations,
+                first_customer,
+            )
         )
-        add_candidate(improved)
-
-    # ------------------------------------------------------------
-    # 3. True current-location driver routes.
-    # ------------------------------------------------------------
-    driver_starts = starts[:min(12, len(starts))]
-    for first_customer in driver_starts:
-        driver_route = build_nearest_pocket_route(
-            distances, durations, first_customer
-        )
-        add_candidate(driver_route)
 
     if not candidates:
         return None
 
-    # ------------------------------------------------------------
-    # 4. Deterministic de-duplication and real-road ranking.
-    # ------------------------------------------------------------
+    # Deterministic de-duplication.
     unique = []
     seen = set()
-    for candidate in candidates:
-        key = tuple(candidate)
+    for route in candidates:
+        key = tuple(route)
         if key not in seen:
             seen.add(key)
-            unique.append(candidate)
+            unique.append(route)
 
-    def candidate_key(route):
-        total_time = sum(
-            float(durations[route[i]][route[i + 1]])
-            for i in range(len(route) - 1)
-        )
-        total_distance = sum(
-            float(distances[route[i]][route[i + 1]])
-            for i in range(len(route) - 1)
-        )
-        breaks = route_locality_breaks(route, distances)
-        # Time is the primary road-efficiency measure, distance the second.
-        # Locality is deliberately only a tie-break so it cannot create a
-        # large mileage/time detour. The route tuple makes final ties stable.
-        return (total_time, total_distance, breaks, tuple(route))
+    # First retain the best construction routes under the actual whole-day
+    # objective.  We deliberately keep a broad pool so a good route is not
+    # discarded merely because its construction family ranked lower.
+    unique.sort(key=lambda r: _practical_route_key(r, distances, durations))
+    construction_pool = unique[:80]
 
-    unique.sort(key=candidate_key)
+    # Add a spread of additional candidates from the remaining construction
+    # families.  This preserves diversity without making the Streamlit app
+    # perform an expensive deep search on every raw route.
+    if len(unique) > 80:
+        tail_step = max(1, len(unique) // 20)
+        construction_pool.extend(unique[::tail_step][:20])
 
-    # V25.36: do not throw away good raw candidates before the final comparison.
-    # The previous version kept only 24 routes after local-search processing.
-    # A candidate could have excellent complete-route mileage/time but be lost
-    # because improve_route preferred a different intermediate score.
-    #
-    # We therefore keep a broader deterministic shortlist and compare every
-    # retained route directly on the live road matrix.  No postcode or
-    # address-specific rules are involved.
-    shortlist = unique[:60]
+    # 5. Deep whole-route search.  This is the important change in v25.37:
+    # the optimiser is no longer limited to adjacent swaps or a tiny polish.
+    # Each selected candidate can be globally reordered by 2-opt and Or-opt.
+    refined = []
+    seen_refined = set()
+    for route in construction_pool:
+        improved = _route_search(route, distances, durations, max_rounds=3)
+        key = tuple(improved)
+        if key not in seen_refined:
+            seen_refined.add(key)
+            refined.append(improved)
 
-    # Give each shortlisted route the same safe, complete-route polish.  This
-    # is deliberately done before the final ranking so a route that is already
-    # good but needs one small relocation/reversal is not overlooked.
-    polished = []
-    seen_polished = set()
-    for candidate in shortlist:
-        polished_candidate = surgical_route_polish(
-            candidate, distances, durations, max_passes=2
-        )
-        for version in (candidate, polished_candidate):
-            key = tuple(version)
-            if key not in seen_polished:
-                seen_polished.add(key)
-                polished.append(version)
+    if not refined:
+        refined = construction_pool
 
-    polished.sort(key=candidate_key)
-    return polished[0] if polished else shortlist[0]
+    refined.sort(key=lambda r: _practical_route_key(r, distances, durations))
+    return refined[0]
 
 
 def surgical_route_polish(route, distances, durations, max_passes=2):
@@ -2841,7 +2899,7 @@ if st.button(
         st.error("The route optimiser could not create a route.")
         st.stop()
 
-    # v25.33: surgical polish ONLY after the proven v25.30 route has been
+    # v25.37: final whole-route polish after complete-day optimisation has been
     # selected.  It can only replace the route when the COMPLETE route is
     # strictly better in both live road time and live road distance.
     route = surgical_route_polish(
