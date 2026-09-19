@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "25.54"
+APP_VERSION = "25.55"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -818,7 +818,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/25.52"
+                    "User-Agent": "DanCleanUKRouteOptimizer/25.55"
                 },
                 timeout=20,
             )
@@ -881,10 +881,94 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
     return None
 
 
+def arcgis_exact_geocode(query, postcode, expected_house_number="", expected_street=""):
+    """Try the public ArcGIS World geocoder for a house-level address point.
+
+    This is another exact-address source only.  A result is accepted when the
+    returned match text contains the requested house number and street.  The
+    postcode-distance safety check remains in get_coords(), so a bad result
+    cannot create a distant route.
+    """
+    expected_house_number = clean_val(expected_house_number)
+    expected_street = clean_val(expected_street).lower()
+    postcode = normalise_postcode(postcode)
+
+    queries = []
+    base = str(query or "").strip()
+    if base:
+        queries.append(base)
+    if expected_house_number and expected_street and postcode:
+        queries.append(
+            f"{expected_house_number} {expected_street}, {postcode}, United Kingdom"
+        )
+
+    for search_query in dict.fromkeys(queries):
+        try:
+            response = requests.get(
+                "https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates",
+                params={
+                    "SingleLine": search_query,
+                    "countryCode": "GBR",
+                    "outFields": "*",
+                    "maxLocations": 20,
+                    "f": "json",
+                },
+                headers={
+                    "User-Agent": "DanCleanUKRouteOptimizer/25.55"
+                },
+                timeout=20,
+            )
+
+            if response.status_code != 200:
+                continue
+
+            data = response.json() or {}
+            for candidate in data.get("candidates") or []:
+                location = candidate.get("location") or {}
+                try:
+                    lon = float(location.get("x"))
+                    lat = float(location.get("y"))
+                except Exception:
+                    continue
+
+                if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                    continue
+
+                attrs = candidate.get("attributes") or {}
+                match_text = clean_val(
+                    candidate.get("address")
+                    or attrs.get("Match_addr")
+                    or attrs.get("LongLabel")
+                    or attrs.get("ShortLabel")
+                ).lower()
+
+                house_match = (
+                    not expected_house_number
+                    or bool(
+                        re.search(
+                            rf"(?<!\d){re.escape(expected_house_number)}(?!\d)",
+                            match_text,
+                        )
+                    )
+                )
+                street_match = (
+                    not expected_street
+                    or expected_street in match_text
+                )
+
+                if house_match and street_match:
+                    return (lat, lon)
+
+        except Exception:
+            continue
+
+    return None
+
+
 def get_coords(query_string, postcode):
     """Locate an address safely with house-level lookup before postcode fallback.
 
-    V25.52 changes ONLY the geocoding layer. The V25.51 route/economic
+    V25.55 changes ONLY the geocoding layer. The V25.51 route/economic
     optimiser is deliberately left untouched.
 
     Exact house/street sources are tried first. Every exact result is checked
@@ -901,7 +985,7 @@ def get_coords(query_string, postcode):
         return cached
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/25.52"
+        "User-Agent": "DanCleanUKRouteOptimizer/25.55"
     }
 
     # Extract a likely house number and street from the imported address.
@@ -966,9 +1050,22 @@ def get_coords(query_string, postcode):
             return coords
         time.sleep(0.35)
 
-    # 3. Additional OSM/Photon house-level lookup. This is particularly useful
-    # when several houses share the same postcode, such as 180/190/194/196
-    # Queensway. It is still protected by the postcode safety anchor.
+    # 3. Additional ArcGIS house-level lookup. This gives the app another
+    # independent address source when OSM does not expose individual houses.
+    # It is still protected by the postcode safety anchor below.
+    arcgis = arcgis_exact_geocode(
+        query,
+        postcode,
+        expected_house_number=expected_house,
+        expected_street=expected_street,
+    )
+    arcgis = safe_exact(arcgis)
+    if arcgis is not None:
+        st.session_state.geocode_cache[key] = arcgis
+        return arcgis
+
+    # 4. Additional OSM/Photon house-level lookup. It remains protected by
+    # the same postcode safety anchor.
     photon = photon_exact_geocode(
         query,
         postcode,
@@ -980,12 +1077,12 @@ def get_coords(query_string, postcode):
         st.session_state.geocode_cache[key] = photon
         return photon
 
-    # 4. Safe fallback: retain the customer at the official postcode point.
+    # 5. Safe fallback: retain the customer at the official postcode point.
     if postcode_anchor is not None:
         st.session_state.geocode_cache[key] = postcode_anchor
         return postcode_anchor
 
-    # 5. Historical Grantham postcode fallback.
+    # 6. Historical Grantham postcode fallback.
     legacy = LEGACY_POSTCODE_COORDS.get(postcode)
     if legacy is not None:
         st.session_state.geocode_cache[key] = legacy
