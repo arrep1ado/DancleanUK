@@ -17,10 +17,10 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 # ============================================================
 # DAN CLEAN UK - DAILY ROUTE OPTIMIZER
-# Version 14.0
+# Version 25.49
 # ============================================================
 
-APP_VERSION = "25.46"
+APP_VERSION = "25.51"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -386,35 +386,18 @@ ACCOUNT_NUMBER = st.sidebar.text_input(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🧠 Route Priorities")
+st.sidebar.subheader("🧠 Route Optimisation")
 
-TIME_PRIORITY = st.sidebar.slider(
-    "Driving Time Priority",
-    1,
-    10,
-    10,
-)
-
-DISTANCE_PRIORITY = st.sidebar.slider(
-    "Distance/Fuel Priority",
-    1,
-    10,
-    7,
-)
-
-CLUSTER_PRIORITY = st.sidebar.slider(
-    "Stay Near Nearby Jobs",
-    1,
-    10,
-    9,
-)
+# V25.49 uses one consistent whole-day economic objective.
+# There are deliberately no separate time/distance/nearby sliders.
+# Those competing filters could override the route search itself.
+DRIVING_TIME_VALUE_PER_HOUR = 6.0
 
 st.sidebar.caption(
-    "Higher values make that factor more important. "
-    "The optimiser considers multiple possible starting customers "
-    "instead of forcing the closest customer to be first."
+    "The optimiser compares complete routes using actual road fuel cost "
+    "plus a modest value for driving time. It does not impose a driving-time "
+    "limit or force nearby customers to be consecutive."
 )
-
 
 # ============================================================
 # API KEY
@@ -824,7 +807,7 @@ def get_coords(query_string, postcode):
         return cached
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/25.45"
+        "User-Agent": "DanCleanUKRouteOptimizer/25.49"
     }
 
     # Extract a likely house number and street from the imported address.
@@ -1036,19 +1019,18 @@ def route_score(
     mpg,
     locations=None,
 ):
-    """
-    Score a complete route.
+    """Single economic objective for the complete route.
 
-    The important change in v14 is that route shape is now treated as a
-    first-class objective.  The previous optimiser could find a route with
-    reasonable total mileage while still jumping out of one dense area and
-    then coming back later.  That is exactly the behaviour we want to avoid.
+    V25.49 deliberately removes the old time/distance/cluster/shape scoring
+    system. The optimiser is no longer asked to satisfy several competing
+    filters. It simply compares the complete driving day using: 
 
-    We therefore score:
-      1. real road driving time
-      2. real road driving distance
-      3. strong continuity / backtracking penalties
-      4. a small geographic-shape penalty when coordinates are available
+      * actual road fuel cost
+      * a modest value assigned to driving time
+
+    Geographic proximity is therefore allowed to help naturally through the
+    real road mileage/time, but it cannot veto a route that is economically
+    better overall.
     """
     metrics = route_metrics(
         route,
@@ -1058,472 +1040,76 @@ def route_score(
         mpg,
     )
 
-    driving_minutes = metrics["time_s"] / 60.0
-    driving_miles = metrics["miles"]
+    driving_hours = metrics["time_s"] / 3600.0
+    return metrics["fuel_cost"] + (driving_hours * DRIVING_TIME_VALUE_PER_HOUR)
 
-    continuity = calculate_continuity_penalty(route, distances)
 
-    zone_penalty = 0.0
-    if locations is not None:
-        zone_penalty = calculate_zone_penalty(route, locations)
 
-    shape_penalty = 0.0
-    backtrack_penalty = 0.0
-    if locations is not None:
-        shape_penalty = calculate_shape_penalty(route, locations)
-        backtrack_penalty = calculate_geographic_backtracking_penalty(route, locations)
 
-    return (
-        driving_minutes * TIME_PRIORITY
-        + driving_miles * DISTANCE_PRIORITY
-        + continuity * CLUSTER_PRIORITY * 10.0
-        + zone_penalty * CLUSTER_PRIORITY * 1.80
-        + shape_penalty * CLUSTER_PRIORITY * 0.90
-        + backtrack_penalty * CLUSTER_PRIORITY * 1.80
-    )
 
 
-def calculate_continuity_penalty(route, distances):
-    """
-    Strongly discourage leaving a dense local group while nearby work remains.
 
-    The value returned is expressed in miles so the final route score remains
-    easy to reason about.
-    """
-    if len(route) <= 3:
-        return 0.0
 
-    customers = set(route[1:-1])
-    penalty = 0.0
 
-    for pos in range(1, len(route) - 1):
-        current = route[pos]
-        next_stop = route[pos + 1]
-        remaining = customers.difference(route[:pos + 1])
 
-        if not remaining:
-            continue
 
-        next_miles = distances[current][next_stop] / 1609.344
-        remaining_miles = {
-            job: distances[current][job] / 1609.344
-            for job in remaining
-        }
 
-        nearby_2 = [m for m in remaining_miles.values() if m <= 2.0]
-        nearby_4 = [m for m in remaining_miles.values() if m <= 4.0]
-        nearby_6 = [m for m in remaining_miles.values() if m <= 6.0]
-
-        # If there are several genuinely nearby jobs, jumping away from them
-        # is a strong sign of a poor route shape.
-        if len(nearby_2) >= 1 and next_miles > 3.0:
-            penalty += (next_miles - 3.0) * (1.0 + 0.65 * len(nearby_2))
-
-        if len(nearby_4) >= 2 and next_miles > 5.0:
-            penalty += (next_miles - 5.0) * (1.5 + 0.45 * len(nearby_4))
-
-        if len(nearby_6) >= 3 and next_miles > 7.0:
-            penalty += (next_miles - 7.0) * (1.8 + 0.30 * len(nearby_6))
-
-        # More generally, compare the chosen next stop with the nearest
-        # remaining stop.  A very large ratio means we are skipping local work.
-        nearest = min(remaining_miles.values())
-        if next_miles > max(nearest * 1.75, nearest + 1.5):
-            excess = next_miles - max(nearest * 1.75, nearest + 1.5)
-            penalty += excess * 2.5
-
-    return penalty
-
-
-def calculate_shape_penalty(route, locations):
-    """
-    Small geometric penalty for routes that repeatedly reverse direction.
-
-    This is deliberately secondary to live road time.  It is only there to
-    prefer a natural sweep through the work area when two routes are otherwise
-    similar.
-    """
-    if len(route) < 5:
-        return 0.0
-
-    def bearing(a, b):
-        lon1, lat1 = locations[a]
-        lon2, lat2 = locations[b]
-        y = math.sin(math.radians(lon2 - lon1)) * math.cos(math.radians(lat2))
-        x = (
-            math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
-            - math.sin(math.radians(lat1))
-            * math.cos(math.radians(lat2))
-            * math.cos(math.radians(lon2 - lon1))
-        )
-        angle = math.degrees(math.atan2(y, x))
-        return (angle + 360.0) % 360.0
-
-    bearings = []
-    for i in range(1, len(route) - 1):
-        bearings.append(bearing(route[i - 1], route[i]))
-
-    penalty = 0.0
-    for i in range(1, len(bearings)):
-        delta = abs(bearings[i] - bearings[i - 1])
-        delta = min(delta, 360.0 - delta)
-        if delta > 115:
-            penalty += (delta - 115) / 45.0
-
-    return penalty
-
-
-def calculate_geographic_backtracking_penalty(route, locations):
-    """Apply a moderate penalty when the route moves back toward the depot
-    while useful work remains farther out in the same general direction.
-
-    This is intentionally softer than the old zone-transition logic. It uses
-    actual coordinates rather than postcode groups, so a road layout can still
-    justify a turn without the optimiser being forced into a rigid zone order.
-    """
-    if len(route) < 5:
-        return 0.0
-
-    depot = locations[0]
-
-    def bearing_from_depot(index):
-        lon, lat = locations[index]
-        dlon = (lon - depot[0]) * math.cos(math.radians(depot[1]))
-        dlat = lat - depot[1]
-        return (math.degrees(math.atan2(dlon, dlat)) + 360.0) % 360.0
-
-    def radius_from_depot(index):
-        return haversine_points(depot, locations[index])
-
-    penalty = 0.0
-
-    for pos in range(1, len(route) - 1):
-        current = route[pos]
-        nxt = route[pos + 1]
-        current_radius = radius_from_depot(current)
-        next_radius = radius_from_depot(nxt)
-
-        # Only consider a meaningful move back toward the depot.
-        radial_backtrack = current_radius - next_radius
-        if radial_backtrack < 1.5:
-            continue
-
-        current_bearing = bearing_from_depot(current)
-        next_bearing = bearing_from_depot(nxt)
-
-        # Is there still unvisited work farther out in roughly the same
-        # direction? If so, returning inward is more likely to be genuine
-        # route backtracking rather than a necessary local road turn.
-        remaining = route[pos + 1:-1]
-        for other in remaining:
-            if other == nxt:
-                continue
-            other_radius = radius_from_depot(other)
-            if other_radius <= current_radius + 2.0:
-                continue
-
-            other_bearing = bearing_from_depot(other)
-            delta = abs(other_bearing - next_bearing)
-            delta = min(delta, 360.0 - delta)
-
-            if delta <= 55.0:
-                # Scale gently: the optimiser should prefer progress, but
-                # real road time/distance still dominate.
-                penalty += min(radial_backtrack, 8.0) * 0.55
-                break
-
-        # Penalise a sharp reversal between consecutive legs, but only when
-        # it is also accompanied by radial backtracking.
-        if pos >= 2:
-            previous = route[pos - 1]
-            a = locations[previous]
-            b = locations[current]
-            c = locations[nxt]
-
-            def leg_bearing(p1, p2):
-                lon1, lat1 = p1
-                lon2, lat2 = p2
-                y = math.sin(math.radians(lon2 - lon1)) * math.cos(math.radians(lat2))
-                x = (
-                    math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
-                    - math.sin(math.radians(lat1)) * math.cos(math.radians(lat2))
-                    * math.cos(math.radians(lon2 - lon1))
-                )
-                return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
-
-            first = leg_bearing(a, b)
-            second = leg_bearing(b, c)
-            turn = abs(second - first)
-            turn = min(turn, 360.0 - turn)
-            if turn > 120.0 and radial_backtrack > 2.0:
-                penalty += (turn - 120.0) / 35.0
-
-    return penalty
-
-
-@lru_cache(maxsize=32)
-def geographic_zone_labels(location_tuple):
-    """Create stable geographic zones from customer coordinates.
-
-    Zones are calculated from the actual customer spread rather than from
-    postcode text, so the optimiser still works when the user imports a
-    completely different day's jobs.
-    """
-    locations = list(location_tuple)
-    customer_count = len(locations) - 1
-    if customer_count <= 0:
-        return tuple()
-
-    if customer_count <= 12:
-        k = 3
-    elif customer_count <= 24:
-        k = 4
-    elif customer_count <= 40:
-        k = 5
-    else:
-        k = 6
-    k = min(k, customer_count)
-
-    # Deterministic farthest-point seeds. This avoids depending on sklearn.
-    seeds = [1]
-    while len(seeds) < k:
-        best_idx = None
-        best_dist = -1.0
-        for idx in range(1, customer_count + 1):
-            if idx in seeds:
-                continue
-            nearest = min(
-                haversine_points(locations[idx], locations[s])
-                for s in seeds
-            )
-            if nearest > best_dist:
-                best_dist = nearest
-                best_idx = idx
-        if best_idx is None:
-            break
-        seeds.append(best_idx)
-
-    labels = [0] * (customer_count + 1)
-    centroids = [locations[i] for i in seeds]
-
-    for _ in range(12):
-        changed = False
-        for idx in range(1, customer_count + 1):
-            distances_to_centroids = [
-                haversine_points(locations[idx], c) for c in centroids
-            ]
-            label = min(range(len(centroids)), key=lambda x: distances_to_centroids[x])
-            if labels[idx] != label + 1:
-                labels[idx] = label + 1
-                changed = True
-
-        new_centroids = []
-        for zone in range(1, len(centroids) + 1):
-            members = [
-                locations[i] for i in range(1, customer_count + 1)
-                if labels[i] == zone
-            ]
-            if members:
-                lon = sum(p[0] for p in members) / len(members)
-                lat = sum(p[1] for p in members) / len(members)
-                new_centroids.append((lon, lat))
-            else:
-                new_centroids.append(centroids[zone - 1])
-        centroids = new_centroids
-        if not changed:
-            break
-
-    return tuple(labels[1:])
-
-
-def calculate_zone_penalty(route, locations):
-    """Penalise leaving a geographic work zone before clearing it.
-
-    This is deliberately softer than live road time/distance. It prevents
-    the optimiser from doing things like Grantham -> NG33 -> NG31 -> NG32
-    when a clean geographical sweep is available, without forcing an
-    unrealistic postcode-based route.
-    """
-    if len(route) < 4:
-        return 0.0
-
-    labels = geographic_zone_labels(location_cache_key(locations))
-    if not labels:
-        return 0.0
-
-    def zone(customer):
-        return labels[customer - 1]
-
-    penalty = 0.0
-    visited_zones = []
-
-    for pos in range(1, len(route) - 1):
-        current = route[pos]
-        nxt = route[pos + 1]
-        current_zone = zone(current)
-        next_zone = zone(nxt)
-
-        if current_zone != next_zone:
-            remaining_same_zone = any(
-                zone(x) == current_zone for x in route[pos + 1:-1]
-            )
-            if remaining_same_zone:
-                penalty += 2.5
-
-            if next_zone in visited_zones:
-                # Strongly discourage re-entering a geographic work zone
-                # after the route has already moved on.  This is the key
-                # v25.3 routing change: road time still decides between
-                # sensible alternatives, but a route should not clear an
-                # area, leave it, and then return much later just to collect
-                # one remaining job.
-                penalty += 8.0
-            visited_zones.append(next_zone)
-        elif current_zone not in visited_zones:
-            visited_zones.append(current_zone)
-
-    # A second visit to an already-cleared zone is particularly undesirable.
-    for zone_id in set(visited_zones):
-        occurrences = visited_zones.count(zone_id)
-        if occurrences > 1:
-            penalty += (occurrences - 1) * 5.0
-
-    return penalty
-
-
-def geographic_zone_routes(locations):
-    """Build candidate routes which clear dynamically detected areas."""
-    customer_count = len(locations) - 1
-    if customer_count <= 0:
-        return []
-
-    labels = geographic_zone_labels(location_cache_key(locations))
-    zones = {}
-    for customer in range(1, customer_count + 1):
-        zones.setdefault(labels[customer - 1], []).append(customer)
-
-    if len(zones) <= 1:
-        return []
-
-    depot = locations[0]
-
-    centroids = {}
-    for zone_id, members in zones.items():
-        lon = sum(locations[i][0] for i in members) / len(members)
-        lat = sum(locations[i][1] for i in members) / len(members)
-        centroids[zone_id] = (lon, lat)
-
-    # Create a few sensible zone orders. Starting with the zone nearest the
-    # depot is usually good, but testing each possible first zone matters
-    # because the depot can sit between two natural work areas.
-    zone_ids = list(zones)
-    routes = []
-
-    for start_zone in sorted(
-        zone_ids,
-        key=lambda z: haversine_points(depot, centroids[z])
-    ):
-        remaining = set(zone_ids)
-        remaining.remove(start_zone)
-        order = [start_zone]
-        current = start_zone
-        while remaining:
-            next_zone = min(
-                remaining,
-                key=lambda z: haversine_points(centroids[current], centroids[z])
-            )
-            order.append(next_zone)
-            remaining.remove(next_zone)
-            current = next_zone
-
-        for zone_order in (order, list(reversed(order))):
-            sequence = []
-            for zone_id in zone_order:
-                members = zones[zone_id][:]
-                # Within each zone, sort by angle around the zone centroid.
-                c_lon, c_lat = centroids[zone_id]
-                members.sort(
-                    key=lambda i: (
-                        math.degrees(
-                            math.atan2(
-                                (locations[i][0] - c_lon) * math.cos(math.radians(c_lat)),
-                                locations[i][1] - c_lat,
-                            )
-                        ) + 360.0
-                    ) % 360.0
-                )
-                sequence.extend(members)
-            routes.append([0] + sequence + [0])
-            routes.append([0] + list(reversed(sequence)) + [0])
-
-    return routes
 
 
 def build_greedy_route(
     first_customer,
     distances,
     durations,
-    mode="time",
+    mode="economic",
+    fuel_price=None,
+    mpg=None,
 ):
-    customer_count = len(distances) - 1
+    """Build a neutral route using the same economic edge objective.
 
+    V25.50 removes the old hidden nearby-job/local-density rewards.  Greedy
+    construction is now only a starting point; the final route is judged by
+    the same whole-route fuel + driving-time objective as every other route.
+    """
+    if fuel_price is None:
+        fuel_price = FUEL_PRICE
+    if mpg is None:
+        mpg = MPG
+
+    customer_count = len(distances) - 1
     route = [0, first_customer]
     remaining = list(range(1, customer_count + 1))
     remaining.remove(first_customer)
     current = first_customer
 
+    def edge_cost(a, b):
+        miles = float(distances[a][b]) / 1000.0 * 0.621371
+        litres = miles / float(mpg) * 4.54609
+        fuel_cost = litres * float(fuel_price)
+        time_cost = (float(durations[a][b]) / 3600.0) * DRIVING_TIME_VALUE_PER_HOUR
+        return fuel_cost + time_cost
+
     while remaining:
-        candidates = []
+        best = None
 
-        for candidate in sorted(remaining):
-            direct_time = durations[current][candidate]
-            direct_distance = distances[current][candidate]
+        for candidate in remaining:
+            cost = edge_cost(current, candidate)
 
+            # Small look-ahead only uses the same economic edge cost.
+            # It does not reward postcode proximity, density, zones or shape.
             future = [x for x in remaining if x != candidate]
             if future:
-                # Look one step ahead, but also reward candidates which sit
-                # inside a dense local group.
-                nearest_future = min(
-                    future,
-                    key=lambda x: (durations[candidate][x], distances[candidate][x], x)
+                continuation = min(
+                    edge_cost(candidate, x) for x in future
                 )
-                future_time = durations[candidate][nearest_future]
-                future_distance = distances[candidate][nearest_future]
-
-                local_count = sum(
-                    1
-                    for x in future
-                    if distances[candidate][x] <= 8000
-                )
+                score = cost + continuation * 0.35
             else:
-                future_time = durations[candidate][0]
-                future_distance = distances[candidate][0]
-                local_count = 0
+                score = cost + edge_cost(candidate, 0)
 
-            if mode == "distance":
-                score = (
-                    direct_distance
-                    + future_distance * 0.35
-                    - local_count * 1800.0
-                )
-            elif mode == "balanced":
-                score = (
-                    direct_time * 0.60
-                    + (direct_distance / 10.0) * 0.25
-                    + future_time * 0.20
-                    - local_count * 900.0
-                )
-            else:
-                score = (
-                    direct_time * 0.65
-                    + future_time * 0.25
-                    - local_count * 950.0
-                )
+            item = (score, cost, candidate)
+            if best is None or item < best:
+                best = item
 
-            candidates.append((score, candidate))
-
-        candidates.sort(key=lambda x: (x[0], x[1]))
-        next_customer = candidates[0][1]
+        next_customer = best[2]
         route.append(next_customer)
         remaining.remove(next_customer)
         current = next_customer
@@ -1532,163 +1118,7 @@ def build_greedy_route(
     return route
 
 
-def angular_sweep_routes(locations):
-    """
-    Generate natural geographical sweeps around the depot.
 
-    We test several angular offsets and both clockwise and anticlockwise
-    directions.  This creates routes which stay in one geographical area
-    instead of bouncing between NG31/NG32/NG13 repeatedly.
-    """
-    customer_count = len(locations) - 1
-    if customer_count <= 0:
-        return []
-
-    depot_lon, depot_lat = locations[0]
-
-    def angle_and_radius(index):
-        lon, lat = locations[index]
-        dlon = (lon - depot_lon) * math.cos(math.radians(depot_lat))
-        dlat = lat - depot_lat
-        angle = (math.degrees(math.atan2(dlon, dlat)) + 360.0) % 360.0
-        radius = math.sqrt(dlon * dlon + dlat * dlat)
-        return angle, radius
-
-    ordered = list(range(1, customer_count + 1))
-    ordered.sort(key=angle_and_radius)
-
-    routes = []
-    n = len(ordered)
-
-    # Rotating the sweep is important because the depot is in the middle of
-    # the working area.  Test every possible cut, not just the first angle.
-    for direction in (1, -1):
-        base = ordered if direction == 1 else ordered[::-1]
-        for start in range(n):
-            sequence = base[start:] + base[:start]
-            routes.append([0] + sequence + [0])
-
-    return routes
-
-
-def directional_sector_routes(locations, distances=None, durations=None):
-    """
-    Build routes as a real geographical sweep around the depot.
-
-    Instead of asking k-means to decide what a "zone" is, this uses the
-    actual bearing of every customer from the depot.  Customers are divided
-    into contiguous angular sectors, then those sectors are cleared in one
-    direction without deliberately jumping back to an earlier sector.
-
-    Road distance/time is used inside each sector when matrices are available,
-    so this is a geographical sweep guided by the road network rather than a
-    simple postcode sort.
-    """
-    customer_count = len(locations) - 1
-    if customer_count < 2:
-        return []
-
-    depot_lon, depot_lat = locations[0]
-    customers = list(range(1, customer_count + 1))
-
-    def bearing_radius(index):
-        lon, lat = locations[index]
-        dlon = (lon - depot_lon) * math.cos(math.radians(depot_lat))
-        dlat = lat - depot_lat
-        bearing = (math.degrees(math.atan2(dlon, dlat)) + 360.0) % 360.0
-        radius = math.hypot(dlon, dlat)
-        return bearing, radius
-
-    info = {i: bearing_radius(i) for i in customers}
-    ordered = sorted(customers, key=lambda i: (info[i][0], info[i][1]))
-    routes = []
-
-    # Four to six sectors works well for normal daily lists.  The sectors are
-    # balanced by number of jobs, which avoids one huge sector and many tiny
-    # ones when the jobs are unevenly distributed.
-    for sector_count in (4, 5, 6):
-        if customer_count < sector_count:
-            continue
-
-        base_size = customer_count // sector_count
-        remainder = customer_count % sector_count
-        sectors = []
-        pos = 0
-        for sector_id in range(sector_count):
-            size = base_size + (1 if sector_id < remainder else 0)
-            sectors.append(ordered[pos:pos + size])
-            pos += size
-
-        for direction in (1, -1):
-            sector_order = list(range(sector_count))
-            if direction == -1:
-                sector_order.reverse()
-
-            # Try every angular cut. This matters because the depot is not
-            # necessarily at the edge of the working area.
-            for cut in range(sector_count):
-                rotated = sector_order[cut:] + sector_order[:cut]
-                sequence = []
-                previous = 0
-
-                for sector_id in rotated:
-                    members = sectors[sector_id][:]
-                    if not members:
-                        continue
-
-                    # Primary order is angular.  For the second direction we
-                    # reverse it. This keeps the route moving through the
-                    # sector instead of zig-zagging across it.
-                    members.sort(key=lambda i: (info[i][0], info[i][1]),
-                                 reverse=(direction == -1))
-
-                    # Road-aware orientation: compare the cost of entering the
-                    # sector at either end and keep the cheaper end first.
-                    if distances is not None and len(members) > 1:
-                        forward_cost = distances[previous][members[0]]
-                        reverse_cost = distances[previous][members[-1]]
-                        if reverse_cost < forward_cost:
-                            members.reverse()
-
-                    sequence.extend(members)
-                    previous = members[-1]
-
-                if sequence:
-                    routes.append([0] + sequence + [0])
-                    routes.append([0] + list(reversed(sequence)) + [0])
-
-    # Also create a finer sweep by assigning jobs to angular bins from the
-    # actual bearing range. This catches cases where one balanced sector cuts
-    # through a natural road/settlement boundary.
-    for sector_count in (5, 6):
-        width = 360.0 / sector_count
-        for offset in (0.0, width / 2.0):
-            bins = [[] for _ in range(sector_count)]
-            for customer in customers:
-                angle = (info[customer][0] - offset) % 360.0
-                bucket = min(sector_count - 1, int(angle / width))
-                bins[bucket].append(customer)
-
-            for direction in (1, -1):
-                ids = list(range(sector_count))
-                if direction == -1:
-                    ids.reverse()
-                sequence = []
-                previous = 0
-                for bucket in ids:
-                    members = bins[bucket][:]
-                    members.sort(key=lambda i: (info[i][0], info[i][1]),
-                                 reverse=(direction == -1))
-                    if distances is not None and len(members) > 1:
-                        if distances[previous][members[-1]] < distances[previous][members[0]]:
-                            members.reverse()
-                    sequence.extend(members)
-                    if members:
-                        previous = members[-1]
-                if sequence:
-                    routes.append([0] + sequence + [0])
-
-    return routes
 
 
 def cheapest_insertion_route(
@@ -1700,12 +1130,24 @@ def cheapest_insertion_route(
     if customer_count <= 0:
         return [0, 0]
 
-    # Try a few geographically extreme seeds rather than only the furthest.
-    seeds = sorted(
+    # Use several deterministic economic starting seeds. The seed is only a
+    # construction choice; the complete-route objective decides the winner.
+    def edge_economic_cost(a, b):
+        miles = float(distances[a][b]) / 1000.0 * 0.621371
+        litres = miles / float(MPG) * 4.54609
+        fuel_cost = litres * float(FUEL_PRICE)
+        time_cost = (float(durations[a][b]) / 3600.0) * DRIVING_TIME_VALUE_PER_HOUR
+        return fuel_cost + time_cost
+
+    ordered_seeds = sorted(
         range(1, customer_count + 1),
-        key=lambda x: durations[0][x],
-        reverse=True,
-    )[: min(6, customer_count)]
+        key=lambda x: (edge_economic_cost(0, x), x),
+    )
+    seed_count = min(8, customer_count)
+    seeds = ordered_seeds[:seed_count]
+    if customer_count > seed_count:
+        seeds.extend(ordered_seeds[-min(4, customer_count - seed_count):])
+    seeds = list(dict.fromkeys(seeds))
 
     best_route = None
     best_value = float("inf")
@@ -1728,19 +1170,16 @@ def cheapest_insertion_route(
                     old_distance = distances[before][after]
                     new_distance = distances[before][customer] + distances[customer][after]
 
-                    # Reward inserting beside nearby unvisited work.
-                    neighbour_bonus = 0.0
-                    for other in sorted(remaining):
-                        if other == customer:
-                            continue
-                        if distances[customer][other] <= 8000:
-                            neighbour_bonus += 120.0
-
-                    increase = (
-                        (new_time - old_time)
-                        + (new_distance - old_distance) / 8.0
-                        - neighbour_bonus
-                    )
+                    # Score the insertion only by the same economic edge
+                    # objective used everywhere else. No nearby-job bonus,
+                    # locality reward or postcode grouping is applied.
+                    old_miles = float(old_distance) / 1000.0 * 0.621371
+                    new_miles = float(new_distance) / 1000.0 * 0.621371
+                    old_fuel = (old_miles / float(MPG) * 4.54609) * float(FUEL_PRICE)
+                    new_fuel = (new_miles / float(MPG) * 4.54609) * float(FUEL_PRICE)
+                    increase = (new_fuel - old_fuel) + (
+                        (new_time - old_time) / 3600.0
+                    ) * DRIVING_TIME_VALUE_PER_HOUR
 
                     if best_choice is None or (increase, customer, position) < best_choice:
                         best_choice = (increase, customer, position)
@@ -1757,435 +1196,20 @@ def cheapest_insertion_route(
     return best_route
 
 
-def two_opt(
-    route,
-    distances,
-    durations,
-    fuel_price,
-    mpg,
-    locations=None,
-):
-    best = route[:]
-    best_score = route_score(best, distances, durations, fuel_price, mpg, locations)
 
-    improved = True
-    while improved:
-        improved = False
 
-        for i in range(1, len(best) - 2):
-            for j in range(i + 1, len(best) - 1):
-                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
-                candidate_score = route_score(
-                    candidate, distances, durations, fuel_price, mpg, locations
-                )
 
-                if candidate_score < best_score - 0.01:
-                    best = candidate
-                    best_score = candidate_score
-                    improved = True
-                    break
-            if improved:
-                break
 
-    return best
 
 
-def relocate_improvement(
-    route,
-    distances,
-    durations,
-    fuel_price,
-    mpg,
-    locations=None,
-):
-    best = route[:]
-    best_score = route_score(best, distances, durations, fuel_price, mpg, locations)
 
-    improved = True
-    while improved:
-        improved = False
 
-        for i in range(1, len(best) - 1):
-            customer = best[i]
-            shortened = best[:i] + best[i + 1:]
 
-            for j in range(1, len(shortened)):
-                candidate = shortened[:j] + [customer] + shortened[j:]
-                candidate_score = route_score(
-                    candidate, distances, durations, fuel_price, mpg, locations
-                )
 
-                if candidate_score < best_score - 0.01:
-                    best = candidate
-                    best_score = candidate_score
-                    improved = True
-                    break
 
-            if improved:
-                break
 
-    return best
 
 
-def swap_improvement(
-    route,
-    distances,
-    durations,
-    fuel_price,
-    mpg,
-    locations=None,
-):
-    best = route[:]
-    best_score = route_score(best, distances, durations, fuel_price, mpg, locations)
-
-    improved = True
-    while improved:
-        improved = False
-
-        for i in range(1, len(best) - 2):
-            for j in range(i + 1, len(best) - 1):
-                candidate = best[:]
-                candidate[i], candidate[j] = candidate[j], candidate[i]
-                candidate_score = route_score(
-                    candidate, distances, durations, fuel_price, mpg, locations
-                )
-
-                if candidate_score < best_score - 0.01:
-                    best = candidate
-                    best_score = candidate_score
-                    improved = True
-                    break
-
-            if improved:
-                break
-
-    return best
-
-
-def generate_candidate_routes(distances, durations, locations=None):
-    customer_count = len(distances) - 1
-    if customer_count <= 0:
-        return []
-
-    candidates = []
-
-    # 1. Dynamic geographic-zone routes. These are the backbone of v14:
-    # clear one natural area before moving to the next.
-    if locations is not None:
-        # The main geographical candidates are now true directional sweeps.
-        # Keep the older zone/angular candidates as fallbacks so a sweep is
-        # never forced when the road network makes another shape genuinely
-        # shorter.
-        candidates.extend(directional_sector_routes(locations, distances, durations))
-        candidates.extend(geographic_zone_routes(locations))
-        candidates.extend(angular_sweep_routes(locations))
-
-    # 2. Multi-start greedy routes.  Test all starts for small lists and a
-    # useful spread of starts for larger lists.
-    starts = list(range(1, customer_count + 1))
-    starts.sort(key=lambda x: durations[0][x])
-
-    if customer_count > 40:
-        selected = starts[:10]
-        selected += starts[-10:]
-        selected += starts[:: max(1, customer_count // 10)]
-        starts = list(dict.fromkeys(selected))
-
-    for first_customer in starts:
-        candidates.append(build_greedy_route(first_customer, distances, durations, "time"))
-        candidates.append(build_greedy_route(first_customer, distances, durations, "balanced"))
-        candidates.append(build_greedy_route(first_customer, distances, durations, "distance"))
-
-    # 3. Insertion construction.
-    insertion = cheapest_insertion_route(distances, durations)
-    if insertion:
-        candidates.append(insertion)
-        if len(insertion) > 3:
-            candidates.append([0] + insertion[1:-1][::-1] + [0])
-
-    # Remove exact duplicates while keeping deterministic order.
-    unique = []
-    seen = set()
-    for candidate in candidates:
-        key = tuple(candidate)
-        if key not in seen:
-            seen.add(key)
-            unique.append(candidate)
-
-    return unique
-
-
-def improve_route(
-    route,
-    distances,
-    durations,
-    fuel_price,
-    mpg,
-    locations=None,
-    preserve_structure=False,
-):
-    """
-    Improve a route without destroying its geographical structure.
-
-    V19 deliberately treats a geographical sweep as a route structure, not
-    merely another score penalty.  Ordinary routes may use the full local
-    search. Sweep routes only receive safe local improvements, because an
-    unrestricted relocate/swap can undo the whole sweep and send the van back
-    into an area that was already cleared.
-    """
-    if preserve_structure:
-        return improve_sweep_route(
-            route,
-            distances,
-            durations,
-            fuel_price,
-            mpg,
-            locations,
-        )
-
-    improved = two_opt(
-        route, distances, durations, fuel_price, mpg, locations
-    )
-    improved = relocate_improvement(
-        improved, distances, durations, fuel_price, mpg, locations
-    )
-    improved = swap_improvement(
-        improved, distances, durations, fuel_price, mpg, locations
-    )
-    improved = two_opt(
-        improved, distances, durations, fuel_price, mpg, locations
-    )
-    return improved
-
-
-def improve_sweep_route(
-    route,
-    distances,
-    durations,
-    fuel_price,
-    mpg,
-    locations,
-):
-    """
-    Safely improve a sweep route while preserving its geographical direction.
-
-    We do not perform unrestricted relocate/swap operations here.  Instead we
-    use adjacent swaps and short reversals only when they improve the route.
-    This keeps the broad order of geographical areas intact while allowing
-    the live road matrix to tidy up the order inside those areas.
-    """
-    if not route or locations is None or len(route) < 5:
-        return route[:]
-
-    best = route[:]
-    best_score = route_score(
-        best, distances, durations, fuel_price, mpg, locations
-    )
-
-    # A sweep should remain a sweep.  Only make local changes which involve
-    # neighbouring stops.  This can remove a bad local zig-zag without moving
-    # a customer across the entire route.
-    for _ in range(3):
-        changed = False
-
-        # Adjacent swaps.
-        for i in range(1, len(best) - 2):
-            candidate = best[:]
-            candidate[i], candidate[i + 1] = candidate[i + 1], candidate[i]
-            candidate_score = route_score(
-                candidate, distances, durations, fuel_price, mpg, locations
-            )
-            if candidate_score < best_score - 0.01:
-                best = candidate
-                best_score = candidate_score
-                changed = True
-
-        # Very short 2-stop reversals only.  Never reverse a large section.
-        for i in range(1, len(best) - 3):
-            candidate = best[:]
-            candidate[i:i + 2] = reversed(candidate[i:i + 2])
-            candidate_score = route_score(
-                candidate, distances, durations, fuel_price, mpg, locations
-            )
-            if candidate_score < best_score - 0.01:
-                best = candidate
-                best_score = candidate_score
-                changed = True
-
-        if not changed:
-            break
-
-    return best
-
-
-def build_driver_sweep_routes(locations, distances=None, durations=None):
-    """Build general-purpose geographic sweep routes.
-
-    The route must work for arbitrary customer locations, so this function
-    deliberately does not know anything about Grantham, villages or postcodes.
-
-    Instead it treats the depot as the centre of the working area, creates
-    several possible circular geographic sweeps, and chooses the road-aware
-    ordering later.  Nearby customers are kept together by angle/radius and
-    the route is never forced to return to the depot between territories.
-    """
-    customer_count = len(locations) - 1
-    if customer_count <= 0:
-        return []
-
-    depot = locations[0]
-    customers = list(range(1, customer_count + 1))
-
-    def bearing(index):
-        lon, lat = locations[index]
-        dlon = (lon - depot[0]) * math.cos(math.radians(depot[1]))
-        dlat = lat - depot[1]
-        return (math.degrees(math.atan2(dlon, dlat)) + 360.0) % 360.0
-
-    def radius(index):
-        return haversine_points(depot, locations[index])
-
-    radii = {i: radius(i) for i in customers}
-    bearings = {i: bearing(i) for i in customers}
-
-    def road_cost(a, b):
-        if durations is not None:
-            return durations[a][b]
-        if distances is not None:
-            return distances[a][b]
-        return haversine_points(locations[a], locations[b])
-
-    def nearest_first(members, start):
-        """Order a small geographic territory without crossing the whole day."""
-        remaining = sorted(members)
-        result = []
-        current = start
-        while remaining:
-            nxt = min(
-                remaining,
-                key=lambda x: (
-                    road_cost(current, x),
-                    radii[x],
-                    x,
-                ),
-            )
-            result.append(nxt)
-            remaining.remove(nxt)
-            current = nxt
-        return result
-
-    routes = []
-
-    # Generate many possible angular cuts.  This makes the method independent
-    # of where the customer's geography happens to sit relative to north.
-    cut_count = 18 if customer_count >= 12 else 12
-    cuts = [360.0 * i / cut_count for i in range(cut_count)]
-
-    # Test 2, 3 and 4 broad territories.  The number is derived from the job
-    # count rather than hard-coded to the current test addresses.
-    territory_counts = [2]
-    if customer_count >= 8:
-        territory_counts.append(3)
-    if customer_count >= 16:
-        territory_counts.append(4)
-
-    for territory_count in territory_counts:
-        width = 360.0 / territory_count
-
-        for cut in cuts:
-            bands = [[] for _ in range(territory_count)]
-            for job in customers:
-                bucket = int(((bearings[job] - cut) % 360.0) / width)
-                bucket = min(territory_count - 1, bucket)
-                bands[bucket].append(job)
-
-            if any(not band for band in bands):
-                continue
-
-            # Try both directions around the depot.  For each direction, try
-            # every possible starting territory so the best sweep is not tied
-            # to an arbitrary compass direction.
-            for direction in (1, -1):
-                base = list(range(territory_count))
-                if direction == -1:
-                    base.reverse()
-
-                for start_pos in range(territory_count):
-                    order = base[start_pos:] + base[:start_pos]
-                    sequence = []
-                    current = 0
-
-                    for band_id in order:
-                        members = bands[band_id]
-                        forward = nearest_first(members, current)
-                        reverse = list(reversed(forward))
-
-                        # Choose the orientation which connects most naturally
-                        # from the previous territory.
-                        if road_cost(current, reverse[0]) < road_cost(current, forward[0]):
-                            chosen = reverse
-                        else:
-                            chosen = forward
-
-                        sequence.extend(chosen)
-                        current = chosen[-1]
-
-                    if len(sequence) == customer_count:
-                        routes.append([0] + sequence + [0])
-
-    # Pure polar sweeps are useful when the customers form one broad corridor.
-    # They are especially valuable for completely new areas not resembling
-    # the current test data.
-    for reverse_angle in (False, True):
-        angular = sorted(
-            customers,
-            key=lambda i: (bearings[i], radii[i]),
-            reverse=reverse_angle,
-        )
-        routes.append([0] + angular + [0])
-
-        # Also test the reverse radial order inside each small angular group.
-        radial = sorted(
-            customers,
-            key=lambda i: (bearings[i], -radii[i]),
-            reverse=reverse_angle,
-        )
-        routes.append([0] + radial + [0])
-
-    # Deduplicate deterministic candidates.
-    unique = []
-    seen = set()
-    for route in routes:
-        key = tuple(route)
-        if key not in seen and len(route) == customer_count + 2:
-            seen.add(key)
-            unique.append(route)
-
-    return unique
-
-
-def improve_driver_sweep_route(route, distances, durations, fuel_price, mpg, locations):
-    """Make only small road-aware changes without breaking territory order."""
-    if not route or len(route) < 5:
-        return route[:]
-
-    best = route[:]
-    best_score = route_score(best, distances, durations, fuel_price, mpg, locations)
-
-    # Adjacent swaps only. This keeps the broad territory sweep intact.
-    for _ in range(3):
-        changed = False
-        for i in range(1, len(best) - 2):
-            candidate = best[:]
-            candidate[i], candidate[i + 1] = candidate[i + 1], candidate[i]
-            score = route_score(candidate, distances, durations, fuel_price, mpg, locations)
-            if score < best_score - 0.01:
-                best = candidate
-                best_score = score
-                changed = True
-        if not changed:
-            break
-    return best
 
 
 def build_nearest_pocket_route(
@@ -2193,20 +1217,11 @@ def build_nearest_pocket_route(
     durations,
     start_customer,
 ):
-    """Build a true driver-style route from the last completed customer.
+    """Build a road-aware candidate without locality gates.
 
-    The primary rule is simple: after every completed job, look from that
-    exact location and take the closest sensible remaining customer using the
-    live road matrix.
-
-    The important addition is an escape gate.  If there is still a genuinely
-    nearby job, the route is not allowed to jump to a distant pocket just
-    because that distant job has a slightly attractive next step.  This is
-    what prevents Grantham -> Lincoln -> Grantham -> Lincoln style bouncing.
-
-    This is deliberately construction logic, not a post-route penalty.  The
-    route is therefore built in the order a driver would actually make the
-    decisions on the road.
+    V25.49 keeps this as one candidate generator only. It does not force a
+    nearby customer, impose an escape distance, or penalise leaving a pocket.
+    The complete-route objective decides whether this candidate is useful.
     """
     customer_count = len(distances) - 1
     if customer_count <= 0:
@@ -2217,108 +1232,41 @@ def build_nearest_pocket_route(
     remaining.remove(start_customer)
     current = start_customer
 
-    # Road-distance thresholds.  They are intentionally broad enough to work
-    # in towns as well as villages, while still stopping obvious area jumps.
-    HARD_LOCAL_MILES = 2.00
-    EXPANDED_LOCAL_MILES = 3.50
-    ESCAPE_RATIO = 1.80
-    ESCAPE_EXTRA_MILES = 1.00
-
     while remaining:
-        # Always calculate the actual nearest remaining customer from the
-        # address just completed.  Road distance is the primary reference.
-        nearest = min(
-            remaining,
-            key=lambda j: (distances[current][j], durations[current][j], j),
-        )
-        nearest_miles = distances[current][nearest] / 1609.344
+        def candidate_key(j):
+            direct_time = float(durations[current][j])
+            direct_distance = float(distances[current][j])
+            future = [x for x in remaining if x != j]
 
-        # Build the local pocket around the current address.
-        local = [
-            j for j in remaining
-            if distances[current][j] / 1609.344 <= HARD_LOCAL_MILES
-        ]
-        if not local:
-            local = [
-                j for j in remaining
-                if distances[current][j] / 1609.344 <= EXPANDED_LOCAL_MILES
-            ]
-        if not local:
-            local = [nearest]
-
-        # If nearby work exists, a distant jump must have a strong road-time
-        # reason.  This is the core protection against leaving one job behind.
-        if nearest_miles <= HARD_LOCAL_MILES:
-            allowed_miles = max(
-                nearest_miles * ESCAPE_RATIO,
-                nearest_miles + ESCAPE_EXTRA_MILES,
-            )
-            gated = [
-                j for j in remaining
-                if distances[current][j] / 1609.344 <= allowed_miles
-            ]
-            if gated:
-                local = gated
-            else:
-                local = [nearest]
-
-        candidates = []
-        for candidate in sorted(local):
-            direct_t = durations[current][candidate]
-            direct_d = distances[current][candidate]
-
-            future = [x for x in remaining if x != candidate]
             if future:
                 next_job = min(
                     future,
-                    key=lambda j: (
-                        durations[candidate][j],
-                        distances[candidate][j],
-                        j,
+                    key=lambda x: (
+                        float(durations[j][x]),
+                        float(distances[j][x]),
+                        x,
                     ),
                 )
-                next_t = durations[candidate][next_job]
-                next_d = distances[candidate][next_job]
+                lookahead_time = float(durations[j][next_job])
+                lookahead_distance = float(distances[j][next_job])
             else:
-                next_t = durations[candidate][0]
-                next_d = distances[candidate][0]
+                lookahead_time = float(durations[j][0])
+                lookahead_distance = float(distances[j][0])
 
-            # Count work that would remain close to the candidate.  This is a
-            # small tie-breaker: direct travel from the last completed job
-            # remains dominant.
-            nearby_after = sum(
-                1 for j in future
-                if distances[candidate][j] / 1609.344 <= HARD_LOCAL_MILES
+            # Small look-ahead uses the same fuel + time economics.
+            direct_miles = direct_distance / 1000.0 * 0.621371
+            lookahead_miles = lookahead_distance / 1000.0 * 0.621371
+            direct_fuel = (direct_miles / float(MPG) * 4.54609) * float(FUEL_PRICE)
+            lookahead_fuel = (lookahead_miles / float(MPG) * 4.54609) * float(FUEL_PRICE)
+            direct_cost = direct_fuel + (direct_time / 3600.0) * DRIVING_TIME_VALUE_PER_HOUR
+            lookahead_cost = lookahead_fuel + (lookahead_time / 3600.0) * DRIVING_TIME_VALUE_PER_HOUR
+            return (
+                direct_cost + 0.20 * lookahead_cost,
+                direct_distance + 0.20 * lookahead_distance,
+                j,
             )
 
-            # If choosing this customer would strand a very close job, make
-            # that choice expensive unless the road-time difference is real.
-            stranded_penalty = 0.0
-            close_remaining = [
-                j for j in future
-                if distances[candidate][j] / 1609.344 <= HARD_LOCAL_MILES
-            ]
-            if close_remaining:
-                closest_after = min(
-                    distances[candidate][j] / 1609.344
-                    for j in close_remaining
-                )
-                candidate_miles = direct_d / 1609.344
-                if candidate_miles > closest_after * 2.0 + 0.75:
-                    stranded_penalty = 300.0
-
-            score = (
-                direct_t
-                + next_t * 0.16
-                + direct_d * 0.00010
-                + next_d * 0.000025
-                - nearby_after * 65.0
-                + stranded_penalty
-            )
-            candidates.append((score, direct_t, direct_d, candidate))
-
-        candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-        chosen = candidates[0][3]
+        chosen = min(remaining, key=candidate_key)
         route.append(chosen)
         remaining.remove(chosen)
         current = chosen
@@ -2327,77 +1275,39 @@ def build_nearest_pocket_route(
     return route
 
 
-def route_locality_breaks(route, distances):
-    """Count obvious leave-an-area-and-return-later situations.
 
-    A break is recorded when, from a completed customer, another unvisited
-    customer is close by but the chosen next stop is substantially farther
-    away, and that nearby customer is eventually visited later.
+
+
+def _practical_route_key(route, distances, durations, fuel_price=None, mpg=None):
+    """Return the one objective used everywhere in V25.49.
+
+    No locality, zone, shape, backtracking or time-limit penalty is included.
+    If a fuel price/MPG pair is not supplied, use the app's current settings.
     """
-    if len(route) < 5:
-        return 0
+    if fuel_price is None:
+        fuel_price = FUEL_PRICE
+    if mpg is None:
+        mpg = MPG
 
-    remaining = set(route[1:-1])
-    breaks = 0
-
-    for pos in range(1, len(route) - 1):
-        current = route[pos]
-        nxt = route[pos + 1]
-        remaining.discard(current)
-        if not remaining:
-            continue
-
-        nearest = min(
-            remaining,
-            key=lambda j: (distances[current][j], j),
-        )
-        nearest_miles = distances[current][nearest] / 1609.344
-        next_miles = distances[current][nxt] / 1609.344
-
-        if nearest_miles <= 2.0 and next_miles > max(
-            nearest_miles * 1.80,
-            nearest_miles + 1.0,
-        ):
-            breaks += 1
-
-    return breaks
-
-
-def _complete_route_metrics(route, distances, durations):
-    """Return exact whole-route driving time and distance from the road matrix."""
-    total_time = 0.0
-    total_distance = 0.0
-    for i in range(len(route) - 1):
-        a = route[i]
-        b = route[i + 1]
-        total_time += float(durations[a][b])
-        total_distance += float(distances[a][b])
-    return total_time, total_distance
-
-
-def _practical_route_key(route, distances, durations):
-    """Whole-day objective used by the final optimiser.
-
-    Time remains the strongest factor, but mileage is deliberately included.
-    The coefficient means that a meaningful mileage saving can justify a small
-    time increase, while a large time increase cannot be hidden by a few miles.
-    This is a route-planning objective, not a postcode/geography rule.
-    """
-    total_time, total_distance = _complete_route_metrics(
-        route, distances, durations
+    metrics = route_metrics(
+        route,
+        distances,
+        durations,
+        fuel_price,
+        mpg,
     )
-    # 0.18 seconds of objective weight per metre ~= 4.83 minutes per mile.
-    practical_score = total_time + (total_distance * 0.18)
+    time_cost = (metrics["time_s"] / 3600.0) * DRIVING_TIME_VALUE_PER_HOUR
+    economic_score = metrics["fuel_cost"] + time_cost
+
     return (
-        practical_score,
-        total_time,
-        total_distance,
-        route_locality_breaks(route, distances),
+        economic_score,
+        metrics["fuel_cost"],
+        metrics["time_s"],
+        metrics["distance_m"],
         tuple(route),
     )
 
-
-def _route_search(route, distances, durations, max_rounds=3):
+def _route_search(route, distances, durations, max_rounds=2, fuel_price=None, mpg=None):
     """Deep deterministic whole-route improvement.
 
     Unlike the old neighbouring-stop polish, this searches the complete route
@@ -2409,7 +1319,7 @@ def _route_search(route, distances, durations, max_rounds=3):
         return route[:]
 
     best = route[:]
-    best_key = _practical_route_key(best, distances, durations)
+    best_key = _practical_route_key(best, distances, durations, fuel_price, mpg)
     n = len(best)
 
     for _ in range(max_rounds):
@@ -2421,7 +1331,7 @@ def _route_search(route, distances, durations, max_rounds=3):
             for j in range(i + 1, n - 1):
                 candidate = best[:]
                 candidate[i:j + 1] = reversed(candidate[i:j + 1])
-                key = _practical_route_key(candidate, distances, durations)
+                key = _practical_route_key(candidate, distances, durations, fuel_price, mpg)
                 if key < best_key:
                     best = candidate
                     best_key = key
@@ -2443,7 +1353,7 @@ def _route_search(route, distances, durations, max_rounds=3):
                     if j == i:
                         continue
                     candidate = remainder[:j] + block + remainder[j:]
-                    key = _practical_route_key(candidate, distances, durations)
+                    key = _practical_route_key(candidate, distances, durations, fuel_price, mpg)
                     if key < best_key:
                         best = candidate
                         best_key = key
@@ -2472,18 +1382,12 @@ def optimise_route(
     mpg,
     locations=None,
 ):
-    """v25.38 FINAL: optimise the complete day on the real road matrix.
+    """V25.51 complete-day route optimiser.
 
-    The optimiser is intentionally address-agnostic. Every day it receives
-    the addresses uploaded for that day, builds many different complete-route
-    starting solutions, then performs a deeper whole-route search on the best
-    candidates. There are no rules for Queensway, Grantham, particular
-    postcodes, villages, or a fixed maximum driving time.
-
-    The depot is always the first and last node. Every customer is visited
-    exactly once. Final selection uses the same practical time+mileage
-    objective as the improvement search, with exact road time as the next
-    tie-break and mileage after that.
+    Every candidate is built from the same economic road-cost logic and every
+    final decision is made by the complete-route objective: fuel cost plus the
+    value assigned to driving time. There are no locality, zone, shape,
+    backtracking, postcode or driving-time filters.
     """
     customer_count = len(distances) - 1
     if customer_count <= 0:
@@ -2502,29 +1406,18 @@ def optimise_route(
             return
         candidates.append(candidate[:])
 
-    # 1. Keep all existing address-agnostic route families.  These provide
-    # different whole-day structures rather than relying on one greedy rule.
-    if locations is not None:
-        structured = []
-        structured.extend(
-            build_driver_sweep_routes(locations, distances, durations)
-        )
-        structured.extend(
-            directional_sector_routes(locations, distances, durations)
-        )
-        structured.extend(
-            geographic_zone_routes(locations)
-        )
-        for route in structured:
-            add_candidate(route)
+    def depot_economic_cost(customer):
+        miles = float(distances[0][customer]) / 1000.0 * 0.621371
+        litres = miles / float(mpg) * 4.54609
+        return (litres * float(fuel_price)) + (
+            float(durations[0][customer]) / 3600.0
+        ) * DRIVING_TIME_VALUE_PER_HOUR
 
-    # 2. Multi-start road greedy routes.  For small/medium daily lists we can
-    # afford every possible first customer.  For larger lists we sample the
-    # starts deterministically from both ends of depot proximity plus evenly
-    # spaced positions.
     starts = list(range(1, customer_count + 1))
-    starts.sort(key=lambda x: (durations[0][x], distances[0][x], x))
+    starts.sort(key=lambda x: (depot_economic_cost(x), x))
 
+    # For normal daily lists (such as 33 jobs) every starting customer is
+    # tested. Larger lists use a deterministic spread to keep Streamlit fast.
     if customer_count > 60:
         picks = starts[:20] + starts[-20:]
         step = max(1, customer_count // 20)
@@ -2532,27 +1425,25 @@ def optimise_route(
         starts = list(dict.fromkeys(picks))
 
     for first_customer in starts:
-        for mode in ("time", "balanced", "distance"):
-            add_candidate(
-                build_greedy_route(
-                    first_customer,
-                    distances,
-                    durations,
-                    mode,
-                )
+        add_candidate(
+            build_greedy_route(
+                first_customer,
+                distances,
+                durations,
+                "economic",
+                fuel_price=fuel_price,
+                mpg=mpg,
             )
+        )
 
-    # 3. Cheapest insertion gives a different construction family and often
-    # finds routes greedy construction cannot reach.
     insertion = cheapest_insertion_route(distances, durations)
     if insertion:
         add_candidate(insertion)
         if len(insertion) > 3:
             add_candidate([0] + insertion[1:-1][::-1] + [0])
 
-    # 4. Driver-style pocket routes from multiple starts.  They are retained
-    # as candidates, not treated as the final truth.
-    for first_customer in starts[:min(20, len(starts))]:
+    # Unconstrained driver-style candidates.
+    for first_customer in starts[:min(24, len(starts))]:
         add_candidate(
             build_nearest_pocket_route(
                 distances,
@@ -2564,7 +1455,6 @@ def optimise_route(
     if not candidates:
         return None
 
-    # Deterministic de-duplication.
     unique = []
     seen = set()
     for route in candidates:
@@ -2573,26 +1463,32 @@ def optimise_route(
             seen.add(key)
             unique.append(route)
 
-    # First retain the best construction routes under the actual whole-day
-    # objective.  We deliberately keep a broad pool so a good route is not
-    # discarded merely because its construction family ranked lower.
-    unique.sort(key=lambda r: _practical_route_key(r, distances, durations))
-    construction_pool = unique[:80]
+    # Keep enough diversity to prevent one construction family from dominating,
+    # while avoiding an excessive deep-search runtime.
+    unique.sort(
+        key=lambda r: _practical_route_key(
+            r, distances, durations, fuel_price, mpg
+        )
+    )
+    construction_pool = unique[:16]
 
-    # Add a spread of additional candidates from the remaining construction
-    # families.  This preserves diversity without making the Streamlit app
-    # perform an expensive deep search on every raw route.
-    if len(unique) > 80:
-        tail_step = max(1, len(unique) // 20)
-        construction_pool.extend(unique[::tail_step][:20])
+    if len(unique) > 16:
+        tail_step = max(1, len(unique) // 6)
+        for route in unique[::tail_step][:6]:
+            if tuple(route) not in {tuple(x) for x in construction_pool}:
+                construction_pool.append(route)
 
-    # 5. Deep whole-route search.  This is the important change in v25.37:
-    # the optimiser is no longer limited to adjacent swaps or a tiny polish.
-    # Each selected candidate can be globally reordered by 2-opt and Or-opt.
     refined = []
     seen_refined = set()
     for route in construction_pool:
-        improved = _route_search(route, distances, durations, max_rounds=3)
+        improved = _route_search(
+            route,
+            distances,
+            durations,
+            max_rounds=2,
+            fuel_price=fuel_price,
+            mpg=mpg,
+        )
         key = tuple(improved)
         if key not in seen_refined:
             seen_refined.add(key)
@@ -2601,65 +1497,53 @@ def optimise_route(
     if not refined:
         refined = construction_pool
 
-    refined.sort(key=lambda r: _practical_route_key(r, distances, durations))
+    refined.sort(
+        key=lambda r: _practical_route_key(
+            r, distances, durations, fuel_price, mpg
+        )
+    )
     return refined[0]
 
 
-def surgical_route_polish(route, distances, durations, max_passes=2):
-    """Safely polish the already-selected route without changing its strategy.
+def surgical_route_polish(
+    route,
+    distances,
+    durations,
+    fuel_price,
+    mpg,
+    max_passes=2,
+):
+    """Final whole-route polish using the same V25.50 economic objective.
 
-    This is deliberately applied AFTER the v25.30 route has been selected.
-    A change is accepted only when the COMPLETE route gets shorter in both
-    real road driving time and real road distance.  There is no shape score,
-    postcode rule, zone rule, or alternate-route selection here.
-
-    The purpose is to catch small local ordering mistakes, such as a long
-    leg where moving one nearby job across the leg or reversing a short section
-    genuinely saves road time and mileage.  If no strict improvement exists,
-    the original v25.30 route is returned byte-for-byte in ordering.
+    A change does not have to improve both time and distance. If it costs a
+    little more time but saves enough fuel/mileage to reduce the total route
+    cost, it is allowed. This keeps the final polish consistent with the main
+    optimiser instead of reintroducing an old hidden filter.
     """
     if not route or len(route) < 5:
         return route[:] if route else route
 
-    def totals(candidate):
-        total_time = 0.0
-        total_distance = 0.0
-        for i in range(len(candidate) - 1):
-            a = candidate[i]
-            b = candidate[i + 1]
-            total_time += float(durations[a][b])
-            total_distance += float(distances[a][b])
-        return total_time, total_distance
-
     best = route[:]
-    best_time, best_distance = totals(best)
+    best_key = _practical_route_key(
+        best, distances, durations, fuel_price, mpg
+    )
 
     for _ in range(max_passes):
         found = False
 
-        # --------------------------------------------------------
-        # 1. Single-customer relocation.
-        # --------------------------------------------------------
-        # Only move a stop if doing so improves the COMPLETE route in
-        # BOTH driving time and driving distance.
         for i in range(1, len(best) - 1):
             customer = best[i]
             shortened = best[:i] + best[i + 1:]
 
             for j in range(1, len(shortened)):
-                if j == i:
-                    continue
-
                 candidate = shortened[:j] + [customer] + shortened[j:]
-                candidate_time, candidate_distance = totals(candidate)
+                candidate_key = _practical_route_key(
+                    candidate, distances, durations, fuel_price, mpg
+                )
 
-                if (
-                    candidate_time < best_time - 0.5
-                    and candidate_distance < best_distance - 1.0
-                ):
+                if candidate_key < best_key:
                     best = candidate
-                    best_time = candidate_time
-                    best_distance = candidate_distance
+                    best_key = candidate_key
                     found = True
                     break
 
@@ -2669,26 +1553,19 @@ def surgical_route_polish(route, distances, durations, max_passes=2):
         if found:
             continue
 
-        # --------------------------------------------------------
-        # 2. Short 2-opt reversals.
-        # --------------------------------------------------------
-        # Restrict the reversal to at most four customer positions.
-        # This cannot reorganise the whole day.
+        # Also test complete 2-opt reversals during the final polish.
         for i in range(1, len(best) - 2):
-            for j in range(i + 1, min(len(best) - 1, i + 5)):
-                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
-                candidate_time, candidate_distance = totals(candidate)
-
-                if (
-                    candidate_time < best_time - 0.5
-                    and candidate_distance < best_distance - 1.0
-                ):
+            for j in range(i + 1, len(best) - 1):
+                candidate = best[:]
+                candidate[i:j + 1] = reversed(candidate[i:j + 1])
+                candidate_key = _practical_route_key(
+                    candidate, distances, durations, fuel_price, mpg
+                )
+                if candidate_key < best_key:
                     best = candidate
-                    best_time = candidate_time
-                    best_distance = candidate_distance
+                    best_key = candidate_key
                     found = True
                     break
-
             if found:
                 break
 
@@ -2697,10 +1574,6 @@ def surgical_route_polish(route, distances, durations, max_passes=2):
 
     return best
 
-
-# ============================================================
-# DESTINATION / WHATSAPP
-# ============================================================
 
 def get_destination(row):
     address = clean_val(row.get("address_text"))
@@ -3175,6 +2048,8 @@ if st.button(
         route,
         distances,
         durations,
+        FUEL_PRICE,
+        MPG,
     )
 
     metrics = route_metrics(
