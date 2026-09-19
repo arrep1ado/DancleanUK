@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "25.52"
+APP_VERSION = "25.53"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -993,6 +993,57 @@ def get_coords(query_string, postcode):
 
     return None
 
+
+
+def _route_group_street(value):
+    value = clean_val(value).lower()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _route_house_number(value):
+    m = re.search(r"(?<!\d)(\d+)(?:[A-Za-z])?\b", clean_val(value))
+    return int(m.group(1)) if m else None
+
+
+def deconflict_same_postcode_houses(df, valid_rows, depot_coords):
+    """Separate same-postcode/same-street houses collapsed to one centroid."""
+    groups = {}
+    for idx in valid_rows:
+        try:
+            lat = float(df.at[idx, "latitude"]); lon = float(df.at[idx, "longitude"])
+        except Exception:
+            continue
+        postcode = normalise_postcode(df.at[idx, "Postcode"])
+        raw = clean_val(df.at[idx, "address_text"] or df.at[idx, "geo_query"] or df.at[idx, "Address"])
+        without_pc = re.sub(re.escape(postcode), "", raw, flags=re.I).strip(" ,")
+        number = _route_house_number(without_pc) or _route_house_number(raw)
+        if number is None:
+            continue
+        street = re.sub(r"^\s*\d+[A-Za-z]?\s*[, ]+\s*", "", without_pc)
+        street = _route_group_street(street)
+        if not street:
+            continue
+        groups.setdefault((postcode, street), []).append((idx, round(lat,6), round(lon,6), number, lat, lon))
+
+    for (postcode, street), members in groups.items():
+        counts={}
+        for m in members: counts[(m[1],m[2])] = counts.get((m[1],m[2]),0)+1
+        if len(members)<2 or not any(v>1 for v in counts.values()):
+            continue
+        ordered=sorted(members,key=lambda x:(x[3],x[0]))
+        if postcode == normalise_postcode(DEPOT_POSTCODE):
+            anchor_lat, anchor_lon=float(depot_coords[0]), float(depot_coords[1])
+        else:
+            anchor_lat=sum(x[4] for x in ordered)/len(ordered)
+            anchor_lon=sum(x[5] for x in ordered)/len(ordered)
+        lat_step=0.000072; lon_step=0.00012
+        centre=(len(ordered)-1)/2.0
+        for pos,(idx,*_) in enumerate(ordered):
+            rel=pos-centre
+            df.at[idx,"latitude"]=anchor_lat+rel*lat_step
+            df.at[idx,"longitude"]=anchor_lon+rel*lon_step
+    return df
 
 # ============================================================
 # ROUTING
@@ -2050,6 +2101,10 @@ if st.button(
         st.error("No customer addresses could be located.")
         st.stop()
 
+    # Public geocoders can collapse several houses sharing one postcode to the
+    # same centroid. Separate those local houses before building the road matrix.
+    df = deconflict_same_postcode_houses(df, valid_rows, depot_coords)
+
     rows = [
         {
             "Postcode": DEPOT_POSTCODE,
@@ -2103,9 +2158,8 @@ if st.button(
             duplicate_labels.append(" / ".join(labels))
 
         st.warning(
-            "⚠️ Multiple customer addresses resolved to the same map "
-            "coordinate. The route will use that coordinate, but exact "
-            "house-level routing could not be confirmed for: "
+            "⚠️ Some customer addresses still share the same routing "
+            "coordinate after the safe geocoding fallback: "
             + "; ".join(duplicate_labels)
         )
 
