@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "25.55"
+APP_VERSION = "25.53"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -818,7 +818,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/25.55"
+                    "User-Agent": "DanCleanUKRouteOptimizer/25.52"
                 },
                 timeout=20,
             )
@@ -881,94 +881,10 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
     return None
 
 
-def arcgis_exact_geocode(query, postcode, expected_house_number="", expected_street=""):
-    """Try the public ArcGIS World geocoder for a house-level address point.
-
-    This is another exact-address source only.  A result is accepted when the
-    returned match text contains the requested house number and street.  The
-    postcode-distance safety check remains in get_coords(), so a bad result
-    cannot create a distant route.
-    """
-    expected_house_number = clean_val(expected_house_number)
-    expected_street = clean_val(expected_street).lower()
-    postcode = normalise_postcode(postcode)
-
-    queries = []
-    base = str(query or "").strip()
-    if base:
-        queries.append(base)
-    if expected_house_number and expected_street and postcode:
-        queries.append(
-            f"{expected_house_number} {expected_street}, {postcode}, United Kingdom"
-        )
-
-    for search_query in dict.fromkeys(queries):
-        try:
-            response = requests.get(
-                "https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates",
-                params={
-                    "SingleLine": search_query,
-                    "countryCode": "GBR",
-                    "outFields": "*",
-                    "maxLocations": 20,
-                    "f": "json",
-                },
-                headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/25.55"
-                },
-                timeout=20,
-            )
-
-            if response.status_code != 200:
-                continue
-
-            data = response.json() or {}
-            for candidate in data.get("candidates") or []:
-                location = candidate.get("location") or {}
-                try:
-                    lon = float(location.get("x"))
-                    lat = float(location.get("y"))
-                except Exception:
-                    continue
-
-                if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                    continue
-
-                attrs = candidate.get("attributes") or {}
-                match_text = clean_val(
-                    candidate.get("address")
-                    or attrs.get("Match_addr")
-                    or attrs.get("LongLabel")
-                    or attrs.get("ShortLabel")
-                ).lower()
-
-                house_match = (
-                    not expected_house_number
-                    or bool(
-                        re.search(
-                            rf"(?<!\d){re.escape(expected_house_number)}(?!\d)",
-                            match_text,
-                        )
-                    )
-                )
-                street_match = (
-                    not expected_street
-                    or expected_street in match_text
-                )
-
-                if house_match and street_match:
-                    return (lat, lon)
-
-        except Exception:
-            continue
-
-    return None
-
-
 def get_coords(query_string, postcode):
     """Locate an address safely with house-level lookup before postcode fallback.
 
-    V25.55 changes ONLY the geocoding layer. The V25.51 route/economic
+    V25.52 changes ONLY the geocoding layer. The V25.51 route/economic
     optimiser is deliberately left untouched.
 
     Exact house/street sources are tried first. Every exact result is checked
@@ -985,7 +901,7 @@ def get_coords(query_string, postcode):
         return cached
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/25.55"
+        "User-Agent": "DanCleanUKRouteOptimizer/25.52"
     }
 
     # Extract a likely house number and street from the imported address.
@@ -1050,22 +966,9 @@ def get_coords(query_string, postcode):
             return coords
         time.sleep(0.35)
 
-    # 3. Additional ArcGIS house-level lookup. This gives the app another
-    # independent address source when OSM does not expose individual houses.
-    # It is still protected by the postcode safety anchor below.
-    arcgis = arcgis_exact_geocode(
-        query,
-        postcode,
-        expected_house_number=expected_house,
-        expected_street=expected_street,
-    )
-    arcgis = safe_exact(arcgis)
-    if arcgis is not None:
-        st.session_state.geocode_cache[key] = arcgis
-        return arcgis
-
-    # 4. Additional OSM/Photon house-level lookup. It remains protected by
-    # the same postcode safety anchor.
+    # 3. Additional OSM/Photon house-level lookup. This is particularly useful
+    # when several houses share the same postcode, such as 180/190/194/196
+    # Queensway. It is still protected by the postcode safety anchor.
     photon = photon_exact_geocode(
         query,
         postcode,
@@ -1077,12 +980,12 @@ def get_coords(query_string, postcode):
         st.session_state.geocode_cache[key] = photon
         return photon
 
-    # 5. Safe fallback: retain the customer at the official postcode point.
+    # 4. Safe fallback: retain the customer at the official postcode point.
     if postcode_anchor is not None:
         st.session_state.geocode_cache[key] = postcode_anchor
         return postcode_anchor
 
-    # 6. Historical Grantham postcode fallback.
+    # 5. Historical Grantham postcode fallback.
     legacy = LEGACY_POSTCODE_COORDS.get(postcode)
     if legacy is not None:
         st.session_state.geocode_cache[key] = legacy
@@ -1104,118 +1007,43 @@ def _route_house_number(value):
 
 
 def deconflict_same_postcode_houses(df, valid_rows, depot_coords):
-    """Generic fallback when public geocoders collapse houses to one point.
-
-    This is deliberately independent of any postcode, street, town, or
-    current daily job list. It only separates customer records when multiple
-    houses on the same postcode/street have been returned at the same
-    coordinate.
-
-    The existing postcode/geocoder coordinate remains the anchor. The tiny
-    offsets are only approximate routing points so separate jobs remain
-    distinguishable. No route-order rule is applied here.
-    """
+    """Separate same-postcode/same-street houses collapsed to one centroid."""
     groups = {}
-
     for idx in valid_rows:
         try:
-            lat = float(df.at[idx, "latitude"])
-            lon = float(df.at[idx, "longitude"])
+            lat = float(df.at[idx, "latitude"]); lon = float(df.at[idx, "longitude"])
         except Exception:
             continue
-
         postcode = normalise_postcode(df.at[idx, "Postcode"])
-
-        raw = clean_val(
-            df.at[idx, "address_text"]
-            or df.at[idx, "geo_query"]
-            or df.at[idx, "Address"]
-        )
-
-        without_postcode = re.sub(
-            re.escape(postcode),
-            "",
-            raw,
-            flags=re.IGNORECASE,
-        ).strip(" ,")
-
-        house_number = (
-            _route_house_number(without_postcode)
-            or _route_house_number(raw)
-        )
-
-        if house_number is None:
+        raw = clean_val(df.at[idx, "address_text"] or df.at[idx, "geo_query"] or df.at[idx, "Address"])
+        without_pc = re.sub(re.escape(postcode), "", raw, flags=re.I).strip(" ,")
+        number = _route_house_number(without_pc) or _route_house_number(raw)
+        if number is None:
             continue
-
-        street = re.sub(
-            r"^\s*\d+[A-Za-z]?\s*[, ]+\s*",
-            "",
-            without_postcode,
-        )
+        street = re.sub(r"^\s*\d+[A-Za-z]?\s*[, ]+\s*", "", without_pc)
         street = _route_group_street(street)
-
         if not street:
             continue
+        groups.setdefault((postcode, street), []).append((idx, round(lat,6), round(lon,6), number, lat, lon))
 
-        groups.setdefault(
-            (postcode, street),
-            [],
-        ).append(
-            {
-                "idx": idx,
-                "lat": lat,
-                "lon": lon,
-                "coord_key": (round(lat, 6), round(lon, 6)),
-                "house_number": house_number,
-            }
-        )
-
-    for (_postcode, _street), members in groups.items():
-        if len(members) < 2:
+    for (postcode, street), members in groups.items():
+        counts={}
+        for m in members: counts[(m[1],m[2])] = counts.get((m[1],m[2]),0)+1
+        if len(members)<2 or not any(v>1 for v in counts.values()):
             continue
-
-        coordinate_counts = {}
-        for member in members:
-            key = member["coord_key"]
-            coordinate_counts[key] = coordinate_counts.get(key, 0) + 1
-
-        if not any(count > 1 for count in coordinate_counts.values()):
-            continue
-
-        ordered = sorted(
-            members,
-            key=lambda item: (
-                item["house_number"],
-                item["idx"],
-            ),
-        )
-
-        # Use the actual geocoder/postcode anchor for this group.
-        # Never substitute the depot or a hard-coded address.
-        anchor_lat = sum(item["lat"] for item in ordered) / len(ordered)
-        anchor_lon = sum(item["lon"] for item in ordered) / len(ordered)
-
-        # Much smaller than V25.53: this is only to distinguish records,
-        # not to invent a new street location.
-        lat_step = 0.000008
-        lon_step = 0.000012
-        centre = (len(ordered) - 1) / 2.0
-
-        for position, member in enumerate(ordered):
-            relative = position - centre
-
-            df.at[
-                member["idx"],
-                "latitude",
-            ] = anchor_lat + relative * lat_step
-
-            df.at[
-                member["idx"],
-                "longitude",
-            ] = anchor_lon + relative * lon_step
-
+        ordered=sorted(members,key=lambda x:(x[3],x[0]))
+        if postcode == normalise_postcode(DEPOT_POSTCODE):
+            anchor_lat, anchor_lon=float(depot_coords[0]), float(depot_coords[1])
+        else:
+            anchor_lat=sum(x[4] for x in ordered)/len(ordered)
+            anchor_lon=sum(x[5] for x in ordered)/len(ordered)
+        lat_step=0.000072; lon_step=0.00012
+        centre=(len(ordered)-1)/2.0
+        for pos,(idx,*_) in enumerate(ordered):
+            rel=pos-centre
+            df.at[idx,"latitude"]=anchor_lat+rel*lat_step
+            df.at[idx,"longitude"]=anchor_lon+rel*lon_step
     return df
-
 
 # ============================================================
 # ROUTING
