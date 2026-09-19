@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 14.0
 # ============================================================
 
-APP_VERSION = "25.45"
+APP_VERSION = "25.46"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -754,10 +754,14 @@ def nominatim_search(
     return None
 
 
-# Legacy postcode coordinates are kept as an empty fallback map.
-# House-level addresses must never be silently collapsed onto a postcode
-# centroid. Exact address geocoding is required when a house number is given.
-LEGACY_POSTCODE_COORDS = {}
+# Safe coordinates for two older Grantham postcodes that can appear in
+# genuine customer records but may no longer be returned by postcodes.io.
+# These are only a last-resort fallback after exact address geocoding fails.
+# They keep the job in the correct Grantham area rather than dropping it.
+LEGACY_POSTCODE_COORDS = {
+    "NG31 7AN": (52.909806, -0.640572),
+    "NG31 9EH": (52.909052, -0.630469),
+}
 
 
 def get_postcode_coords(postcode):
@@ -896,6 +900,15 @@ def get_coords(query_string, postcode):
     if postcode_anchor is not None:
         st.session_state.geocode_cache[key] = postcode_anchor
         return postcode_anchor
+
+    # 4. Historical Grantham postcode fallback. These coordinates are known
+    # local anchors and are used only when the live postcode service has no
+    # record. This prevents legitimate jobs such as NG31 7AN / NG31 9EH from
+    # becoming "unlocated".
+    legacy = LEGACY_POSTCODE_COORDS.get(postcode)
+    if legacy is not None:
+        st.session_state.geocode_cache[key] = legacy
+        return legacy
 
     return None
 
