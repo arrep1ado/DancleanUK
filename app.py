@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "25.53"
+APP_VERSION = "25.54"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1007,43 +1007,118 @@ def _route_house_number(value):
 
 
 def deconflict_same_postcode_houses(df, valid_rows, depot_coords):
-    """Separate same-postcode/same-street houses collapsed to one centroid."""
+    """Generic fallback when public geocoders collapse houses to one point.
+
+    This is deliberately independent of any postcode, street, town, or
+    current daily job list. It only separates customer records when multiple
+    houses on the same postcode/street have been returned at the same
+    coordinate.
+
+    The existing postcode/geocoder coordinate remains the anchor. The tiny
+    offsets are only approximate routing points so separate jobs remain
+    distinguishable. No route-order rule is applied here.
+    """
     groups = {}
+
     for idx in valid_rows:
         try:
-            lat = float(df.at[idx, "latitude"]); lon = float(df.at[idx, "longitude"])
+            lat = float(df.at[idx, "latitude"])
+            lon = float(df.at[idx, "longitude"])
         except Exception:
             continue
+
         postcode = normalise_postcode(df.at[idx, "Postcode"])
-        raw = clean_val(df.at[idx, "address_text"] or df.at[idx, "geo_query"] or df.at[idx, "Address"])
-        without_pc = re.sub(re.escape(postcode), "", raw, flags=re.I).strip(" ,")
-        number = _route_house_number(without_pc) or _route_house_number(raw)
-        if number is None:
+
+        raw = clean_val(
+            df.at[idx, "address_text"]
+            or df.at[idx, "geo_query"]
+            or df.at[idx, "Address"]
+        )
+
+        without_postcode = re.sub(
+            re.escape(postcode),
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        ).strip(" ,")
+
+        house_number = (
+            _route_house_number(without_postcode)
+            or _route_house_number(raw)
+        )
+
+        if house_number is None:
             continue
-        street = re.sub(r"^\s*\d+[A-Za-z]?\s*[, ]+\s*", "", without_pc)
+
+        street = re.sub(
+            r"^\s*\d+[A-Za-z]?\s*[, ]+\s*",
+            "",
+            without_postcode,
+        )
         street = _route_group_street(street)
+
         if not street:
             continue
-        groups.setdefault((postcode, street), []).append((idx, round(lat,6), round(lon,6), number, lat, lon))
 
-    for (postcode, street), members in groups.items():
-        counts={}
-        for m in members: counts[(m[1],m[2])] = counts.get((m[1],m[2]),0)+1
-        if len(members)<2 or not any(v>1 for v in counts.values()):
+        groups.setdefault(
+            (postcode, street),
+            [],
+        ).append(
+            {
+                "idx": idx,
+                "lat": lat,
+                "lon": lon,
+                "coord_key": (round(lat, 6), round(lon, 6)),
+                "house_number": house_number,
+            }
+        )
+
+    for (_postcode, _street), members in groups.items():
+        if len(members) < 2:
             continue
-        ordered=sorted(members,key=lambda x:(x[3],x[0]))
-        if postcode == normalise_postcode(DEPOT_POSTCODE):
-            anchor_lat, anchor_lon=float(depot_coords[0]), float(depot_coords[1])
-        else:
-            anchor_lat=sum(x[4] for x in ordered)/len(ordered)
-            anchor_lon=sum(x[5] for x in ordered)/len(ordered)
-        lat_step=0.000072; lon_step=0.00012
-        centre=(len(ordered)-1)/2.0
-        for pos,(idx,*_) in enumerate(ordered):
-            rel=pos-centre
-            df.at[idx,"latitude"]=anchor_lat+rel*lat_step
-            df.at[idx,"longitude"]=anchor_lon+rel*lon_step
+
+        coordinate_counts = {}
+        for member in members:
+            key = member["coord_key"]
+            coordinate_counts[key] = coordinate_counts.get(key, 0) + 1
+
+        if not any(count > 1 for count in coordinate_counts.values()):
+            continue
+
+        ordered = sorted(
+            members,
+            key=lambda item: (
+                item["house_number"],
+                item["idx"],
+            ),
+        )
+
+        # Use the actual geocoder/postcode anchor for this group.
+        # Never substitute the depot or a hard-coded address.
+        anchor_lat = sum(item["lat"] for item in ordered) / len(ordered)
+        anchor_lon = sum(item["lon"] for item in ordered) / len(ordered)
+
+        # Much smaller than V25.53: this is only to distinguish records,
+        # not to invent a new street location.
+        lat_step = 0.000008
+        lon_step = 0.000012
+        centre = (len(ordered) - 1) / 2.0
+
+        for position, member in enumerate(ordered):
+            relative = position - centre
+
+            df.at[
+                member["idx"],
+                "latitude",
+            ] = anchor_lat + relative * lat_step
+
+            df.at[
+                member["idx"],
+                "longitude",
+            ] = anchor_lon + relative * lon_step
+
     return df
+
 
 # ============================================================
 # ROUTING
