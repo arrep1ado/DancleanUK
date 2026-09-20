@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "25.64"
+APP_VERSION = "25.66"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -818,7 +818,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/25.64"
+                    "User-Agent": "DanCleanUKRouteOptimizer/25.66"
                 },
                 timeout=20,
             )
@@ -901,7 +901,7 @@ def get_coords(query_string, postcode):
         return cached
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/25.64"
+        "User-Agent": "DanCleanUKRouteOptimizer/25.66"
     }
 
     # Extract a likely house number and street from the imported address.
@@ -1106,6 +1106,224 @@ def get_ors_matrix(locations):
 
     except Exception:
         return None, None
+
+
+
+def matrix_values_are_valid(distances, durations, expected_size):
+    """Reject incomplete/non-finite/negative ORS matrices before optimisation."""
+    if not isinstance(distances, list) or not isinstance(durations, list):
+        return False
+
+    if len(distances) != expected_size or len(durations) != expected_size:
+        return False
+
+    for matrix in (distances, durations):
+        for row in matrix:
+            if not isinstance(row, list) or len(row) != expected_size:
+                return False
+            for value in row:
+                try:
+                    value = float(value)
+                except Exception:
+                    return False
+                if not math.isfinite(value) or value < 0:
+                    return False
+
+    return True
+
+
+def suspicious_matrix_nodes(locations, distances, durations):
+    """Find coordinates whose live-road legs are implausible for their geometry.
+
+    This is deliberately generic: it knows nothing about Grantham, Queensway,
+    today's postcodes, or a target route length. It compares ORS road distance
+    with straight-line distance between the SAME two coordinates.
+
+    A leg is suspicious only when the road detour is both very large in
+    absolute terms and extreme relative to the straight-line separation.
+    Requiring repeated suspicious legs before blaming a customer avoids
+    changing a valid route because of one unusual bridge/road restriction.
+    """
+    n = len(locations)
+    strikes = [0] * n
+    worst_excess = [0.0] * n
+
+    for i in range(n):
+        lon1, lat1 = locations[i]
+        for j in range(i + 1, n):
+            lon2, lat2 = locations[j]
+            straight_km = haversine_km(lat1, lon1, lat2, lon2)
+
+            try:
+                road_ij = float(distances[i][j]) / 1000.0
+                road_ji = float(distances[j][i]) / 1000.0
+                time_ij = float(durations[i][j])
+                time_ji = float(durations[j][i])
+            except Exception:
+                strikes[i] += 2
+                strikes[j] += 2
+                continue
+
+            # Use the smaller direction so normal one-way systems do not
+            # trigger the validator merely because one direction is longer.
+            road_km = min(road_ij, road_ji)
+            drive_s = min(time_ij, time_ji)
+
+            # Zero/near-zero geometry can legitimately have a small road snap.
+            # What we are looking for is a many-tens-of-km detour between
+            # coordinates that are geographically close.
+            # Generic sanity envelope. For nearby coordinates, a road route
+            # tens of kilometres longer than the geometry is suspicious. For
+            # genuinely distant jobs, proportional allowance grows naturally.
+            # No town, postcode, daily mileage target, or route order is used.
+            allowed_km = max(20.0, straight_km * 5.0 + 8.0)
+            excessive_road = road_km > allowed_km
+
+            # Also reject impossible average speeds on a substantial leg.
+            bad_speed = False
+            if road_km >= 5.0 and drive_s > 0:
+                speed_kph = road_km / (drive_s / 3600.0)
+                bad_speed = speed_kph < 3.0 or speed_kph > 160.0
+
+            if excessive_road or bad_speed:
+                strikes[i] += 1
+                strikes[j] += 1
+                excess = max(0.0, road_km - allowed_km)
+                worst_excess[i] = max(worst_excess[i], excess)
+                worst_excess[j] = max(worst_excess[j], excess)
+
+    # Depot is index 0 and is never auto-replaced here.
+    suspects = [
+        idx
+        for idx in range(1, n)
+        if strikes[idx] >= 2
+    ]
+
+    # Generic isolation check: if a customer has no reasonably local road
+    # connection relative to its nearest geometric neighbour, flag it. This
+    # catches a single wildly misplaced/snap-broken customer even when the
+    # pairwise strike count would otherwise be too low.
+    for i in range(1, n):
+        geometric = []
+        for j in range(n):
+            if i == j:
+                continue
+            lon1, lat1 = locations[i]
+            lon2, lat2 = locations[j]
+            straight_km = haversine_km(lat1, lon1, lat2, lon2)
+            geometric.append((straight_km, j))
+
+        geometric.sort(key=lambda item: (item[0], item[1]))
+        for straight_km, j in geometric[:3]:
+            road_km = min(
+                float(distances[i][j]),
+                float(distances[j][i]),
+            ) / 1000.0
+            allowed_km = max(20.0, straight_km * 5.0 + 8.0)
+            if road_km > allowed_km:
+                strikes[i] += 1
+                worst_excess[i] = max(
+                    worst_excess[i],
+                    road_km - allowed_km,
+                )
+
+    suspects = [
+        idx
+        for idx in range(1, n)
+        if strikes[idx] >= 2
+    ]
+    suspects.sort(
+        key=lambda idx: (strikes[idx], worst_excess[idx], idx),
+        reverse=True,
+    )
+    return suspects
+
+
+def get_validated_ors_matrix(locations, postcode_fallbacks, max_repairs=4):
+    """Build a live ORS matrix and repair bad address snaps generically.
+
+    Exact address coordinates remain preferred. If the live matrix shows that
+    one customer coordinate repeatedly creates implausible road detours, only
+    that customer is moved to its official postcode centroid and the matrix is
+    requested again. This makes daily address changes safe without hard-coding
+    any route, postcode, town, or customer.
+    """
+    working_locations = [
+        [float(lon), float(lat)]
+        for lon, lat in locations
+    ]
+    repaired = []
+
+    for _ in range(max_repairs + 1):
+        distances, durations = get_ors_matrix(working_locations)
+
+        if not matrix_values_are_valid(
+            distances,
+            durations,
+            len(working_locations),
+        ):
+            return None, None, working_locations, repaired
+
+        suspects = suspicious_matrix_nodes(
+            working_locations,
+            distances,
+            durations,
+        )
+
+        repair_idx = None
+        for idx in suspects:
+            fallback = postcode_fallbacks[idx]
+            if fallback is None:
+                continue
+
+            fallback_lon, fallback_lat = fallback
+            current_lon, current_lat = working_locations[idx]
+
+            # Do not waste an API retry if the postcode point is effectively
+            # identical to the coordinate already being used.
+            if haversine_km(
+                current_lat,
+                current_lon,
+                fallback_lat,
+                fallback_lon,
+            ) < 0.03:
+                continue
+
+            repair_idx = idx
+            break
+
+        if repair_idx is None:
+            # Suspicious live-road data remains, but none of the flagged
+            # customer points has a usable, materially different postcode
+            # fallback. Do NOT silently accept this matrix as valid.
+            return None, None, working_locations, repaired
+
+        fallback_lon, fallback_lat = postcode_fallbacks[repair_idx]
+        working_locations[repair_idx] = [
+            float(fallback_lon),
+            float(fallback_lat),
+        ]
+        repaired.append(repair_idx)
+
+    # Final matrix after the allowed repairs.
+    distances, durations = get_ors_matrix(working_locations)
+    if not matrix_values_are_valid(
+        distances,
+        durations,
+        len(working_locations),
+    ):
+        return None, None, working_locations, repaired
+
+    # If it is still structurally suspicious, do not present it as a valid
+    # live-road result. The caller will use the existing offline fallback.
+    if suspicious_matrix_nodes(
+        working_locations,
+        distances,
+        durations,
+    ):
+        return None, None, working_locations, repaired
+
+    return distances, durations, working_locations, repaired
 
 
 def route_metrics(route, distances, durations, fuel_price, mpg):
@@ -2135,20 +2353,85 @@ if st.button(
             + "; ".join(grouped_labels)
         )
 
+    # Official postcode centroids are retained independently from the exact
+    # address coordinates. They are used only if the LIVE road matrix proves
+    # that an exact address point is repeatedly producing implausible detours.
+    postcode_fallbacks = [None]
+    for idx in valid_rows:
+        pc = normalise_postcode(df.loc[idx, "Postcode"])
+        anchor = get_postcode_coords(pc)
+        if anchor is None:
+            anchor = LEGACY_POSTCODE_COORDS.get(pc)
+
+        if anchor is None:
+            postcode_fallbacks.append(None)
+        else:
+            # Matrix/location format is [longitude, latitude].
+            postcode_fallbacks.append(
+                [float(anchor[1]), float(anchor[0])]
+            )
+
     with st.spinner(
-        "🛣️ Getting actual road distances and driving times..."
+        "🛣️ Getting and validating actual road distances and driving times..."
     ):
-        distances, durations = get_ors_matrix(locations)
+        distances, durations, validated_locations, repaired_nodes = (
+            get_validated_ors_matrix(
+                locations,
+                postcode_fallbacks,
+            )
+        )
+
+    # Keep routing_df consistent with any automatic postcode-centroid repair.
+    if repaired_nodes:
+        repaired_labels = []
+        for node_idx in repaired_nodes:
+            locations[node_idx] = validated_locations[node_idx]
+            routing_df.at[node_idx, "longitude"] = validated_locations[node_idx][0]
+            routing_df.at[node_idx, "latitude"] = validated_locations[node_idx][1]
+            repaired_labels.append(
+                str(
+                    routing_df.iloc[node_idx].get(
+                        "address_text",
+                        routing_df.iloc[node_idx].get("Postcode", "customer"),
+                    )
+                )
+            )
+
+        st.info(
+            "ℹ️ Live-road validation corrected suspicious address routing "
+            "for: " + " / ".join(repaired_labels)
+        )
 
     using_offline = False
 
     if distances is None or durations is None:
         using_offline = True
+        locations = validated_locations
         st.warning(
-            "OpenRouteService could not provide the live road matrix. "
-            "Using an offline estimate instead."
+            "The live road matrix failed route-sanity validation. "
+            "Using the safe offline road estimate instead of presenting "
+            "implausible live mileage."
         )
         distances, durations = offline_matrix(locations)
+    else:
+        locations = validated_locations
+
+    # V25.66: matrix validation may have replaced an exact address coordinate
+    # with its postcode centroid. Recompute same-coordinate customer groups
+    # NOW, from the final coordinates actually used by the route matrix.
+    # This prevents customers that become identical after a safe repair from
+    # being separated later in the route.
+    coordinate_groups = {}
+    for node_idx in range(1, len(locations)):
+        lon, lat = locations[node_idx]
+        coord_key = (round(float(lon), 6), round(float(lat), 6))
+        coordinate_groups.setdefault(coord_key, []).append(node_idx)
+
+    duplicate_coordinate_groups = [
+        members
+        for members in coordinate_groups.values()
+        if len(members) > 1
+    ]
 
     with st.spinner(
         f"🧠 Optimising {len(valid_rows)} customer stops..."
