@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "26.5"
+APP_VERSION = "26.6"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -808,7 +808,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/26.5"
+                    "User-Agent": "DanCleanUKRouteOptimizer/26.6"
                 },
                 timeout=20,
             )
@@ -878,6 +878,41 @@ def _postcode_outcode(postcode):
     return postcode.split()[0].upper()
 
 
+def get_outcode_coords(postcode):
+    """Return the official centroid for a UK postcode outcode.
+
+    This is validation-only. It is useful when a full postcode is retired,
+    mistyped, or unavailable from the live postcode service. It is never used
+    as a customer routing coordinate and never supplies road distance/time.
+    """
+    outcode = _postcode_outcode(postcode)
+    if not outcode:
+        return None
+
+    cache_key = f"__OUTCODE__|{outcode}".lower()
+    cached = st.session_state.geocode_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        response = requests.get(
+            f"https://api.postcodes.io/outcodes/{quote(outcode)}",
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return None
+        result = response.json().get("result") or {}
+        lat = result.get("latitude")
+        lon = result.get("longitude")
+        if lat is None or lon is None:
+            return None
+        coords = (float(lat), float(lon))
+        st.session_state.geocode_cache[cache_key] = coords
+        return coords
+    except Exception:
+        return None
+
+
 def reverse_postcode_outcode(lat, lon):
     """Return the nearest live UK postcode outcode for a coordinate.
 
@@ -917,7 +952,7 @@ def get_coords(query_string, postcode):
     postcode = normalise_postcode(postcode)
     key = cache_key_for(query, postcode)
 
-    headers = {"User-Agent": "DanCleanUKRouteOptimizer/26.5"}
+    headers = {"User-Agent": "DanCleanUKRouteOptimizer/26.6"}
 
     house_match = re.search(r"(?<!\d)(\d+[A-Za-z]?)\b", query)
     expected_house = house_match.group(1) if house_match else ""
@@ -929,6 +964,7 @@ def get_coords(query_string, postcode):
 
     postcode_anchor = get_postcode_coords(postcode)
     expected_outcode = _postcode_outcode(postcode)
+    outcode_anchor = get_outcode_coords(postcode)
 
     def safe_exact(coords):
         if coords is None:
@@ -950,14 +986,27 @@ def get_coords(query_string, postcode):
                 return None
             return (lat, lon)
 
-        # If the exact postcode is unavailable/invalid, never trust only a
-        # matching house number + street name. Reverse-check the candidate's
-        # live postcode district. This catches distant same-name streets.
+        # If the full postcode is unavailable/retired, validate the exact
+        # address against the OFFICIAL OUTCODE geography instead. A nearby
+        # address may legitimately reverse-geocode to an adjacent outcode, so
+        # exact outcode equality is too strict. Geographic proximity to the
+        # supplied outcode is the safer generic test. This accepts genuine
+        # local addresses while rejecting a same-name street hundreds of
+        # kilometres away.
+        if outcode_anchor is not None:
+            if haversine_km(
+                outcode_anchor[0], outcode_anchor[1], lat, lon
+            ) <= 20.0:
+                return (lat, lon)
+            return None
+
+        # Last validation option when the outcode service has no centroid.
+        # Exact outcode agreement is still useful, but failure means we do not
+        # guess.
         if expected_outcode:
             candidate_outcode = reverse_postcode_outcode(lat, lon)
-            if not candidate_outcode or candidate_outcode != expected_outcode:
-                return None
-            return (lat, lon)
+            if candidate_outcode == expected_outcode:
+                return (lat, lon)
 
         return None
 
@@ -1317,7 +1366,7 @@ def get_validated_ors_matrix(locations, postcode_fallbacks, max_repairs=4):
         return None, None, working_locations, repaired
 
     # If it is still structurally suspicious, do not present it as a valid
-    # live-road result. The caller will use the existing offline fallback.
+    # live-road result. The caller must stop rather than substitute estimates.
     if suspicious_matrix_nodes(
         working_locations,
         distances,
