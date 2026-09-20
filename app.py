@@ -17,10 +17,10 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 # ============================================================
 # DAN CLEAN UK - DAILY ROUTE OPTIMIZER
-# Version 26.9
+# Version 26.10
 # ============================================================
 
-APP_VERSION = "26.9"
+APP_VERSION = "26.10"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -851,7 +851,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/26.9"
+                    "User-Agent": "DanCleanUKRouteOptimizer/26.10"
                 },
                 timeout=20,
             )
@@ -995,7 +995,7 @@ def get_coords(query_string, postcode):
     postcode = normalise_postcode(postcode)
     key = cache_key_for(query, postcode)
 
-    headers = {"User-Agent": "DanCleanUKRouteOptimizer/26.9"}
+    headers = {"User-Agent": "DanCleanUKRouteOptimizer/26.10"}
 
     house_match = re.search(r"(?<!\d)(\d+[A-Za-z]?)\b", query)
     expected_house = house_match.group(1) if house_match else ""
@@ -2859,28 +2859,97 @@ if st.button(
     with st.spinner(
         f"🧠 Optimising {len(valid_rows)} customer stops..."
     ):
-        route = build_daily_pocket_route(
+        # V26.10 hybrid search.  Build the conservative driver-style route AND
+        # the complete-day route, then compare them on the same verified ORS
+        # matrix.  This removes the V26.9 red flag where the final route could
+        # preserve a local pocket even when it caused a large later backtrack.
+        route_candidates = []
+
+        pocket_route = build_daily_pocket_route(
             distances,
             durations,
             locations,
             FUEL_PRICE,
             MPG,
         )
+        if pocket_route:
+            pocket_route = pocket_preserving_polish(
+                pocket_route,
+                distances,
+                durations,
+                locations,
+                FUEL_PRICE,
+                MPG,
+            )
+            route_candidates.append(pocket_route)
+
+            # Let the whole-route polish test whether a job trapped in the
+            # wrong pocket can be relocated without changing any coordinates.
+            route_candidates.append(
+                surgical_route_polish(
+                    pocket_route,
+                    distances,
+                    durations,
+                    FUEL_PRICE,
+                    MPG,
+                    max_passes=4,
+                )
+            )
+
+        global_route = optimise_route(
+            distances,
+            durations,
+            FUEL_PRICE,
+            MPG,
+            locations=locations,
+        )
+        if global_route:
+            route_candidates.append(global_route)
+            route_candidates.append(
+                surgical_route_polish(
+                    global_route,
+                    distances,
+                    durations,
+                    FUEL_PRICE,
+                    MPG,
+                    max_passes=4,
+                )
+            )
+
+        # Reject any malformed candidate before comparison. Depot stays fixed,
+        # every customer must appear exactly once, and no job may disappear.
+        expected_customers = list(range(1, len(distances)))
+        safe_candidates = []
+        seen_candidates = set()
+        for candidate in route_candidates:
+            if not candidate:
+                continue
+            if candidate[0] != 0 or candidate[-1] != 0:
+                continue
+            if len(candidate) != len(distances) + 1:
+                continue
+            if sorted(candidate[1:-1]) != expected_customers:
+                continue
+            candidate_tuple = tuple(candidate)
+            if candidate_tuple in seen_candidates:
+                continue
+            seen_candidates.add(candidate_tuple)
+            safe_candidates.append(candidate)
+
+        route = (
+            min(
+                safe_candidates,
+                key=lambda r: _practical_route_key(
+                    r, distances, durations, FUEL_PRICE, MPG
+                ),
+            )
+            if safe_candidates
+            else None
+        )
 
     if not route:
-        st.error("The route optimiser could not create a route.")
+        st.error("The route optimiser could not create a safe complete route.")
         st.stop()
-
-    # V26.1: preserve the daily pocket behaviour during final improvement.
-    # The old unconstrained whole-route polish is intentionally NOT used here.
-    route = pocket_preserving_polish(
-        route,
-        distances,
-        durations,
-        locations,
-        FUEL_PRICE,
-        MPG,
-    )
 
     # Keep same-coordinate jobs consecutive without globally relocating
     # their area. The first occurrence determines the group's position.
@@ -2913,7 +2982,14 @@ if st.button(
             and grouped_route[-1] == 0
             and len(grouped_route) == len(route)
             and sorted(grouped_route[1:-1]) == sorted(route[1:-1])
+            and _practical_route_key(
+                grouped_route, distances, durations, FUEL_PRICE, MPG
+            ) <= _practical_route_key(
+                route, distances, durations, FUEL_PRICE, MPG
+            )
         ):
+            # V26.10: never force duplicate grouping if it would make the
+            # verified complete route worse.
             route = grouped_route
 
     metrics = route_metrics(
