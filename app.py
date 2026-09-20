@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "25.62"
+APP_VERSION = "25.63"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -818,7 +818,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/25.62"
+                    "User-Agent": "DanCleanUKRouteOptimizer/25.63"
                 },
                 timeout=20,
             )
@@ -901,7 +901,7 @@ def get_coords(query_string, postcode):
         return cached
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/25.62"
+        "User-Agent": "DanCleanUKRouteOptimizer/25.63"
     }
 
     # Extract a likely house number and street from the imported address.
@@ -2279,6 +2279,87 @@ if st.button(
             else:
                 route_blocks.insert(target_pos, moving_block)
 
+        # Strong whole-route search on the grouped route.
+        #
+        # From this point each entry in route_blocks is indivisible. A block
+        # may be one normal customer or several jobs sharing one coordinate.
+        # Search block relocations, block swaps and block-level 2-opt reversals
+        # using the SAME fuel + driving-time objective as the main optimiser.
+        # Depot blocks remain fixed at the beginning and end.
+        def block_route_key(blocks):
+            candidate_route = [
+                node
+                for block in blocks
+                for node in block
+            ]
+            return _practical_route_key(
+                candidate_route,
+                distances,
+                durations,
+                FUEL_PRICE,
+                MPG,
+            )
+
+        best_blocks = [block[:] for block in route_blocks]
+        best_key = block_route_key(best_blocks)
+
+        # Deterministic best-improvement search. Four rounds are enough for
+        # normal daily routes while remaining practical in Streamlit.
+        for _ in range(4):
+            round_best_blocks = best_blocks
+            round_best_key = best_key
+            internal_count = len(best_blocks) - 2
+
+            # 1) Relocate one complete block anywhere else.
+            for i in range(1, len(best_blocks) - 1):
+                moving = best_blocks[i]
+                remainder = best_blocks[:i] + best_blocks[i + 1:]
+
+                for j in range(1, len(remainder)):
+                    candidate_blocks = (
+                        remainder[:j]
+                        + [moving]
+                        + remainder[j:]
+                    )
+                    candidate_key = block_route_key(candidate_blocks)
+                    if candidate_key < round_best_key:
+                        round_best_key = candidate_key
+                        round_best_blocks = candidate_blocks
+
+            # 2) Swap any two complete internal blocks.
+            for i in range(1, len(best_blocks) - 2):
+                for j in range(i + 1, len(best_blocks) - 1):
+                    candidate_blocks = [block[:] for block in best_blocks]
+                    candidate_blocks[i], candidate_blocks[j] = (
+                        candidate_blocks[j],
+                        candidate_blocks[i],
+                    )
+                    candidate_key = block_route_key(candidate_blocks)
+                    if candidate_key < round_best_key:
+                        round_best_key = candidate_key
+                        round_best_blocks = candidate_blocks
+
+            # 3) Block-level 2-opt. Reverse the order of a complete section,
+            # never the customer order inside a duplicate-coordinate block.
+            for i in range(1, len(best_blocks) - 2):
+                for j in range(i + 1, len(best_blocks) - 1):
+                    candidate_blocks = (
+                        best_blocks[:i]
+                        + list(reversed(best_blocks[i:j + 1]))
+                        + best_blocks[j + 1:]
+                    )
+                    candidate_key = block_route_key(candidate_blocks)
+                    if candidate_key < round_best_key:
+                        round_best_key = candidate_key
+                        round_best_blocks = candidate_blocks
+
+            if round_best_key >= best_key:
+                break
+
+            best_blocks = [block[:] for block in round_best_blocks]
+            best_key = round_best_key
+
+        route_blocks = best_blocks
         route = [
             node
             for block in route_blocks
