@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "26.1"
+APP_VERSION = "26.4"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -818,7 +818,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/26.1"
+                    "User-Agent": "DanCleanUKRouteOptimizer/26.4"
                 },
                 timeout=20,
             )
@@ -901,7 +901,7 @@ def get_coords(query_string, postcode):
         return cached
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/26.1"
+        "User-Agent": "DanCleanUKRouteOptimizer/26.4"
     }
 
     # Extract a likely house number and street from the imported address.
@@ -1051,29 +1051,6 @@ def location_cache_key(locations):
     )
 
 
-def offline_matrix(locations):
-    n = len(locations)
-    distances = [[0.0] * n for _ in range(n)]
-    durations = [[0.0] * n for _ in range(n)]
-
-    road_factor = 1.30
-    average_speed = 35.0
-
-    for i in range(n):
-        lon1, lat1 = locations[i]
-
-        for j in range(n):
-            if i == j:
-                continue
-
-            lon2, lat2 = locations[j]
-            km = haversine_km(lat1, lon1, lat2, lon2)
-            road_km = km * road_factor
-
-            distances[i][j] = road_km * 1000
-            durations[i][j] = road_km / average_speed * 3600
-
-    return distances, durations
 
 
 def get_ors_matrix(locations):
@@ -1714,6 +1691,33 @@ def _route_search(route, distances, durations, max_rounds=2, fuel_price=None, mp
 
 
 
+
+
+
+def route_leg_diagnostics(route, locations, distances, durations):
+    """Return final-route leg diagnostics for validation/display."""
+    rows = []
+    for pos in range(len(route) - 1):
+        a = route[pos]
+        b = route[pos + 1]
+        lon1, lat1 = locations[a]
+        lon2, lat2 = locations[b]
+        straight_km = haversine_km(lat1, lon1, lat2, lon2)
+        road_km = float(distances[a][b]) / 1000.0
+        seconds = float(durations[a][b])
+        ratio = road_km / straight_km if straight_km >= 0.03 else None
+        rows.append({
+            "leg": pos + 1,
+            "from_node": a,
+            "to_node": b,
+            "road_miles": road_km * 0.621371,
+            "minutes": seconds / 60.0,
+            "straight_miles": straight_km * 0.621371,
+            "ratio": ratio,
+        })
+    return rows
+
+
 def build_daily_pocket_route(
     distances,
     durations,
@@ -1721,78 +1725,22 @@ def build_daily_pocket_route(
     fuel_price,
     mpg,
 ):
-    """Build a deterministic driver-style daily route.
+    """Dynamic daily driver route using only today's road matrix.
 
-    Behaviour:
-    - start at the depot/current route origin;
-    - discover natural pockets from THIS day's road-time relationships;
-    - clear the current pocket before making a materially longer move;
-    - choose the next pocket from the current position;
-    - return to the depot only after all jobs are visited.
-
-    There are no postcode, town, address, mileage, stop-order or test-day rules.
-    Pocket scale is derived from the day's own nearest-neighbour road times.
+    The current local neighbourhood is derived from the nearest unfinished
+    road-time moves from the current position. Nearby jobs are cleared before
+    a materially longer transition is made. There are no postcode/town rules
+    and no transitive connected-component clustering.
     """
     customer_count = len(distances) - 1
     if customer_count <= 0:
         return [0, 0]
-    if customer_count == 1:
-        return [0, 1, 0]
 
-    customers = list(range(1, customer_count + 1))
+    remaining = set(range(1, customer_count + 1))
+    route = [0]
+    current = 0
 
-    # Each customer's nearest OTHER customer road time. This describes the
-    # natural local spacing of today's work without assuming a town or radius.
-    nearest_times = []
-    for i in customers:
-        vals = [
-            float(durations[i][j])
-            for j in customers
-            if j != i
-            and math.isfinite(float(durations[i][j]))
-            and float(durations[i][j]) >= 0.0
-        ]
-        if vals:
-            nearest_times.append(min(vals))
-
-    if nearest_times:
-        ordered = sorted(nearest_times)
-        median_nn = ordered[len(ordered) // 2]
-    else:
-        median_nn = 0.0
-
-    # Dynamic pocket threshold. It grows from today's actual customer spacing.
-    # A floor only prevents identical/very-close coordinates from making the
-    # threshold zero; it is not a locality or total-route constraint.
-    pocket_time = max(8.0 * 60.0, median_nn * 2.5)
-
-    # Build undirected connectivity using the better of the two road directions.
-    adjacency = {i: set() for i in customers}
-    for pos, i in enumerate(customers):
-        for j in customers[pos + 1:]:
-            tij = min(float(durations[i][j]), float(durations[j][i]))
-            if math.isfinite(tij) and tij <= pocket_time:
-                adjacency[i].add(j)
-                adjacency[j].add(i)
-
-    # Connected components are today's natural pockets.
-    pockets = []
-    unseen = set(customers)
-    while unseen:
-        seed = min(unseen)
-        stack = [seed]
-        unseen.remove(seed)
-        component = []
-        while stack:
-            node = stack.pop()
-            component.append(node)
-            for nxt in sorted(adjacency[node]):
-                if nxt in unseen:
-                    unseen.remove(nxt)
-                    stack.append(nxt)
-        pockets.append(sorted(component))
-
-    def edge_economic_cost(a, b):
+    def edge_cost(a, b):
         miles = float(distances[a][b]) / 1000.0 * 0.621371
         litres = miles / float(mpg) * 4.54609
         return (
@@ -1801,95 +1749,59 @@ def build_daily_pocket_route(
             * DRIVING_TIME_VALUE_PER_HOUR
         )
 
-    # If the dynamic threshold connected everything into one component, the
-    # same logic still behaves sensibly: clear that one pocket by road cost.
-    remaining_pockets = [p[:] for p in pockets]
-    route = [0]
-    current = 0
+    while remaining:
+        # Dynamic local scale from CURRENT position only. This avoids the
+        # transitive "A near B, B near C, therefore A/C same pocket" problem.
+        current_times = sorted(
+            float(durations[current][x]) for x in remaining
+        )
+        nearest_time = current_times[0]
+        local_limit = max(
+            nearest_time * 2.25,
+            nearest_time + 6.0 * 60.0,
+        )
 
-    while remaining_pockets:
-        # Choose the pocket with the cheapest reachable member from where the
-        # driver currently is. This avoids returning to the depot between areas.
-        best_pick = None
-        for p_idx, pocket in enumerate(remaining_pockets):
-            entry = min(
-                pocket,
-                key=lambda node: (
-                    edge_economic_cost(current, node),
-                    float(durations[current][node]),
-                    float(distances[current][node]),
-                    node,
-                ),
-            )
-            key = (
-                edge_economic_cost(current, entry),
-                float(durations[current][entry]),
-                float(distances[current][entry]),
-                entry,
-                p_idx,
-            )
-            if best_pick is None or key < best_pick[0]:
-                best_pick = (key, p_idx, entry)
+        local = [
+            x for x in remaining
+            if float(durations[current][x]) <= local_limit
+        ]
+        if not local:
+            local = list(remaining)
 
-        _, p_idx, entry = best_pick
-        pocket = remaining_pockets.pop(p_idx)
+        def candidate_key(candidate):
+            direct = edge_cost(current, candidate)
+            future_local = [x for x in local if x != candidate]
 
-        # Clear this pocket completely before leaving it. Start with the best
-        # entry from the current position, then use deterministic road-aware
-        # nearest-neighbour selection with one-step look-ahead.
-        pocket_remaining = set(pocket)
-        node = entry
-
-        while pocket_remaining:
-            if node not in pocket_remaining:
-                node = min(
-                    pocket_remaining,
-                    key=lambda x: (
-                        edge_economic_cost(current, x),
-                        float(durations[current][x]),
-                        float(distances[current][x]),
-                        x,
-                    ),
+            if future_local:
+                continuation = min(
+                    edge_cost(candidate, x)
+                    for x in future_local
+                )
+            else:
+                future = remaining - {candidate}
+                continuation = (
+                    min(edge_cost(candidate, x) for x in future)
+                    if future else edge_cost(candidate, 0)
                 )
 
-            route.append(node)
-            pocket_remaining.remove(node)
-            current = node
+            return (
+                direct + 0.15 * continuation,
+                float(durations[current][candidate]),
+                float(distances[current][candidate]),
+                candidate,
+            )
 
-            if not pocket_remaining:
-                break
-
-            def inside_key(candidate):
-                future = pocket_remaining - {candidate}
-                direct = edge_economic_cost(current, candidate)
-                if future:
-                    continuation = min(
-                        edge_economic_cost(candidate, x)
-                        for x in future
-                    )
-                else:
-                    # Small awareness of the next area/depot without allowing
-                    # it to split the current pocket.
-                    next_targets = [
-                        x
-                        for p in remaining_pockets
-                        for x in p
-                    ]
-                    continuation = min(
-                        [edge_economic_cost(candidate, x) for x in next_targets]
-                        + [edge_economic_cost(candidate, 0)]
-                    )
-                return (
-                    direct + 0.20 * continuation,
-                    float(durations[current][candidate]),
-                    float(distances[current][candidate]),
-                    candidate,
-                )
-
-            node = min(pocket_remaining, key=inside_key)
+        chosen = min(local, key=candidate_key)
+        route.append(chosen)
+        remaining.remove(chosen)
+        current = chosen
 
     route.append(0)
     return route
+
+
+
+
 
 
 def pocket_preserving_polish(
@@ -2587,47 +2499,39 @@ if st.button(
     routing_df = pd.DataFrame(rows)
 
     # ------------------------------------------------------------------
-    # V26.1 ROUTING ENGINE INPUT
+    # V26.4 ROUTING ENGINE INPUT
     # ------------------------------------------------------------------
-    # Customer addresses change every day. The route must therefore be built
-    # from safe, generic routing anchors rather than trusting an exact-address
-    # geocoder result blindly.
+    # Route from the validated house-level coordinates already resolved by
+    # get_coords(). Official postcode centroids are kept only as recovery
+    # anchors if live-road validation later identifies a suspicious customer.
     #
-    # Exact address coordinates are still retained in the dataframe for the
-    # customer record / map destination. For route calculation, the official
-    # postcode point is preferred because it is stable and cannot accidentally
-    # snap a customer hundreds of miles away. If a postcode point is genuinely
-    # unavailable, the already-validated exact coordinate is used instead.
-    #
-    # This contains NO town rules, NO postcode ordering, NO expected mileage,
-    # and NO hard-coded route sequence.
+    # No town/postcode ordering, fixed route, expected mileage or test-day
+    # customer rule exists here.
 
-    routing_locations = [[float(depot_coords[1]), float(depot_coords[0])]]
-    routing_anchor_source = ["depot"]
+    locations = [[float(depot_coords[1]), float(depot_coords[0])]]
+    postcode_fallbacks = [None]
 
     for node_idx, df_idx in enumerate(valid_rows, start=1):
-        pc = normalise_postcode(df.loc[df_idx, "Postcode"])
+        row = routing_df.iloc[node_idx]
 
+        # Exact address coordinate produced by the app's existing geocoder,
+        # which already validates exact matches against the postcode area.
+        locations.append([
+            float(row["longitude"]),
+            float(row["latitude"]),
+        ])
+
+        pc = normalise_postcode(row.get("Postcode", ""))
         anchor = get_postcode_coords(pc)
         if anchor is None:
             anchor = LEGACY_POSTCODE_COORDS.get(pc)
 
-        if anchor is not None:
-            lat, lon = float(anchor[0]), float(anchor[1])
-            routing_locations.append([lon, lat])
-            routing_anchor_source.append("postcode")
+        if anchor is None:
+            postcode_fallbacks.append(None)
         else:
-            # Safe fallback only when no postcode coordinate exists.
-            row = routing_df.iloc[node_idx]
-            routing_locations.append(
-                [float(row["longitude"]), float(row["latitude"])]
-            )
-            routing_anchor_source.append("address")
+            lat, lon = float(anchor[0]), float(anchor[1])
+            postcode_fallbacks.append([lon, lat])
 
-    locations = routing_locations
-
-    # Duplicate routing anchors are normal (for example, several houses in one
-    # postcode). They are kept together AFTER full-job optimisation.
     def build_duplicate_groups(route_locations):
         grouped = {}
         for node_idx in range(1, len(route_locations)):
@@ -2642,68 +2546,98 @@ if st.button(
 
     duplicate_groups = build_duplicate_groups(locations)
 
-    if duplicate_groups:
-        grouped_labels = []
-        for group in duplicate_groups:
-            labels = []
-            for node_idx in group:
-                row = routing_df.iloc[node_idx]
-                label = clean_val(row.get("Address", ""))
-                postcode = clean_val(row.get("Postcode", ""))
-                labels.append(label or postcode or "customer")
-            grouped_labels.append(" / ".join(labels))
-
-        st.info(
-            "ℹ️ Jobs sharing the same routing area will be kept together "
-            "in the final route: "
-            + "; ".join(grouped_labels)
-        )
-
-    # First choice: live road matrix using the safe daily routing anchors.
+    # First choice: a genuine ORS matrix from validated house coordinates.
     with st.spinner(
         "🛣️ Getting actual road distances and driving times..."
     ):
         distances, durations = get_ors_matrix(locations)
 
     using_offline = False
+    live_matrix_verified = False
+    corrected_nodes = []
 
-    if not matrix_values_are_valid(
-        distances,
-        durations,
-        len(locations),
-    ):
-        # Do not switch back to suspect exact-address coordinates. If ORS is
-        # unavailable, estimate from the same safe postcode routing anchors.
-        using_offline = True
-        distances, durations = offline_matrix(locations)
-        st.warning(
-            "The live road-routing matrix was unavailable. "
-            "The route is using postcode-based estimated road distances "
-            "for this calculation."
-        )
-    else:
-        # Matrix is structurally valid. Run a diagnostic sanity check, but do
-        # not throw away the whole live matrix merely because one unusual road
-        # pair has a large detour. Postcode anchors are already the safe input.
+    if matrix_values_are_valid(distances, durations, len(locations)):
         suspects = suspicious_matrix_nodes(
             locations,
             distances,
             durations,
         )
-        if suspects:
-            suspect_labels = []
-            for node_idx in suspects[:8]:
-                row = routing_df.iloc[node_idx]
-                label = clean_val(row.get("Address", ""))
-                postcode = clean_val(row.get("Postcode", ""))
-                suspect_labels.append(label or postcode or f"stop {node_idx}")
 
-            st.warning(
-                "Road-routing diagnostics found unusual live-road detours "
-                "around: " + " / ".join(suspect_labels)
-                + ". The route still uses the live road matrix because the "
-                "routing anchors themselves are postcode-validated."
-            )
+        # Repair coordinates, NOT road legs. Each suspicious customer is moved
+        # only to its official postcode anchor, then the WHOLE road matrix is
+        # requested again from ORS. No road distance/time is fabricated.
+        if suspects:
+            retry_locations = [coord[:] for coord in locations]
+            for node_idx in suspects:
+                if node_idx <= 0 or node_idx >= len(postcode_fallbacks):
+                    continue
+                fallback = postcode_fallbacks[node_idx]
+                if fallback is None:
+                    continue
+
+                old_lon, old_lat = retry_locations[node_idx]
+                new_lon, new_lat = fallback
+                shift_km = haversine_km(
+                    old_lat, old_lon, new_lat, new_lon
+                )
+                if shift_km >= 0.03:
+                    retry_locations[node_idx] = [new_lon, new_lat]
+                    corrected_nodes.append(node_idx)
+
+            if corrected_nodes:
+                with st.spinner(
+                    "🛣️ Rechecking suspicious road locations..."
+                ):
+                    retry_d, retry_t = get_ors_matrix(retry_locations)
+
+                if matrix_values_are_valid(
+                    retry_d, retry_t, len(retry_locations)
+                ):
+                    retry_suspects = suspicious_matrix_nodes(
+                        retry_locations,
+                        retry_d,
+                        retry_t,
+                    )
+                    if not retry_suspects:
+                        locations = retry_locations
+                        distances = retry_d
+                        durations = retry_t
+                        live_matrix_verified = True
+
+                        labels = []
+                        for node_idx in corrected_nodes:
+                            row = routing_df.iloc[node_idx]
+                            address = clean_val(row.get("Address", ""))
+                            postcode = clean_val(row.get("Postcode", ""))
+                            labels.append(address or postcode or f"stop {node_idx}")
+
+                        st.info(
+                            "Live-road validation safely corrected the routing "
+                            "location for: " + " / ".join(labels)
+                        )
+                # If retry remains suspicious, do not label it verified/live.
+            else:
+                # Suspicious ORS matrix but no safe coordinate repair available.
+                live_matrix_verified = False
+        else:
+            live_matrix_verified = True
+
+    if not live_matrix_verified:
+        # V26.4 production rule: NO straight-line/estimated routing fallback.
+        # If genuine ORS road data cannot be verified, stop rather than invent
+        # mileage or driving time.
+        st.error(
+            "A verified real-road route could not be calculated. "
+            "No estimated or straight-line route has been substituted."
+        )
+        st.info(
+            "Check the customer addresses/postcodes shown above, then calculate "
+            "the route again. The app will only continue when verified ORS "
+            "driving-road distances and times are available."
+        )
+        st.stop()
+
+    using_offline = False
 
     # Authoritative duplicate groups are based on the exact coordinates used
     # by this route matrix.
@@ -2776,6 +2710,48 @@ if st.button(
         FUEL_PRICE,
         MPG,
     )
+
+    # V26.2 final-leg audit. This makes any remaining bad leg visible instead
+    # of hiding it inside the day's total.
+    leg_audit = route_leg_diagnostics(
+        route,
+        locations,
+        distances,
+        durations,
+    )
+
+    with st.expander("🔎 Routing diagnostics", expanded=False):
+        diagnostic_rows = []
+        for item in leg_audit:
+            a = item["from_node"]
+            b = item["to_node"]
+
+            def node_label(node_idx):
+                if node_idx == 0:
+                    return "DEPOT"
+                row = routing_df.iloc[node_idx]
+                address = clean_val(row.get("Address", ""))
+                postcode = clean_val(row.get("Postcode", ""))
+                return f"{address} ({postcode})" if address else postcode
+
+            diagnostic_rows.append({
+                "Leg": item["leg"],
+                "From": node_label(a),
+                "To": node_label(b),
+                "Road miles": round(item["road_miles"], 2),
+                "Drive min": round(item["minutes"], 1),
+                "Straight miles": round(item["straight_miles"], 2),
+                "Road / straight": (
+                    round(item["ratio"], 2)
+                    if item["ratio"] is not None else ""
+                ),
+            })
+
+        st.dataframe(
+            pd.DataFrame(diagnostic_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     revenue = float(
         routing_df["Price"].sum()
@@ -2931,7 +2907,7 @@ if route_data:
         )
     else:
         st.success(
-            "✅ Route calculated using live road distance and driving time."
+            "✅ Route calculated using verified ORS driving-road distance and driving time."
         )
 
 
