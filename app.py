@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "25.63"
+APP_VERSION = "25.64"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -818,7 +818,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/25.63"
+                    "User-Agent": "DanCleanUKRouteOptimizer/25.64"
                 },
                 timeout=20,
             )
@@ -901,7 +901,7 @@ def get_coords(query_string, postcode):
         return cached
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/25.63"
+        "User-Agent": "DanCleanUKRouteOptimizer/25.64"
     }
 
     # Extract a likely house number and street from the imported address.
@@ -2279,20 +2279,23 @@ if st.button(
             else:
                 route_blocks.insert(target_pos, moving_block)
 
-        # Strong whole-route search on the grouped route.
-        #
-        # From this point each entry in route_blocks is indivisible. A block
-        # may be one normal customer or several jobs sharing one coordinate.
-        # Search block relocations, block swaps and block-level 2-opt reversals
-        # using the SAME fuel + driving-time objective as the main optimiser.
-        # Depot blocks remain fixed at the beginning and end.
-        def block_route_key(blocks):
+        route = [
+            node
+            for block in route_blocks
+            for node in block
+        ]
+
+        # V25.64 SAFE grouped-route polish.
+        # Start from V25.62's known-good grouped route. Duplicate-coordinate
+        # jobs remain indivisible blocks. A candidate is accepted ONLY if its
+        # real route_metrics economic cost strictly improves.
+        def safe_block_metrics(blocks):
             candidate_route = [
                 node
                 for block in blocks
                 for node in block
             ]
-            return _practical_route_key(
+            m = route_metrics(
                 candidate_route,
                 distances,
                 durations,
@@ -2300,71 +2303,103 @@ if st.button(
                 MPG,
             )
 
-        best_blocks = [block[:] for block in route_blocks]
-        best_key = block_route_key(best_blocks)
+            miles = float(m["miles"])
+            time_s = float(m["time_s"])
+            fuel_cost = float(m["fuel_cost"])
 
-        # Deterministic best-improvement search. Four rounds are enough for
-        # normal daily routes while remaining practical in Streamlit.
-        for _ in range(4):
-            round_best_blocks = best_blocks
-            round_best_key = best_key
-            internal_count = len(best_blocks) - 2
+            if not (
+                math.isfinite(miles)
+                and math.isfinite(time_s)
+                and math.isfinite(fuel_cost)
+            ):
+                return None
 
-            # 1) Relocate one complete block anywhere else.
-            for i in range(1, len(best_blocks) - 1):
-                moving = best_blocks[i]
-                remainder = best_blocks[:i] + best_blocks[i + 1:]
+            if miles < 0 or time_s < 0 or fuel_cost < 0:
+                return None
 
-                for j in range(1, len(remainder)):
-                    candidate_blocks = (
-                        remainder[:j]
-                        + [moving]
-                        + remainder[j:]
+            economic_cost = (
+                fuel_cost
+                + (time_s / 3600.0) * DRIVING_TIME_VALUE_PER_HOUR
+            )
+
+            if not math.isfinite(economic_cost):
+                return None
+
+            return {
+                "route": candidate_route,
+                "miles": miles,
+                "time_s": time_s,
+                "fuel_cost": fuel_cost,
+                "economic_cost": economic_cost,
+            }
+
+        current_blocks = [block[:] for block in route_blocks]
+        current_eval = safe_block_metrics(current_blocks)
+
+        if current_eval is not None:
+            # Conservative best-improvement relocation only.
+            # No swap/2-opt experiment from V25.63.
+            for _ in range(3):
+                best_blocks = None
+                best_eval = current_eval
+                best_key = None
+
+                for i in range(1, len(current_blocks) - 1):
+                    moving_block = current_blocks[i]
+                    remainder = (
+                        current_blocks[:i]
+                        + current_blocks[i + 1:]
                     )
-                    candidate_key = block_route_key(candidate_blocks)
-                    if candidate_key < round_best_key:
-                        round_best_key = candidate_key
-                        round_best_blocks = candidate_blocks
 
-            # 2) Swap any two complete internal blocks.
-            for i in range(1, len(best_blocks) - 2):
-                for j in range(i + 1, len(best_blocks) - 1):
-                    candidate_blocks = [block[:] for block in best_blocks]
-                    candidate_blocks[i], candidate_blocks[j] = (
-                        candidate_blocks[j],
-                        candidate_blocks[i],
-                    )
-                    candidate_key = block_route_key(candidate_blocks)
-                    if candidate_key < round_best_key:
-                        round_best_key = candidate_key
-                        round_best_blocks = candidate_blocks
+                    for insert_at in range(1, len(remainder)):
+                        candidate_blocks = (
+                            remainder[:insert_at]
+                            + [moving_block]
+                            + remainder[insert_at:]
+                        )
+                        candidate_eval = safe_block_metrics(candidate_blocks)
 
-            # 3) Block-level 2-opt. Reverse the order of a complete section,
-            # never the customer order inside a duplicate-coordinate block.
-            for i in range(1, len(best_blocks) - 2):
-                for j in range(i + 1, len(best_blocks) - 1):
-                    candidate_blocks = (
-                        best_blocks[:i]
-                        + list(reversed(best_blocks[i:j + 1]))
-                        + best_blocks[j + 1:]
-                    )
-                    candidate_key = block_route_key(candidate_blocks)
-                    if candidate_key < round_best_key:
-                        round_best_key = candidate_key
-                        round_best_blocks = candidate_blocks
+                        if candidate_eval is None:
+                            continue
 
-            if round_best_key >= best_key:
-                break
+                        # Hard safety gate: never accept a route that is not
+                        # strictly cheaper on the real economic objective.
+                        if (
+                            candidate_eval["economic_cost"]
+                            >= current_eval["economic_cost"] - 1e-9
+                        ):
+                            continue
 
-            best_blocks = [block[:] for block in round_best_blocks]
-            best_key = round_best_key
+                        candidate_key = (
+                            round(candidate_eval["economic_cost"], 9),
+                            round(candidate_eval["time_s"], 6),
+                            round(candidate_eval["miles"], 6),
+                            i,
+                            insert_at,
+                        )
 
-        route_blocks = best_blocks
-        route = [
-            node
-            for block in route_blocks
-            for node in block
-        ]
+                        if best_key is None or candidate_key < best_key:
+                            best_key = candidate_key
+                            best_blocks = candidate_blocks
+                            best_eval = candidate_eval
+
+                if best_blocks is None:
+                    break
+
+                # Re-check before commit.
+                if (
+                    best_eval["economic_cost"]
+                    >= current_eval["economic_cost"] - 1e-9
+                ):
+                    break
+
+                current_blocks = [
+                    block[:] for block in best_blocks
+                ]
+                current_eval = best_eval
+
+            route_blocks = current_blocks
+            route = current_eval["route"]
 
     metrics = route_metrics(
         route,
