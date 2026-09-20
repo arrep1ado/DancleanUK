@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "25.58"
+APP_VERSION = "25.59"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -818,7 +818,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/25.58"
+                    "User-Agent": "DanCleanUKRouteOptimizer/25.59"
                 },
                 timeout=20,
             )
@@ -901,7 +901,7 @@ def get_coords(query_string, postcode):
         return cached
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/25.58"
+        "User-Agent": "DanCleanUKRouteOptimizer/25.59"
     }
 
     # Extract a likely house number and street from the imported address.
@@ -2103,82 +2103,109 @@ if st.button(
 
     routing_df = pd.DataFrame(rows)
 
-    # Detect multiple different customer records receiving the same coordinate.
-    # This is a data-quality warning, not a hard-coded route rule.
+    # Group customer records that genuinely share the same routing coordinate.
+    # They remain separate jobs, but the optimiser sees one physical location.
+    # After optimisation, the location is expanded back to all of its jobs
+    # consecutively. This is fully generic and contains no postcode/street rule.
     coordinate_groups = {}
+    coordinate_order = []
+
     for idx in range(1, len(locations)):
         coord_key = (
             round(float(locations[idx][0]), 6),
             round(float(locations[idx][1]), 6),
         )
-        coordinate_groups.setdefault(coord_key, []).append(idx)
+        if coord_key not in coordinate_groups:
+            coordinate_groups[coord_key] = []
+            coordinate_order.append(coord_key)
+        coordinate_groups[coord_key].append(idx)
 
     duplicate_groups = [
-        group for group in coordinate_groups.values()
-        if len(group) > 1
+        coordinate_groups[key]
+        for key in coordinate_order
+        if len(coordinate_groups[key]) > 1
     ]
 
     if duplicate_groups:
-        duplicate_labels = []
+        grouped_labels = []
         for group in duplicate_groups:
-            labels = []
-            for idx in group:
-                labels.append(
-                    str(routing_df.iloc[idx].get("address_text", "customer"))
-                )
-            duplicate_labels.append(" / ".join(labels))
+            labels = [
+                str(routing_df.iloc[idx].get("address_text", "customer"))
+                for idx in group
+            ]
+            grouped_labels.append(" / ".join(labels))
 
-        st.warning(
-            "⚠️ Some customer addresses still share the same routing "
-            "coordinate after the safe geocoding fallback: "
-            + "; ".join(duplicate_labels)
+        st.info(
+            "ℹ️ Jobs sharing the same verified routing coordinate will be "
+            "kept together as one physical stop during optimisation: "
+            + "; ".join(grouped_labels)
         )
+
+    # Compact routing model: depot + one entry per unique customer coordinate.
+    compact_locations = [locations[0]]
+    compact_to_full = {0: [0]}
+
+    compact_idx = 1
+    for coord_key in coordinate_order:
+        group = coordinate_groups[coord_key]
+        representative = group[0]
+        compact_locations.append(locations[representative])
+        compact_to_full[compact_idx] = group[:]
+        compact_idx += 1
 
     with st.spinner(
         "🛣️ Getting actual road distances and driving times..."
     ):
-        distances, durations = get_ors_matrix(locations)
+        compact_distances, compact_durations = get_ors_matrix(compact_locations)
 
     using_offline = False
 
-    if distances is None or durations is None:
+    if compact_distances is None or compact_durations is None:
         using_offline = True
         st.warning(
             "OpenRouteService could not provide the live road matrix. "
             "Using an offline estimate instead."
         )
-        distances, durations = offline_matrix(locations)
+        compact_distances, compact_durations = offline_matrix(compact_locations)
 
     with st.spinner(
-        f"🧠 Optimising {len(valid_rows)} customer stops..."
+        f"🧠 Optimising {len(valid_rows)} customer jobs..."
     ):
-        route = optimise_route(
-            distances,
-            durations,
+        compact_route = optimise_route(
+            compact_distances,
+            compact_durations,
             FUEL_PRICE,
             MPG,
-            locations,
+            compact_locations,
         )
 
-    if not route:
+    if not compact_route:
         st.error("The route optimiser could not create a route.")
         st.stop()
 
-    # v25.37: final whole-route polish after complete-day optimisation has been
-    # selected.  It can only replace the route when the COMPLETE route is
-    # strictly better in both live road time and live road distance.
-    route = surgical_route_polish(
-        route,
-        distances,
-        durations,
+    # Polish the physical-location route before expanding grouped jobs.
+    compact_route = surgical_route_polish(
+        compact_route,
+        compact_distances,
+        compact_durations,
         FUEL_PRICE,
         MPG,
     )
 
+    # Expand every physical location back into its individual customer jobs.
+    # Members of a shared coordinate remain consecutive and deterministic.
+    route = [0]
+    for compact_stop in compact_route[1:-1]:
+        route.extend(compact_to_full[int(compact_stop)])
+    route.append(0)
+
+    # Route totals come from the same physical-location road matrix used for
+    # optimisation. Zero-distance transitions between co-located jobs add no
+    # mileage or driving time.
     metrics = route_metrics(
-        route,
-        distances,
-        durations,
+        compact_route,
+        compact_distances,
+        compact_durations,
         FUEL_PRICE,
         MPG,
     )
