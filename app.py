@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "26.4"
+APP_VERSION = "26.5"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -737,16 +737,6 @@ def nominatim_search(
     return None
 
 
-# Safe coordinates for two older Grantham postcodes that can appear in
-# genuine customer records but may no longer be returned by postcodes.io.
-# These are only a last-resort fallback after exact address geocoding fails.
-# They keep the job in the correct Grantham area rather than dropping it.
-LEGACY_POSTCODE_COORDS = {
-    "NG31 7AN": (52.909806, -0.640572),
-    "NG31 9EH": (52.909052, -0.630469),
-}
-
-
 def get_postcode_coords(postcode):
     """Return the official postcode centroid used as a safety anchor.
 
@@ -818,7 +808,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/26.4"
+                    "User-Agent": "DanCleanUKRouteOptimizer/26.5"
                 },
                 timeout=20,
             )
@@ -881,30 +871,54 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
     return None
 
 
+def _postcode_outcode(postcode):
+    postcode = normalise_postcode(postcode)
+    if not postcode:
+        return ""
+    return postcode.split()[0].upper()
+
+
+def reverse_postcode_outcode(lat, lon):
+    """Return the nearest live UK postcode outcode for a coordinate.
+
+    This is a validation check only. It never supplies route distance/time and
+    never changes the road matrix. It prevents a geocoder from matching the
+    right house/street name in the wrong part of the country.
+    """
+    try:
+        response = requests.get(
+            "https://api.postcodes.io/postcodes",
+            params={"lat": float(lat), "lon": float(lon), "limit": 1},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return ""
+        results = response.json().get("result") or []
+        if not results:
+            return ""
+        nearest = normalise_postcode(results[0].get("postcode", ""))
+        return _postcode_outcode(nearest)
+    except Exception:
+        return ""
+
+
 def get_coords(query_string, postcode):
-    """Locate an address safely with house-level lookup before postcode fallback.
+    """Locate a customer safely before any ORS road calculation.
 
-    V25.52 changes ONLY the geocoding layer. The V25.51 route/economic
-    optimiser is deliberately left untouched.
+    House-level geocoder results are accepted only when they agree with the
+    supplied postcode geography. Cached coordinates are revalidated too, so a
+    bad coordinate from an earlier lookup cannot survive inside the session.
 
-    Exact house/street sources are tried first. Every exact result is checked
-    against the official postcode centroid before it can enter the route.
-    If no house-level source can resolve the address, the postcode centroid is
-    still used as the safe fallback so a genuine customer is never dropped.
+    If the supplied postcode cannot be verified and the candidate coordinate
+    does not even belong to the same postcode outcode, the customer is left
+    unlocated rather than routing hundreds of real-road miles to a wrong place.
     """
     query = str(query_string or "").strip()
     postcode = normalise_postcode(postcode)
     key = cache_key_for(query, postcode)
 
-    cached = st.session_state.geocode_cache.get(key)
-    if cached is not None:
-        return cached
+    headers = {"User-Agent": "DanCleanUKRouteOptimizer/26.5"}
 
-    headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/26.4"
-    }
-
-    # Extract a likely house number and street from the imported address.
     house_match = re.search(r"(?<!\d)(\d+[A-Za-z]?)\b", query)
     expected_house = house_match.group(1) if house_match else ""
 
@@ -913,9 +927,8 @@ def get_coords(query_string, postcode):
         tail = query[house_match.end():]
         expected_street = tail.split(",")[0].strip()
 
-    # Official postcode centroid is the safety anchor. It prevents the old
-    # V25.44 problem where a bad exact geocoder result created a huge route.
     postcode_anchor = get_postcode_coords(postcode)
+    expected_outcode = _postcode_outcode(postcode)
 
     def safe_exact(coords):
         if coords is None:
@@ -928,30 +941,47 @@ def get_coords(query_string, postcode):
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             return None
 
+        # Strongest check: a live official postcode point exists. Exact house
+        # coordinates must remain geographically close to that postcode.
         if postcode_anchor is not None:
             if haversine_km(
-                postcode_anchor[0],
-                postcode_anchor[1],
-                lat,
-                lon,
+                postcode_anchor[0], postcode_anchor[1], lat, lon
             ) > 5.0:
                 return None
+            return (lat, lon)
 
-        return (lat, lon)
+        # If the exact postcode is unavailable/invalid, never trust only a
+        # matching house number + street name. Reverse-check the candidate's
+        # live postcode district. This catches distant same-name streets.
+        if expected_outcode:
+            candidate_outcode = reverse_postcode_outcode(lat, lon)
+            if not candidate_outcode or candidate_outcode != expected_outcode:
+                return None
+            return (lat, lon)
 
-    # 1. ORS/Pelias exact address lookup.
-    exact_ors = ors_exact_geocode(
-        query,
-        postcode,
-        expected_house_number=expected_house,
-        expected_street=expected_street,
+        return None
+
+    # Revalidate cached coordinates under the CURRENT safety rules. This is
+    # essential because a previously cached wrong match must not bypass fixes.
+    cached = st.session_state.geocode_cache.get(key)
+    if cached is not None:
+        checked_cached = safe_exact(cached)
+        if checked_cached is not None:
+            return checked_cached
+        st.session_state.geocode_cache.pop(key, None)
+
+    exact_ors = safe_exact(
+        ors_exact_geocode(
+            query,
+            postcode,
+            expected_house_number=expected_house,
+            expected_street=expected_street,
+        )
     )
-    exact_ors = safe_exact(exact_ors)
     if exact_ors is not None:
         st.session_state.geocode_cache[key] = exact_ors
         return exact_ors
 
-    # 2. Nominatim exact address lookup.
     for candidate in geocode_candidates(query, postcode):
         coords = nominatim_search(
             candidate,
@@ -966,31 +996,26 @@ def get_coords(query_string, postcode):
             return coords
         time.sleep(0.35)
 
-    # 3. Additional OSM/Photon house-level lookup. This is particularly useful
-    # when several houses share the same postcode, such as 180/190/194/196
-    # Queensway. It is still protected by the postcode safety anchor.
-    photon = photon_exact_geocode(
-        query,
-        postcode,
-        expected_house_number=expected_house,
-        expected_street=expected_street,
+    photon = safe_exact(
+        photon_exact_geocode(
+            query,
+            postcode,
+            expected_house_number=expected_house,
+            expected_street=expected_street,
+        )
     )
-    photon = safe_exact(photon)
     if photon is not None:
         st.session_state.geocode_cache[key] = photon
         return photon
 
-    # 4. Safe fallback: retain the customer at the official postcode point.
+    # A verified live postcode centroid is a safe routing fallback when a
+    # house point is unavailable. It is not a road-distance estimate; ORS will
+    # still calculate every distance/time on the real driving network.
     if postcode_anchor is not None:
         st.session_state.geocode_cache[key] = postcode_anchor
         return postcode_anchor
 
-    # 5. Historical Grantham postcode fallback.
-    legacy = LEGACY_POSTCODE_COORDS.get(postcode)
-    if legacy is not None:
-        st.session_state.geocode_cache[key] = legacy
-        return legacy
-
+    # No verified location: do not guess.
     return None
 
 
@@ -2463,6 +2488,20 @@ if st.button(
     else:
         st.session_state.failed_jobs = pd.DataFrame()
 
+    if failed_rows:
+        st.error(
+            f"{len(failed_rows)} customer address(es) could not be verified. "
+            "The route has NOT been calculated, because an incomplete or "
+            "mislocated daily route would be inaccurate."
+        )
+        cols = [c for c in ["Address", "Postcode", "Phone"] if c in df.columns]
+        st.dataframe(df.loc[failed_rows, cols], use_container_width=True)
+        st.info(
+            "Correct the address/postcode shown above and calculate again. "
+            "The app will not guess a location or substitute straight-line mileage."
+        )
+        st.stop()
+
     if not valid_rows:
         st.error("No customer addresses could be located.")
         st.stop()
@@ -2523,8 +2562,6 @@ if st.button(
 
         pc = normalise_postcode(row.get("Postcode", ""))
         anchor = get_postcode_coords(pc)
-        if anchor is None:
-            anchor = LEGACY_POSTCODE_COORDS.get(pc)
 
         if anchor is None:
             postcode_fallbacks.append(None)
