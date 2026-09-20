@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "25.59"
+APP_VERSION = "25.62"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -818,7 +818,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/25.59"
+                    "User-Agent": "DanCleanUKRouteOptimizer/25.62"
                 },
                 timeout=20,
             )
@@ -901,7 +901,7 @@ def get_coords(query_string, postcode):
         return cached
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/25.59"
+        "User-Agent": "DanCleanUKRouteOptimizer/25.62"
     }
 
     # Extract a likely house number and street from the imported address.
@@ -2103,27 +2103,21 @@ if st.button(
 
     routing_df = pd.DataFrame(rows)
 
-    # Group customer records that genuinely share the same routing coordinate.
-    # They remain separate jobs, but the optimiser sees one physical location.
-    # After optimisation, the location is expanded back to all of its jobs
-    # consecutively. This is fully generic and contains no postcode/street rule.
+    # Detect customer jobs that share the exact same routing coordinate.
+    # IMPORTANT: unlike V25.59, the optimiser still receives the FULL matrix
+    # with every customer job present. Grouping is applied only AFTER the best
+    # route has been selected, so duplicate handling cannot change the search.
     coordinate_groups = {}
-    coordinate_order = []
-
     for idx in range(1, len(locations)):
         coord_key = (
             round(float(locations[idx][0]), 6),
             round(float(locations[idx][1]), 6),
         )
-        if coord_key not in coordinate_groups:
-            coordinate_groups[coord_key] = []
-            coordinate_order.append(coord_key)
-        coordinate_groups[coord_key].append(idx)
+        coordinate_groups.setdefault(coord_key, []).append(idx)
 
     duplicate_groups = [
-        coordinate_groups[key]
-        for key in coordinate_order
-        if len(coordinate_groups[key]) > 1
+        group for group in coordinate_groups.values()
+        if len(group) > 1
     ]
 
     if duplicate_groups:
@@ -2136,76 +2130,165 @@ if st.button(
             grouped_labels.append(" / ".join(labels))
 
         st.info(
-            "ℹ️ Jobs sharing the same verified routing coordinate will be "
-            "kept together as one physical stop during optimisation: "
+            "ℹ️ Jobs sharing the same routing coordinate will be kept "
+            "together in the final route: "
             + "; ".join(grouped_labels)
         )
-
-    # Compact routing model: depot + one entry per unique customer coordinate.
-    compact_locations = [locations[0]]
-    compact_to_full = {0: [0]}
-
-    compact_idx = 1
-    for coord_key in coordinate_order:
-        group = coordinate_groups[coord_key]
-        representative = group[0]
-        compact_locations.append(locations[representative])
-        compact_to_full[compact_idx] = group[:]
-        compact_idx += 1
 
     with st.spinner(
         "🛣️ Getting actual road distances and driving times..."
     ):
-        compact_distances, compact_durations = get_ors_matrix(compact_locations)
+        distances, durations = get_ors_matrix(locations)
 
     using_offline = False
 
-    if compact_distances is None or compact_durations is None:
+    if distances is None or durations is None:
         using_offline = True
         st.warning(
             "OpenRouteService could not provide the live road matrix. "
             "Using an offline estimate instead."
         )
-        compact_distances, compact_durations = offline_matrix(compact_locations)
+        distances, durations = offline_matrix(locations)
 
     with st.spinner(
-        f"🧠 Optimising {len(valid_rows)} customer jobs..."
+        f"🧠 Optimising {len(valid_rows)} customer stops..."
     ):
-        compact_route = optimise_route(
-            compact_distances,
-            compact_durations,
+        route = optimise_route(
+            distances,
+            durations,
             FUEL_PRICE,
             MPG,
-            compact_locations,
+            locations,
         )
 
-    if not compact_route:
+    if not route:
         st.error("The route optimiser could not create a route.")
         st.stop()
 
-    # Polish the physical-location route before expanding grouped jobs.
-    compact_route = surgical_route_polish(
-        compact_route,
-        compact_distances,
-        compact_durations,
+    # Keep V25.58's full-job optimisation and whole-route polish unchanged.
+    route = surgical_route_polish(
+        route,
+        distances,
+        durations,
         FUEL_PRICE,
         MPG,
     )
 
-    # Expand every physical location back into its individual customer jobs.
-    # Members of a shared coordinate remain consecutive and deterministic.
-    route = [0]
-    for compact_stop in compact_route[1:-1]:
-        route.extend(compact_to_full[int(compact_stop)])
-    route.append(0)
+    # Post-optimisation duplicate grouping.
+    #
+    # Every duplicate-coordinate set is converted into an indivisible block.
+    # Blocks are then positioned one at a time, but insertion is allowed only
+    # BETWEEN existing blocks. Therefore a later duplicate group can never be
+    # inserted inside an earlier duplicate group and split it apart.
+    #
+    # The optimiser itself still receives the original full customer matrix.
+    # No GPS coordinates are invented and no postcode/street/depot rule exists.
+    if duplicate_groups:
+        duplicate_lookup = {}
+        ordered_duplicate_members = {}
 
-    # Route totals come from the same physical-location road matrix used for
-    # optimisation. Zero-distance transitions between co-located jobs add no
-    # mileage or driving time.
+        for group_id, group in enumerate(duplicate_groups):
+            group_set = set(group)
+            ordered_members = [node for node in route if node in group_set]
+            ordered_duplicate_members[group_id] = ordered_members
+            for node in group:
+                duplicate_lookup[node] = group_id
+
+        # Build route blocks while preserving the optimised route's first
+        # occurrence/order. Depot endpoints stay as their own blocks.
+        route_blocks = [[route[0]]]
+        emitted_groups = set()
+
+        for node in route[1:-1]:
+            if node in duplicate_lookup:
+                group_id = duplicate_lookup[node]
+                if group_id not in emitted_groups:
+                    route_blocks.append(ordered_duplicate_members[group_id][:])
+                    emitted_groups.add(group_id)
+            else:
+                route_blocks.append([node])
+
+        route_blocks.append([route[-1]])
+
+        # Reposition each duplicate block economically, but ONLY at boundaries
+        # between blocks. This guarantees all grouped jobs remain consecutive.
+        for group_id in range(len(duplicate_groups)):
+            target_members = ordered_duplicate_members[group_id]
+            if not target_members:
+                continue
+
+            # Find and remove this exact duplicate block.
+            target_pos = None
+            for i, block in enumerate(route_blocks):
+                if block == target_members:
+                    target_pos = i
+                    break
+
+            if target_pos is None:
+                continue
+
+            moving_block = route_blocks.pop(target_pos)
+
+            best_blocks = None
+            best_key = None
+
+            # First and last blocks are depot endpoints. Insert only between
+            # block boundaries inside them.
+            for insert_at in range(1, len(route_blocks)):
+                candidate_blocks = (
+                    route_blocks[:insert_at]
+                    + [moving_block]
+                    + route_blocks[insert_at:]
+                )
+                candidate = [
+                    node
+                    for block in candidate_blocks
+                    for node in block
+                ]
+
+                candidate_metrics = route_metrics(
+                    candidate,
+                    distances,
+                    durations,
+                    FUEL_PRICE,
+                    MPG,
+                )
+
+                candidate_hours = float(candidate_metrics["time_s"]) / 3600.0
+                candidate_miles = float(candidate_metrics["miles"])
+                candidate_score = (
+                    float(candidate_metrics["fuel_cost"])
+                    + (candidate_hours * DRIVING_TIME_VALUE_PER_HOUR)
+                )
+
+                # Deterministic tie-break: economic objective, time, distance,
+                # then earliest valid block boundary.
+                candidate_key = (
+                    round(candidate_score, 9),
+                    round(candidate_hours, 9),
+                    round(candidate_miles, 9),
+                    insert_at,
+                )
+
+                if best_key is None or candidate_key < best_key:
+                    best_key = candidate_key
+                    best_blocks = candidate_blocks
+
+            if best_blocks is not None:
+                route_blocks = best_blocks
+            else:
+                route_blocks.insert(target_pos, moving_block)
+
+        route = [
+            node
+            for block in route_blocks
+            for node in block
+        ]
+
     metrics = route_metrics(
-        compact_route,
-        compact_distances,
-        compact_durations,
+        route,
+        distances,
+        durations,
         FUEL_PRICE,
         MPG,
     )
