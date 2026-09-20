@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "25.66"
+APP_VERSION = "26.1"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -818,7 +818,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/25.66"
+                    "User-Agent": "DanCleanUKRouteOptimizer/26.1"
                 },
                 timeout=20,
             )
@@ -901,7 +901,7 @@ def get_coords(query_string, postcode):
         return cached
 
     headers = {
-        "User-Agent": "DanCleanUKRouteOptimizer/25.66"
+        "User-Agent": "DanCleanUKRouteOptimizer/26.1"
     }
 
     # Extract a likely house number and street from the imported address.
@@ -1713,6 +1713,271 @@ def _route_search(route, distances, durations, max_rounds=2, fuel_price=None, mp
     return best
 
 
+
+def build_daily_pocket_route(
+    distances,
+    durations,
+    locations,
+    fuel_price,
+    mpg,
+):
+    """Build a deterministic driver-style daily route.
+
+    Behaviour:
+    - start at the depot/current route origin;
+    - discover natural pockets from THIS day's road-time relationships;
+    - clear the current pocket before making a materially longer move;
+    - choose the next pocket from the current position;
+    - return to the depot only after all jobs are visited.
+
+    There are no postcode, town, address, mileage, stop-order or test-day rules.
+    Pocket scale is derived from the day's own nearest-neighbour road times.
+    """
+    customer_count = len(distances) - 1
+    if customer_count <= 0:
+        return [0, 0]
+    if customer_count == 1:
+        return [0, 1, 0]
+
+    customers = list(range(1, customer_count + 1))
+
+    # Each customer's nearest OTHER customer road time. This describes the
+    # natural local spacing of today's work without assuming a town or radius.
+    nearest_times = []
+    for i in customers:
+        vals = [
+            float(durations[i][j])
+            for j in customers
+            if j != i
+            and math.isfinite(float(durations[i][j]))
+            and float(durations[i][j]) >= 0.0
+        ]
+        if vals:
+            nearest_times.append(min(vals))
+
+    if nearest_times:
+        ordered = sorted(nearest_times)
+        median_nn = ordered[len(ordered) // 2]
+    else:
+        median_nn = 0.0
+
+    # Dynamic pocket threshold. It grows from today's actual customer spacing.
+    # A floor only prevents identical/very-close coordinates from making the
+    # threshold zero; it is not a locality or total-route constraint.
+    pocket_time = max(8.0 * 60.0, median_nn * 2.5)
+
+    # Build undirected connectivity using the better of the two road directions.
+    adjacency = {i: set() for i in customers}
+    for pos, i in enumerate(customers):
+        for j in customers[pos + 1:]:
+            tij = min(float(durations[i][j]), float(durations[j][i]))
+            if math.isfinite(tij) and tij <= pocket_time:
+                adjacency[i].add(j)
+                adjacency[j].add(i)
+
+    # Connected components are today's natural pockets.
+    pockets = []
+    unseen = set(customers)
+    while unseen:
+        seed = min(unseen)
+        stack = [seed]
+        unseen.remove(seed)
+        component = []
+        while stack:
+            node = stack.pop()
+            component.append(node)
+            for nxt in sorted(adjacency[node]):
+                if nxt in unseen:
+                    unseen.remove(nxt)
+                    stack.append(nxt)
+        pockets.append(sorted(component))
+
+    def edge_economic_cost(a, b):
+        miles = float(distances[a][b]) / 1000.0 * 0.621371
+        litres = miles / float(mpg) * 4.54609
+        return (
+            litres * float(fuel_price)
+            + (float(durations[a][b]) / 3600.0)
+            * DRIVING_TIME_VALUE_PER_HOUR
+        )
+
+    # If the dynamic threshold connected everything into one component, the
+    # same logic still behaves sensibly: clear that one pocket by road cost.
+    remaining_pockets = [p[:] for p in pockets]
+    route = [0]
+    current = 0
+
+    while remaining_pockets:
+        # Choose the pocket with the cheapest reachable member from where the
+        # driver currently is. This avoids returning to the depot between areas.
+        best_pick = None
+        for p_idx, pocket in enumerate(remaining_pockets):
+            entry = min(
+                pocket,
+                key=lambda node: (
+                    edge_economic_cost(current, node),
+                    float(durations[current][node]),
+                    float(distances[current][node]),
+                    node,
+                ),
+            )
+            key = (
+                edge_economic_cost(current, entry),
+                float(durations[current][entry]),
+                float(distances[current][entry]),
+                entry,
+                p_idx,
+            )
+            if best_pick is None or key < best_pick[0]:
+                best_pick = (key, p_idx, entry)
+
+        _, p_idx, entry = best_pick
+        pocket = remaining_pockets.pop(p_idx)
+
+        # Clear this pocket completely before leaving it. Start with the best
+        # entry from the current position, then use deterministic road-aware
+        # nearest-neighbour selection with one-step look-ahead.
+        pocket_remaining = set(pocket)
+        node = entry
+
+        while pocket_remaining:
+            if node not in pocket_remaining:
+                node = min(
+                    pocket_remaining,
+                    key=lambda x: (
+                        edge_economic_cost(current, x),
+                        float(durations[current][x]),
+                        float(distances[current][x]),
+                        x,
+                    ),
+                )
+
+            route.append(node)
+            pocket_remaining.remove(node)
+            current = node
+
+            if not pocket_remaining:
+                break
+
+            def inside_key(candidate):
+                future = pocket_remaining - {candidate}
+                direct = edge_economic_cost(current, candidate)
+                if future:
+                    continuation = min(
+                        edge_economic_cost(candidate, x)
+                        for x in future
+                    )
+                else:
+                    # Small awareness of the next area/depot without allowing
+                    # it to split the current pocket.
+                    next_targets = [
+                        x
+                        for p in remaining_pockets
+                        for x in p
+                    ]
+                    continuation = min(
+                        [edge_economic_cost(candidate, x) for x in next_targets]
+                        + [edge_economic_cost(candidate, 0)]
+                    )
+                return (
+                    direct + 0.20 * continuation,
+                    float(durations[current][candidate]),
+                    float(distances[current][candidate]),
+                    candidate,
+                )
+
+            node = min(pocket_remaining, key=inside_key)
+
+    route.append(0)
+    return route
+
+
+def pocket_preserving_polish(
+    route,
+    distances,
+    durations,
+    locations,
+    fuel_price,
+    mpg,
+):
+    """Conservative final polish.
+
+    Only accepts a relocation when it improves the real economic objective AND
+    does not create a larger local jump around the moved customer than the
+    original route. This prevents a global optimiser from undoing the
+    driver-style pocket behaviour.
+    """
+    if not route or len(route) < 5:
+        return route[:] if route else route
+
+    best = route[:]
+    best_metrics = route_metrics(best, distances, durations, fuel_price, mpg)
+    best_score = (
+        float(best_metrics["fuel_cost"])
+        + (float(best_metrics["time_s"]) / 3600.0)
+        * DRIVING_TIME_VALUE_PER_HOUR
+    )
+
+    # One conservative deterministic pass is intentional.
+    original = best[:]
+    for i in range(1, len(original) - 1):
+        customer = original[i]
+        if customer not in best[1:-1]:
+            continue
+        old_i = best.index(customer)
+        old_prev = best[old_i - 1]
+        old_next = best[old_i + 1]
+        old_local = (
+            float(durations[old_prev][customer])
+            + float(durations[customer][old_next])
+        )
+
+        shortened = best[:old_i] + best[old_i + 1:]
+        chosen = None
+
+        for j in range(1, len(shortened)):
+            prev_node = shortened[j - 1]
+            next_node = shortened[j]
+            new_local = (
+                float(durations[prev_node][customer])
+                + float(durations[customer][next_node])
+            )
+
+            # Do not move a job into a materially more remote local position.
+            if new_local > old_local * 1.20 + 120.0:
+                continue
+
+            candidate = shortened[:j] + [customer] + shortened[j:]
+            metrics = route_metrics(
+                candidate, distances, durations, fuel_price, mpg
+            )
+            score = (
+                float(metrics["fuel_cost"])
+                + (float(metrics["time_s"]) / 3600.0)
+                * DRIVING_TIME_VALUE_PER_HOUR
+            )
+            key = (
+                round(score, 9),
+                round(float(metrics["time_s"]), 6),
+                round(float(metrics["distance_m"]), 6),
+                j,
+            )
+            if score + 1e-9 < best_score and (
+                chosen is None or key < chosen[0]
+            ):
+                chosen = (key, candidate, metrics)
+
+        if chosen is not None:
+            _, best, best_metrics = chosen
+            best_score = (
+                float(best_metrics["fuel_cost"])
+                + (float(best_metrics["time_s"]) / 3600.0)
+                * DRIVING_TIME_VALUE_PER_HOUR
+            )
+
+    return best
+
+
 def optimise_route(
     distances,
     durations,
@@ -2321,368 +2586,188 @@ if st.button(
 
     routing_df = pd.DataFrame(rows)
 
-    # Detect customer jobs that share the exact same routing coordinate.
-    # IMPORTANT: unlike V25.59, the optimiser still receives the FULL matrix
-    # with every customer job present. Grouping is applied only AFTER the best
-    # route has been selected, so duplicate handling cannot change the search.
-    coordinate_groups = {}
-    for idx in range(1, len(locations)):
-        coord_key = (
-            round(float(locations[idx][0]), 6),
-            round(float(locations[idx][1]), 6),
-        )
-        coordinate_groups.setdefault(coord_key, []).append(idx)
+    # ------------------------------------------------------------------
+    # V26.1 ROUTING ENGINE INPUT
+    # ------------------------------------------------------------------
+    # Customer addresses change every day. The route must therefore be built
+    # from safe, generic routing anchors rather than trusting an exact-address
+    # geocoder result blindly.
+    #
+    # Exact address coordinates are still retained in the dataframe for the
+    # customer record / map destination. For route calculation, the official
+    # postcode point is preferred because it is stable and cannot accidentally
+    # snap a customer hundreds of miles away. If a postcode point is genuinely
+    # unavailable, the already-validated exact coordinate is used instead.
+    #
+    # This contains NO town rules, NO postcode ordering, NO expected mileage,
+    # and NO hard-coded route sequence.
 
-    duplicate_groups = [
-        group for group in coordinate_groups.values()
-        if len(group) > 1
-    ]
+    routing_locations = [[float(depot_coords[1]), float(depot_coords[0])]]
+    routing_anchor_source = ["depot"]
 
-    if duplicate_groups:
-        grouped_labels = []
-        for group in duplicate_groups:
-            labels = [
-                str(routing_df.iloc[idx].get("address_text", "customer"))
-                for idx in group
-            ]
-            grouped_labels.append(" / ".join(labels))
+    for node_idx, df_idx in enumerate(valid_rows, start=1):
+        pc = normalise_postcode(df.loc[df_idx, "Postcode"])
 
-        st.info(
-            "ℹ️ Jobs sharing the same routing coordinate will be kept "
-            "together in the final route: "
-            + "; ".join(grouped_labels)
-        )
-
-    # Official postcode centroids are retained independently from the exact
-    # address coordinates. They are used only if the LIVE road matrix proves
-    # that an exact address point is repeatedly producing implausible detours.
-    postcode_fallbacks = [None]
-    for idx in valid_rows:
-        pc = normalise_postcode(df.loc[idx, "Postcode"])
         anchor = get_postcode_coords(pc)
         if anchor is None:
             anchor = LEGACY_POSTCODE_COORDS.get(pc)
 
-        if anchor is None:
-            postcode_fallbacks.append(None)
+        if anchor is not None:
+            lat, lon = float(anchor[0]), float(anchor[1])
+            routing_locations.append([lon, lat])
+            routing_anchor_source.append("postcode")
         else:
-            # Matrix/location format is [longitude, latitude].
-            postcode_fallbacks.append(
-                [float(anchor[1]), float(anchor[0])]
+            # Safe fallback only when no postcode coordinate exists.
+            row = routing_df.iloc[node_idx]
+            routing_locations.append(
+                [float(row["longitude"]), float(row["latitude"])]
             )
+            routing_anchor_source.append("address")
 
-    with st.spinner(
-        "🛣️ Getting and validating actual road distances and driving times..."
-    ):
-        distances, durations, validated_locations, repaired_nodes = (
-            get_validated_ors_matrix(
-                locations,
-                postcode_fallbacks,
-            )
-        )
+    locations = routing_locations
 
-    # Keep routing_df consistent with any automatic postcode-centroid repair.
-    if repaired_nodes:
-        repaired_labels = []
-        for node_idx in repaired_nodes:
-            locations[node_idx] = validated_locations[node_idx]
-            routing_df.at[node_idx, "longitude"] = validated_locations[node_idx][0]
-            routing_df.at[node_idx, "latitude"] = validated_locations[node_idx][1]
-            repaired_labels.append(
-                str(
-                    routing_df.iloc[node_idx].get(
-                        "address_text",
-                        routing_df.iloc[node_idx].get("Postcode", "customer"),
-                    )
-                )
-            )
+    # Duplicate routing anchors are normal (for example, several houses in one
+    # postcode). They are kept together AFTER full-job optimisation.
+    def build_duplicate_groups(route_locations):
+        grouped = {}
+        for node_idx in range(1, len(route_locations)):
+            lon, lat = route_locations[node_idx]
+            key = (round(float(lon), 6), round(float(lat), 6))
+            grouped.setdefault(key, []).append(node_idx)
+        return [
+            members
+            for members in grouped.values()
+            if len(members) > 1
+        ]
+
+    duplicate_groups = build_duplicate_groups(locations)
+
+    if duplicate_groups:
+        grouped_labels = []
+        for group in duplicate_groups:
+            labels = []
+            for node_idx in group:
+                row = routing_df.iloc[node_idx]
+                label = clean_val(row.get("Address", ""))
+                postcode = clean_val(row.get("Postcode", ""))
+                labels.append(label or postcode or "customer")
+            grouped_labels.append(" / ".join(labels))
 
         st.info(
-            "ℹ️ Live-road validation corrected suspicious address routing "
-            "for: " + " / ".join(repaired_labels)
+            "ℹ️ Jobs sharing the same routing area will be kept together "
+            "in the final route: "
+            + "; ".join(grouped_labels)
         )
+
+    # First choice: live road matrix using the safe daily routing anchors.
+    with st.spinner(
+        "🛣️ Getting actual road distances and driving times..."
+    ):
+        distances, durations = get_ors_matrix(locations)
 
     using_offline = False
 
-    if distances is None or durations is None:
+    if not matrix_values_are_valid(
+        distances,
+        durations,
+        len(locations),
+    ):
+        # Do not switch back to suspect exact-address coordinates. If ORS is
+        # unavailable, estimate from the same safe postcode routing anchors.
         using_offline = True
-        locations = validated_locations
-        st.warning(
-            "The live road matrix failed route-sanity validation. "
-            "Using the safe offline road estimate instead of presenting "
-            "implausible live mileage."
-        )
         distances, durations = offline_matrix(locations)
+        st.warning(
+            "The live road-routing matrix was unavailable. "
+            "The route is using postcode-based estimated road distances "
+            "for this calculation."
+        )
     else:
-        locations = validated_locations
+        # Matrix is structurally valid. Run a diagnostic sanity check, but do
+        # not throw away the whole live matrix merely because one unusual road
+        # pair has a large detour. Postcode anchors are already the safe input.
+        suspects = suspicious_matrix_nodes(
+            locations,
+            distances,
+            durations,
+        )
+        if suspects:
+            suspect_labels = []
+            for node_idx in suspects[:8]:
+                row = routing_df.iloc[node_idx]
+                label = clean_val(row.get("Address", ""))
+                postcode = clean_val(row.get("Postcode", ""))
+                suspect_labels.append(label or postcode or f"stop {node_idx}")
 
-    # V25.66: matrix validation may have replaced an exact address coordinate
-    # with its postcode centroid. Recompute same-coordinate customer groups
-    # NOW, from the final coordinates actually used by the route matrix.
-    # This prevents customers that become identical after a safe repair from
-    # being separated later in the route.
-    coordinate_groups = {}
-    for node_idx in range(1, len(locations)):
-        lon, lat = locations[node_idx]
-        coord_key = (round(float(lon), 6), round(float(lat), 6))
-        coordinate_groups.setdefault(coord_key, []).append(node_idx)
+            st.warning(
+                "Road-routing diagnostics found unusual live-road detours "
+                "around: " + " / ".join(suspect_labels)
+                + ". The route still uses the live road matrix because the "
+                "routing anchors themselves are postcode-validated."
+            )
 
-    duplicate_coordinate_groups = [
-        members
-        for members in coordinate_groups.values()
-        if len(members) > 1
-    ]
+    # Authoritative duplicate groups are based on the exact coordinates used
+    # by this route matrix.
+    duplicate_groups = build_duplicate_groups(locations)
 
     with st.spinner(
         f"🧠 Optimising {len(valid_rows)} customer stops..."
     ):
-        route = optimise_route(
+        route = build_daily_pocket_route(
             distances,
             durations,
+            locations,
             FUEL_PRICE,
             MPG,
-            locations,
         )
 
     if not route:
         st.error("The route optimiser could not create a route.")
         st.stop()
 
-    # Keep V25.58's full-job optimisation and whole-route polish unchanged.
-    route = surgical_route_polish(
+    # V26.1: preserve the daily pocket behaviour during final improvement.
+    # The old unconstrained whole-route polish is intentionally NOT used here.
+    route = pocket_preserving_polish(
         route,
         distances,
         durations,
+        locations,
         FUEL_PRICE,
         MPG,
     )
 
-    # Post-optimisation duplicate grouping.
-    #
-    # Every duplicate-coordinate set is converted into an indivisible block.
-    # Blocks are then positioned one at a time, but insertion is allowed only
-    # BETWEEN existing blocks. Therefore a later duplicate group can never be
-    # inserted inside an earlier duplicate group and split it apart.
-    #
-    # The optimiser itself still receives the original full customer matrix.
-    # No GPS coordinates are invented and no postcode/street/depot rule exists.
+    # Keep same-coordinate jobs consecutive without globally relocating
+    # their area. The first occurrence determines the group's position.
     if duplicate_groups:
-        duplicate_lookup = {}
-        ordered_duplicate_members = {}
-
-        for group_id, group in enumerate(duplicate_groups):
-            group_set = set(group)
-            ordered_members = [node for node in route if node in group_set]
-            ordered_duplicate_members[group_id] = ordered_members
+        group_for = {}
+        for gid, group in enumerate(duplicate_groups):
             for node in group:
-                duplicate_lookup[node] = group_id
+                group_for[node] = gid
 
-        # Build route blocks while preserving the optimised route's first
-        # occurrence/order. Depot endpoints stay as their own blocks.
-        route_blocks = [[route[0]]]
-        emitted_groups = set()
+        emitted = set()
+        grouped_route = [route[0]]
 
         for node in route[1:-1]:
-            if node in duplicate_lookup:
-                group_id = duplicate_lookup[node]
-                if group_id not in emitted_groups:
-                    route_blocks.append(ordered_duplicate_members[group_id][:])
-                    emitted_groups.add(group_id)
-            else:
-                route_blocks.append([node])
-
-        route_blocks.append([route[-1]])
-
-        # Reposition each duplicate block economically, but ONLY at boundaries
-        # between blocks. This guarantees all grouped jobs remain consecutive.
-        for group_id in range(len(duplicate_groups)):
-            target_members = ordered_duplicate_members[group_id]
-            if not target_members:
+            gid = group_for.get(node)
+            if gid is None:
+                grouped_route.append(node)
+                continue
+            if gid in emitted:
                 continue
 
-            # Find and remove this exact duplicate block.
-            target_pos = None
-            for i, block in enumerate(route_blocks):
-                if block == target_members:
-                    target_pos = i
-                    break
+            members = [x for x in route[1:-1] if group_for.get(x) == gid]
+            grouped_route.extend(members)
+            emitted.add(gid)
 
-            if target_pos is None:
-                continue
+        grouped_route.append(route[-1])
 
-            moving_block = route_blocks.pop(target_pos)
-
-            best_blocks = None
-            best_key = None
-
-            # First and last blocks are depot endpoints. Insert only between
-            # block boundaries inside them.
-            for insert_at in range(1, len(route_blocks)):
-                candidate_blocks = (
-                    route_blocks[:insert_at]
-                    + [moving_block]
-                    + route_blocks[insert_at:]
-                )
-                candidate = [
-                    node
-                    for block in candidate_blocks
-                    for node in block
-                ]
-
-                candidate_metrics = route_metrics(
-                    candidate,
-                    distances,
-                    durations,
-                    FUEL_PRICE,
-                    MPG,
-                )
-
-                candidate_hours = float(candidate_metrics["time_s"]) / 3600.0
-                candidate_miles = float(candidate_metrics["miles"])
-                candidate_score = (
-                    float(candidate_metrics["fuel_cost"])
-                    + (candidate_hours * DRIVING_TIME_VALUE_PER_HOUR)
-                )
-
-                # Deterministic tie-break: economic objective, time, distance,
-                # then earliest valid block boundary.
-                candidate_key = (
-                    round(candidate_score, 9),
-                    round(candidate_hours, 9),
-                    round(candidate_miles, 9),
-                    insert_at,
-                )
-
-                if best_key is None or candidate_key < best_key:
-                    best_key = candidate_key
-                    best_blocks = candidate_blocks
-
-            if best_blocks is not None:
-                route_blocks = best_blocks
-            else:
-                route_blocks.insert(target_pos, moving_block)
-
-        route = [
-            node
-            for block in route_blocks
-            for node in block
-        ]
-
-        # V25.64 SAFE grouped-route polish.
-        # Start from V25.62's known-good grouped route. Duplicate-coordinate
-        # jobs remain indivisible blocks. A candidate is accepted ONLY if its
-        # real route_metrics economic cost strictly improves.
-        def safe_block_metrics(blocks):
-            candidate_route = [
-                node
-                for block in blocks
-                for node in block
-            ]
-            m = route_metrics(
-                candidate_route,
-                distances,
-                durations,
-                FUEL_PRICE,
-                MPG,
-            )
-
-            miles = float(m["miles"])
-            time_s = float(m["time_s"])
-            fuel_cost = float(m["fuel_cost"])
-
-            if not (
-                math.isfinite(miles)
-                and math.isfinite(time_s)
-                and math.isfinite(fuel_cost)
-            ):
-                return None
-
-            if miles < 0 or time_s < 0 or fuel_cost < 0:
-                return None
-
-            economic_cost = (
-                fuel_cost
-                + (time_s / 3600.0) * DRIVING_TIME_VALUE_PER_HOUR
-            )
-
-            if not math.isfinite(economic_cost):
-                return None
-
-            return {
-                "route": candidate_route,
-                "miles": miles,
-                "time_s": time_s,
-                "fuel_cost": fuel_cost,
-                "economic_cost": economic_cost,
-            }
-
-        current_blocks = [block[:] for block in route_blocks]
-        current_eval = safe_block_metrics(current_blocks)
-
-        if current_eval is not None:
-            # Conservative best-improvement relocation only.
-            # No swap/2-opt experiment from V25.63.
-            for _ in range(3):
-                best_blocks = None
-                best_eval = current_eval
-                best_key = None
-
-                for i in range(1, len(current_blocks) - 1):
-                    moving_block = current_blocks[i]
-                    remainder = (
-                        current_blocks[:i]
-                        + current_blocks[i + 1:]
-                    )
-
-                    for insert_at in range(1, len(remainder)):
-                        candidate_blocks = (
-                            remainder[:insert_at]
-                            + [moving_block]
-                            + remainder[insert_at:]
-                        )
-                        candidate_eval = safe_block_metrics(candidate_blocks)
-
-                        if candidate_eval is None:
-                            continue
-
-                        # Hard safety gate: never accept a route that is not
-                        # strictly cheaper on the real economic objective.
-                        if (
-                            candidate_eval["economic_cost"]
-                            >= current_eval["economic_cost"] - 1e-9
-                        ):
-                            continue
-
-                        candidate_key = (
-                            round(candidate_eval["economic_cost"], 9),
-                            round(candidate_eval["time_s"], 6),
-                            round(candidate_eval["miles"], 6),
-                            i,
-                            insert_at,
-                        )
-
-                        if best_key is None or candidate_key < best_key:
-                            best_key = candidate_key
-                            best_blocks = candidate_blocks
-                            best_eval = candidate_eval
-
-                if best_blocks is None:
-                    break
-
-                # Re-check before commit.
-                if (
-                    best_eval["economic_cost"]
-                    >= current_eval["economic_cost"] - 1e-9
-                ):
-                    break
-
-                current_blocks = [
-                    block[:] for block in best_blocks
-                ]
-                current_eval = best_eval
-
-            route_blocks = current_blocks
-            route = current_eval["route"]
+        # Safety: grouping must never lose or duplicate a customer.
+        if (
+            grouped_route[0] == 0
+            and grouped_route[-1] == 0
+            and len(grouped_route) == len(route)
+            and sorted(grouped_route[1:-1]) == sorted(route[1:-1])
+        ):
+            route = grouped_route
 
     metrics = route_metrics(
         route,
