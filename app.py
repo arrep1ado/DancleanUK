@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 25.49
 # ============================================================
 
-APP_VERSION = "26.6"
+APP_VERSION = "26.8"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -778,6 +778,49 @@ def get_postcode_coords(postcode):
     return None
 
 
+
+def get_terminated_postcode_coords(postcode):
+    """Return the last known coordinate for a terminated UK postcode.
+
+    This coordinate is VALIDATION-ONLY. It is never used as a customer
+    routing point and never supplies route distance/time. It lets genuine
+    addresses with old postcodes pass geographic validation while still
+    rejecting a street/address match that is in a completely different area.
+    """
+    postcode = normalise_postcode(postcode)
+    if not postcode:
+        return None
+
+    cache_key = f"__TERMINATED_POSTCODE__|{postcode}".lower()
+    if cache_key in st.session_state.geocode_cache:
+        return st.session_state.geocode_cache.get(cache_key)
+
+    for pc in dict.fromkeys([postcode, postcode.replace(" ", "")]):
+        try:
+            response = requests.get(
+                f"https://api.postcodes.io/terminated_postcodes/{quote(pc)}",
+                timeout=10,
+            )
+            if response.status_code != 200:
+                continue
+
+            result = response.json().get("result") or {}
+            lat = result.get("latitude")
+            lon = result.get("longitude")
+            if lat is None or lon is None:
+                continue
+
+            coords = (float(lat), float(lon))
+            st.session_state.geocode_cache[cache_key] = coords
+            return coords
+        except Exception:
+            continue
+
+    # Cache the miss for this session so every customer with the same bad/
+    # unknown postcode does not repeatedly call the service.
+    st.session_state.geocode_cache[cache_key] = None
+    return None
+
 def photon_exact_geocode(query, postcode, expected_house_number="", expected_street=""):
     """Try Photon/OSM address data for a true house-level coordinate.
 
@@ -808,7 +851,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/26.6"
+                    "User-Agent": "DanCleanUKRouteOptimizer/26.8"
                 },
                 timeout=20,
             )
@@ -952,7 +995,7 @@ def get_coords(query_string, postcode):
     postcode = normalise_postcode(postcode)
     key = cache_key_for(query, postcode)
 
-    headers = {"User-Agent": "DanCleanUKRouteOptimizer/26.6"}
+    headers = {"User-Agent": "DanCleanUKRouteOptimizer/26.8"}
 
     house_match = re.search(r"(?<!\d)(\d+[A-Za-z]?)\b", query)
     expected_house = house_match.group(1) if house_match else ""
@@ -963,6 +1006,10 @@ def get_coords(query_string, postcode):
         expected_street = tail.split(",")[0].strip()
 
     postcode_anchor = get_postcode_coords(postcode)
+    terminated_postcode_anchor = (
+        None if postcode_anchor is not None
+        else get_terminated_postcode_coords(postcode)
+    )
     expected_outcode = _postcode_outcode(postcode)
     outcode_anchor = get_outcode_coords(postcode)
 
@@ -986,13 +1033,24 @@ def get_coords(query_string, postcode):
                 return None
             return (lat, lon)
 
-        # If the full postcode is unavailable/retired, validate the exact
-        # address against the OFFICIAL OUTCODE geography instead. A nearby
-        # address may legitimately reverse-geocode to an adjacent outcode, so
-        # exact outcode equality is too strict. Geographic proximity to the
-        # supplied outcode is the safer generic test. This accepts genuine
-        # local addresses while rejecting a same-name street hundreds of
-        # kilometres away.
+        # A terminated postcode still has a last-known official coordinate.
+        # Use it ONLY to validate the geocoded house/street. This is the key
+        # distinction: old postcodes can remain useful evidence of the area,
+        # but are never substituted as the customer's routing coordinate.
+        if terminated_postcode_anchor is not None:
+            if haversine_km(
+                terminated_postcode_anchor[0],
+                terminated_postcode_anchor[1],
+                lat,
+                lon,
+            ) <= 5.0:
+                return (lat, lon)
+            return None
+
+        # If neither a live nor terminated full postcode can be verified,
+        # validate against the official OUTCODE geography. A nearby address
+        # may legitimately reverse-geocode to an adjacent outcode, so exact
+        # outcode equality is too strict.
         if outcode_anchor is not None:
             if haversine_km(
                 outcode_anchor[0], outcode_anchor[1], lat, lon
@@ -1057,9 +1115,42 @@ def get_coords(query_string, postcode):
         st.session_state.geocode_cache[key] = photon
         return photon
 
-    # A verified live postcode centroid is a safe routing fallback when a
-    # house point is unavailable. It is not a road-distance estimate; ORS will
-    # still calculate every distance/time on the real driving network.
+    # If a geocoder has no house-number record, try the named STREET itself.
+    # This is still a real map coordinate and ORS still supplies every road
+    # distance/time.  Crucially, the street coordinate must pass the same
+    # postcode/outcode geography check, so a same-named street in another
+    # part of the country cannot be accepted.
+    if expected_street:
+        street_queries = []
+        if postcode:
+            street_queries.append(f"{expected_street}, {postcode}, United Kingdom")
+        street_queries.append(f"{expected_street}, United Kingdom")
+
+        seen_street_queries = set()
+        for street_query in street_queries:
+            sq_key = street_query.strip().lower()
+            if not sq_key or sq_key in seen_street_queries:
+                continue
+            seen_street_queries.add(sq_key)
+
+            street_coords = nominatim_search(
+                street_query,
+                headers,
+                expected_house_number=None,
+                expected_street=expected_street,
+                postcode=postcode,
+            )
+            street_coords = safe_exact(street_coords)
+            if street_coords is not None:
+                st.session_state.geocode_cache[key] = street_coords
+                return street_coords
+            time.sleep(0.35)
+
+    # ONLY a verified LIVE postcode centroid may be used as a final routing
+    # fallback when a house point is unavailable. A terminated postcode is
+    # deliberately excluded here: its old coordinate is validation evidence,
+    # not a current customer location. ORS still calculates every actual road
+    # distance/time.
     if postcode_anchor is not None:
         st.session_state.geocode_cache[key] = postcode_anchor
         return postcode_anchor
