@@ -17,10 +17,10 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 # ============================================================
 # DAN CLEAN UK - DAILY ROUTE OPTIMIZER
-# Version 25.49
+# Version 26.9
 # ============================================================
 
-APP_VERSION = "26.8"
+APP_VERSION = "26.9"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -851,7 +851,7 @@ def photon_exact_geocode(query, postcode, expected_house_number="", expected_str
                     "limit": 20,
                 },
                 headers={
-                    "User-Agent": "DanCleanUKRouteOptimizer/26.8"
+                    "User-Agent": "DanCleanUKRouteOptimizer/26.9"
                 },
                 timeout=20,
             )
@@ -995,7 +995,7 @@ def get_coords(query_string, postcode):
     postcode = normalise_postcode(postcode)
     key = cache_key_for(query, postcode)
 
-    headers = {"User-Agent": "DanCleanUKRouteOptimizer/26.8"}
+    headers = {"User-Agent": "DanCleanUKRouteOptimizer/26.9"}
 
     house_match = re.search(r"(?<!\d)(\d+[A-Za-z]?)\b", query)
     expected_house = house_match.group(1) if house_match else ""
@@ -1146,14 +1146,45 @@ def get_coords(query_string, postcode):
                 return street_coords
             time.sleep(0.35)
 
-    # ONLY a verified LIVE postcode centroid may be used as a final routing
-    # fallback when a house point is unavailable. A terminated postcode is
-    # deliberately excluded here: its old coordinate is validation evidence,
-    # not a current customer location. ORS still calculates every actual road
-    # distance/time.
+    # Final safe postcode-level fallback. A LIVE postcode centroid is always
+    # acceptable when the exact house/street is unavailable.
     if postcode_anchor is not None:
         st.session_state.geocode_cache[key] = postcode_anchor
         return postcode_anchor
+
+    # A terminated postcode can still be useful for older customer records,
+    # but only when the imported address does NOT contain an additional
+    # locality/town that could conflict with that historic postcode.
+    # Example safe shape: "45 Dysart Road, NG31 7AN, United Kingdom".
+    # Example unsafe shape: "7 Church Street, Muston, OLD POSTCODE, UK".
+    # In the unsafe case we keep the hard stop rather than silently routing to
+    # the wrong village/town.
+    if terminated_postcode_anchor is not None:
+        address_without_country = re.sub(
+            r",?\s*united kingdom\s*$",
+            "",
+            query,
+            flags=re.IGNORECASE,
+        )
+        address_without_pc = re.sub(
+            re.escape(postcode),
+            "",
+            address_without_country,
+            flags=re.IGNORECASE,
+        ).strip(" ,")
+
+        # Split the remaining address. One component means house + street only;
+        # two or more components usually means an explicit locality/town was
+        # supplied and must be resolved rather than ignored.
+        address_parts = [
+            part.strip()
+            for part in address_without_pc.split(",")
+            if part.strip()
+        ]
+
+        if len(address_parts) <= 1:
+            st.session_state.geocode_cache[key] = terminated_postcode_anchor
+            return terminated_postcode_anchor
 
     # No verified location: do not guess.
     return None
@@ -2702,6 +2733,11 @@ if st.button(
 
         pc = normalise_postcode(row.get("Postcode", ""))
         anchor = get_postcode_coords(pc)
+        if anchor is None:
+            # Rows using a verified historic postcode fallback are allowed to
+            # use that same official historic point for matrix repair. This is
+            # only reached for customers already accepted by get_coords().
+            anchor = get_terminated_postcode_coords(pc)
 
         if anchor is None:
             postcode_fallbacks.append(None)
