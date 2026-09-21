@@ -3845,5 +3845,4 @@ if not export_df.empty:
         use_container_width=True,
     )
 
-st.sidebar.caption(
-    f"DanCleanUK Route Optimizer v{APP_VERSION}"
+st.sidebar.caption(f"DanCleanUK Route Optimizer v{APP_VERSION}")
