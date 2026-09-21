@@ -21,7 +21,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.3"
+APP_VERSION = "27.4"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2838,19 +2838,34 @@ if driver_mode:
     st.markdown(
         """
         <style>
-        /* Keep action buttons side-by-side on narrow phone screens. */
+        /* Mobile-safe action rows: columns must share the viewport instead of
+           keeping a desktop minimum width and overflowing off-screen. */
         div[data-testid="stHorizontalBlock"] {
-            flex-wrap: nowrap !important;
             gap: 0.35rem !important;
+            width: 100% !important;
         }
-        div[data-testid="column"] {
+        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+            flex: 1 1 0 !important;
+            width: 0 !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+        }
+        div[data-testid="stButton"],
+        div[data-testid="stLinkButton"] {
+            width: 100% !important;
             min-width: 0 !important;
         }
         div[data-testid="stButton"] button,
         div[data-testid="stLinkButton"] a {
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
             min-height: 2.75rem;
-            padding-left: 0.35rem !important;
-            padding-right: 0.35rem !important;
+            padding-left: 0.2rem !important;
+            padding-right: 0.2rem !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
         }
         @media (max-width: 640px) {
             h1 { font-size: 1.8rem !important; margin-bottom: 0.35rem !important; }
