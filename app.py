@@ -17,16 +17,17 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 # ============================================================
 # DAN CLEAN UK - DAILY ROUTE OPTIMIZER
-# Version 26.10
+# Version 27.0 Mobile
 # ============================================================
 
-APP_VERSION = "26.13"
+APP_VERSION = "27.0"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
     page_title="DanCleanUK Route Optimizer",
     page_icon="🚗",
     layout="centered",
+    initial_sidebar_state="auto",
 )
 
 st.title("🚗 DanCleanUK Daily Route Optimizer")
@@ -36,6 +37,59 @@ st.markdown(
     <style>
         html, body { overscroll-behavior-y: none; }
         .small-muted { color: #777; font-size: 0.9rem; }
+
+        /* V27.0 MOBILE/TABLET UI ONLY. The V26.13 route engine below is unchanged. */
+        .stButton > button, .stLinkButton > a, .stDownloadButton > button {
+            min-height: 3rem;
+            border-radius: 0.75rem;
+            font-weight: 650;
+        }
+        [data-testid="stMetric"] {
+            padding: 0.75rem;
+            border: 1px solid rgba(128,128,128,0.22);
+            border-radius: 0.8rem;
+        }
+        [data-testid="stMetricLabel"] { font-size: 0.86rem; }
+        [data-testid="stMetricValue"] { font-size: 1.45rem; }
+
+        @media (max-width: 768px) {
+            .block-container {
+                padding-top: 1rem;
+                padding-left: 0.75rem;
+                padding-right: 0.75rem;
+                padding-bottom: 5rem;
+                max-width: 100%;
+            }
+            h1 { font-size: 1.65rem !important; line-height: 1.15 !important; }
+            h2 { font-size: 1.35rem !important; }
+            h3 { font-size: 1.12rem !important; }
+            [data-testid="stVerticalBlockBorderWrapper"] {
+                border-radius: 0.9rem;
+            }
+            .stButton > button, .stLinkButton > a, .stDownloadButton > button {
+                min-height: 3.25rem;
+                font-size: 0.96rem;
+            }
+            [data-testid="stMetric"] { padding: 0.6rem; }
+            [data-testid="stMetricLabel"] { font-size: 0.78rem; }
+            [data-testid="stMetricValue"] { font-size: 1.25rem; }
+            [data-testid="stFileUploader"] {
+                padding: 0.25rem 0;
+            }
+            [data-testid="stDataFrame"] {
+                max-width: 100%;
+                overflow-x: auto;
+            }
+        }
+
+        @media (min-width: 769px) and (max-width: 1100px) {
+            .block-container {
+                padding-left: 1.25rem;
+                padding-right: 1.25rem;
+                max-width: 900px;
+            }
+            .stButton > button, .stLinkButton > a { min-height: 3.1rem; }
+        }
     </style>
     """,
     unsafe_allow_html=True,
@@ -3512,6 +3566,24 @@ else:
     st.sidebar.success(
         "🎉 All customer stops completed!"
     )
+
+
+# ============================================================
+# MOBILE / TABLET QUICK NAVIGATION
+# UI only: route order and optimisation remain V26.13.
+# ============================================================
+
+if not pending.empty:
+    st.markdown("---")
+    with st.container(border=True):
+        st.write("### 🧭 Next Stop")
+        st.write(destination)
+        st.link_button(
+            "🚗 Navigate to Next Stop",
+            maps_url(destination),
+            use_container_width=True,
+        )
+        st.caption(f"{len(pending)} stops remaining")
 
 
 # ============================================================
