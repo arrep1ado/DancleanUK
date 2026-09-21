@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "26.10"
+APP_VERSION = "26.11"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2216,6 +2216,107 @@ def optimise_route(
     return refined[0]
 
 
+
+def intensive_route_polish(
+    route,
+    distances,
+    durations,
+    fuel_price,
+    mpg,
+    max_rounds=8,
+):
+    """V26.11 best-improvement whole-route search.
+
+    Searches several complementary neighbourhoods against the SAME verified
+    ORS matrix and the SAME fuel + driving-time objective as V26.10:
+      * 2-opt segment reversals
+      * single-customer swaps
+      * Or-opt relocation of 1..5 consecutive customers
+
+    The depot is fixed at both ends.  A round accepts only the single best
+    strict improvement found across every tested move, then starts again.
+    This is intentionally geography-agnostic: it contains no postcode, town,
+    specific village, postcode, or other hard-coded ordering rule.
+    """
+    if not route or len(route) < 5:
+        return route[:] if route else route
+
+    customer_count = len(route) - 2
+    expected = list(range(1, customer_count + 1))
+
+    def valid(candidate):
+        return (
+            candidate
+            and candidate[0] == 0
+            and candidate[-1] == 0
+            and len(candidate) == customer_count + 2
+            and sorted(candidate[1:-1]) == expected
+        )
+
+    best = route[:]
+    if not valid(best):
+        return route[:]
+    best_key = _practical_route_key(
+        best, distances, durations, fuel_price, mpg
+    )
+
+    for _ in range(max_rounds):
+        round_best = None
+        round_key = best_key
+        n = len(best)
+
+        # 2-opt: reverse a complete internal section.
+        for i in range(1, n - 2):
+            for j in range(i + 1, n - 1):
+                candidate = best[:]
+                candidate[i:j + 1] = reversed(candidate[i:j + 1])
+                key = _practical_route_key(
+                    candidate, distances, durations, fuel_price, mpg
+                )
+                if key < round_key:
+                    round_key = key
+                    round_best = candidate
+
+        # Swap two individual customers. This can escape a local minimum that
+        # neither a simple relocation nor one 2-opt reversal can improve.
+        for i in range(1, n - 2):
+            for j in range(i + 1, n - 1):
+                candidate = best[:]
+                candidate[i], candidate[j] = candidate[j], candidate[i]
+                key = _practical_route_key(
+                    candidate, distances, durations, fuel_price, mpg
+                )
+                if key < round_key:
+                    round_key = key
+                    round_best = candidate
+
+        # Or-opt: relocate short consecutive runs. V26.10 searched up to three
+        # jobs; V26.11 extends this to five so a whole small geographic pocket
+        # can move together instead of being split across the day.
+        for block_size in range(1, min(5, customer_count) + 1):
+            for i in range(1, n - block_size):
+                if i + block_size > n - 1:
+                    continue
+                block = best[i:i + block_size]
+                remainder = best[:i] + best[i + block_size:]
+                for j in range(1, len(remainder)):
+                    candidate = remainder[:j] + block + remainder[j:]
+                    if candidate == best:
+                        continue
+                    key = _practical_route_key(
+                        candidate, distances, durations, fuel_price, mpg
+                    )
+                    if key < round_key:
+                        round_key = key
+                        round_best = candidate
+
+        if round_best is None or not valid(round_best):
+            break
+        best = round_best
+        best_key = round_key
+
+    return best
+
 def surgical_route_polish(
     route,
     distances,
@@ -2896,6 +2997,17 @@ if st.button(
                 )
             )
 
+            route_candidates.append(
+                intensive_route_polish(
+                    route_candidates[-1],
+                    distances,
+                    durations,
+                    FUEL_PRICE,
+                    MPG,
+                    max_rounds=8,
+                )
+            )
+
         global_route = optimise_route(
             distances,
             durations,
@@ -2913,6 +3025,30 @@ if st.button(
                     FUEL_PRICE,
                     MPG,
                     max_passes=4,
+                )
+            )
+
+            # V26.11: deeper best-improvement search from both the raw global
+            # route and its V26.10 polished result.  The final selector below
+            # still keeps V26.10's candidate whenever these do not beat it.
+            route_candidates.append(
+                intensive_route_polish(
+                    global_route,
+                    distances,
+                    durations,
+                    FUEL_PRICE,
+                    MPG,
+                    max_rounds=8,
+                )
+            )
+            route_candidates.append(
+                intensive_route_polish(
+                    route_candidates[-2],
+                    distances,
+                    durations,
+                    FUEL_PRICE,
+                    MPG,
+                    max_rounds=8,
                 )
             )
 
@@ -3711,4 +3847,3 @@ if not export_df.empty:
 
 st.sidebar.caption(
     f"DanCleanUK Route Optimizer v{APP_VERSION}"
-)
