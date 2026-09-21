@@ -21,7 +21,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.2"
+APP_VERSION = "27.3"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2828,14 +2828,51 @@ if saved_snapshot is not None:
 if st.session_state.pop("saved_route_notice", None):
     st.success("✅ Saved laptop route loaded exactly as stored.")
 
+# Driver Mode is automatic when a locked laptop route has been loaded.
+# It changes presentation only; routing and saved-route data stay untouched.
+driver_mode = bool(
+    st.session_state.get("route_data", {}).get("saved_route")
+)
+
+if driver_mode:
+    st.markdown(
+        """
+        <style>
+        /* Keep action buttons side-by-side on narrow phone screens. */
+        div[data-testid="stHorizontalBlock"] {
+            flex-wrap: nowrap !important;
+            gap: 0.35rem !important;
+        }
+        div[data-testid="column"] {
+            min-width: 0 !important;
+        }
+        div[data-testid="stButton"] button,
+        div[data-testid="stLinkButton"] a {
+            min-height: 2.75rem;
+            padding-left: 0.35rem !important;
+            padding-right: 0.35rem !important;
+        }
+        @media (max-width: 640px) {
+            h1 { font-size: 1.8rem !important; margin-bottom: 0.35rem !important; }
+            h2 { font-size: 1.45rem !important; }
+            h3 { font-size: 1.25rem !important; }
+            div[data-testid="stVerticalBlockBorderWrapper"] { margin-bottom: 0.35rem; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 # ============================================================
 # FILE UPLOAD
 # ============================================================
 
-uploaded_file = st.file_uploader(
-    "📁 Upload your day's CSV or Excel file",
-    type=["csv", "xlsx"],
-)
+uploaded_file = None
+if not driver_mode:
+    uploaded_file = st.file_uploader(
+        "📁 Upload your day's CSV or Excel file",
+        type=["csv", "xlsx"],
+    )
 
 if uploaded_file is not None:
     if st.session_state.get("uploaded_filename") != uploaded_file.name:
@@ -3018,10 +3055,13 @@ df = st.session_state.master_df
 # PLAN ROUTE
 # ============================================================
 
-if st.button(
-    "🚀 PLAN / RE-PLAN BEST DAILY ROUTE",
-    type="primary",
-    use_container_width=True,
+if (
+    not driver_mode
+    and st.button(
+        "🚀 PLAN / RE-PLAN BEST DAILY ROUTE",
+        type="primary",
+        use_container_width=True,
+    )
 ):
     if df.empty:
         st.error("No valid customer jobs found.")
@@ -3633,49 +3673,50 @@ if route_data:
         .sum()
     )
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.metric(
-            "Take-Home",
-            f"£{route_data['take_home']:.2f}",
+    if driver_mode:
+        st.markdown(
+            f"""
+            <div style="border:1px solid rgba(128,128,128,.35);border-radius:12px;
+                        padding:.75rem .9rem;margin:.25rem 0 .65rem 0;">
+              <div style="font-size:1.05rem;font-weight:700;margin-bottom:.45rem;">📱 Driver Mode</div>
+              <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.45rem;text-align:center;">
+                <div><b>{route_data.get('jobs',0)}</b><br><span style="font-size:.78rem;opacity:.75">Jobs</span></div>
+                <div><b>{route_data['miles']:.1f} mi</b><br><span style="font-size:.78rem;opacity:.75">Distance</span></div>
+                <div><b>{format_duration(route_data['time'])}</b><br><span style="font-size:.78rem;opacity:.75">Driving</span></div>
+                <div><b>{completed_jobs}</b><br><span style="font-size:.78rem;opacity:.75">Done</span></div>
+                <div><b>{paid_jobs}</b><br><span style="font-size:.78rem;opacity:.75">Paid</span></div>
+                <div><b>£{route_data['take_home']:.2f}</b><br><span style="font-size:.78rem;opacity:.75">Take-home</span></div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-    with c2:
-        st.metric(
-            "Revenue",
-            f"£{route_data['revenue']:.2f}",
-        )
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Take-Home", f"£{route_data['take_home']:.2f}")
+        with c2:
+            st.metric("Revenue", f"£{route_data['revenue']:.2f}")
 
-    c3, c4 = st.columns(2)
-    with c3:
-        st.metric(
-            "Driving Distance",
-            f"{route_data['miles']:.1f} miles",
-        )
-    with c4:
-        st.metric(
-            "Driving Time",
-            format_duration(route_data["time"]),
-        )
+        c3, c4 = st.columns(2)
+        with c3:
+            st.metric("Driving Distance", f"{route_data['miles']:.1f} miles")
+        with c4:
+            st.metric("Driving Time", format_duration(route_data["time"]))
 
-    c5, c6 = st.columns(2)
-    with c5:
-        st.metric(
-            "Fuel Cost",
-            f"£{route_data['fuel_cost']:.2f}",
-        )
-    with c6:
-        st.metric(
-            "Fuel Used",
-            f"{route_data['litres']:.1f} litres",
-        )
+        c5, c6 = st.columns(2)
+        with c5:
+            st.metric("Fuel Cost", f"£{route_data['fuel_cost']:.2f}")
+        with c6:
+            st.metric("Fuel Used", f"{route_data['litres']:.1f} litres")
 
-    c7, c8, c9 = st.columns(3)
-    with c7:
-        st.metric("Jobs Routed", route_data.get("jobs", 0))
-    with c8:
-        st.metric("Completed", completed_jobs)
-    with c9:
-        st.metric("Paid", paid_jobs)
+        c7, c8, c9 = st.columns(3)
+        with c7:
+            st.metric("Jobs Routed", route_data.get("jobs", 0))
+        with c8:
+            st.metric("Completed", completed_jobs)
+        with c9:
+            st.metric("Paid", paid_jobs)
 
     if unpaid_jobs:
         st.warning(
@@ -3702,7 +3743,7 @@ if route_data:
 # SAVE FINISHED ROUTE FOR PHONE / TABLET
 # ============================================================
 
-if route_data and not route_data.get("persisted_only"):
+if route_data and not route_data.get("persisted_only") and not driver_mode:
     route_ready_to_save = (
         route_data.get("jobs", 0) > 0
         and df["route_order"].notna().sum() >= int(route_data.get("jobs", 0))
@@ -3724,6 +3765,9 @@ if route_data and not route_data.get("persisted_only"):
         st.info(
             "🔒 You are using the saved route. No optimisation was run on this device."
         )
+
+if driver_mode:
+    st.info("🔒 Saved laptop route · no optimisation on this device")
 
 # ============================================================
 # FAILED ADDRESSES
@@ -3907,7 +3951,7 @@ else:
             with col1:
                 if status != "completed":
                     if st.button(
-                        "✅ Mark Complete",
+                        "✅ Complete",
                         key=f"complete_{row['job_id']}",
                         use_container_width=True,
                     ):
@@ -3934,7 +3978,7 @@ else:
 
             with col2:
                 st.link_button(
-                    "🚗 Navigate Here",
+                    "🚗 Navigate",
                     maps_url(destination),
                     key=f"nav_{row['job_id']}",
                     use_container_width=True,
@@ -3969,7 +4013,7 @@ else:
 
             with pay2:
                 if st.button(
-                    "🏦 Bank Transfer",
+                    "🏦 Bank",
                     key=f"bank_{row['job_id']}",
                     use_container_width=True,
                 ):
@@ -3994,7 +4038,7 @@ else:
 
             with pay3:
                 if st.button(
-                    "❌ Not Paid",
+                    "❌ Unpaid",
                     key=f"notpaid_{row['job_id']}",
                     use_container_width=True,
                 ):
@@ -4044,7 +4088,7 @@ completed_df = df[
     df["Status"].astype(str).str.lower() == "completed"
 ].copy()
 
-if not completed_df.empty:
+if not completed_df.empty and not driver_mode:
     st.markdown("---")
     st.subheader("✅ Completed Jobs")
 
