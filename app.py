@@ -21,7 +21,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.1"
+APP_VERSION = "27.2"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -209,26 +209,56 @@ def delete_day(service_date):
     conn.close()
 
 
+def _supabase_config():
+    """Return private server-side Supabase settings from Streamlit Secrets."""
+    try:
+        url = str(st.secrets["SUPABASE_URL"]).strip().rstrip("/")
+        key = str(st.secrets["SUPABASE_SECRET_KEY"]).strip()
+    except Exception:
+        return None, None
+    if not url.startswith("https://") or not key.startswith("sb_secret_"):
+        return None, None
+    return url, key
+
+
+def _supabase_headers(prefer=None):
+    url, key = _supabase_config()
+    if not url or not key:
+        return None
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def _json_safe(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def init_saved_routes_db():
-    conn = db_connect()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS saved_routes (
-            service_date TEXT PRIMARY KEY,
-            route_json TEXT NOT NULL,
-            revenue REAL NOT NULL,
-            fuel_cost REAL NOT NULL,
-            take_home REAL NOT NULL,
-            miles REAL NOT NULL,
-            litres REAL NOT NULL,
-            time_s REAL NOT NULL,
-            jobs INTEGER NOT NULL,
-            saved_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+    # V27.2 stores locked route snapshots in Supabase. The existing local
+    # SQLite jobs database is deliberately left unchanged.
+    return True
 
 
 def save_route_snapshot(service_date, df, route_data):
@@ -244,108 +274,159 @@ def save_route_snapshot(service_date, df, route_data):
 
     routed["_saved_order"] = pd.to_numeric(routed["route_order"], errors="coerce")
     routed = routed.dropna(subset=["_saved_order"]).sort_values("_saved_order")
-    route_job_ids = routed["job_id"].astype(str).tolist()
-    if len(route_job_ids) != int(route_data.get("jobs", len(route_job_ids))):
+    if len(routed) != int(route_data.get("jobs", len(routed))):
         return False
 
-    conn = db_connect()
-    conn.execute(
-        """
-        INSERT INTO saved_routes (
-            service_date, route_json, revenue, fuel_cost, take_home,
-            miles, litres, time_s, jobs, saved_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(service_date) DO UPDATE SET
-            route_json=excluded.route_json,
-            revenue=excluded.revenue,
-            fuel_cost=excluded.fuel_cost,
-            take_home=excluded.take_home,
-            miles=excluded.miles,
-            litres=excluded.litres,
-            time_s=excluded.time_s,
-            jobs=excluded.jobs,
-            saved_at=excluded.saved_at
-        """,
-        (
-            str(service_date),
-            json.dumps(route_job_ids),
-            float(route_data.get("revenue", 0.0)),
-            float(route_data.get("fuel_cost", 0.0)),
-            float(route_data.get("take_home", 0.0)),
-            float(route_data.get("miles", 0.0)),
-            float(route_data.get("litres", 0.0)),
-            float(route_data.get("time", 0.0)),
-            int(route_data.get("jobs", len(route_job_ids))),
-            now_text(),
-        ),
-    )
-    conn.commit()
-    conn.close()
-    return True
+    # Store complete job rows as well as the exact order. This means a locked
+    # route can be reconstructed even if Streamlit's local SQLite is restarted.
+    job_rows = []
+    for _, row in routed.drop(columns=["_saved_order"], errors="ignore").iterrows():
+        job_rows.append({str(k): _json_safe(v) for k, v in row.to_dict().items()})
+
+    route_payload = {
+        "route_job_ids": routed["job_id"].astype(str).tolist(),
+        "jobs_data": job_rows,
+        "litres": float(route_data.get("litres", 0.0)),
+        "time_s": float(route_data.get("time", 0.0)),
+        "saved_at": now_text(),
+        "app_version": APP_VERSION,
+    }
+    total_minutes = int(round(float(route_data.get("time", 0.0)) / 60.0))
+    payload = {
+        "route_date": str(service_date),
+        "route_data": route_payload,
+        "total_jobs": int(route_data.get("jobs", len(routed))),
+        "total_miles": round(float(route_data.get("miles", 0.0)), 2),
+        "total_minutes": total_minutes,
+        "revenue": round(float(route_data.get("revenue", 0.0)), 2),
+        "fuel_cost": round(float(route_data.get("fuel_cost", 0.0)), 2),
+        "take_home": round(float(route_data.get("take_home", 0.0)), 2),
+        "updated_at": datetime.now().astimezone().isoformat(),
+    }
+
+    url, _ = _supabase_config()
+    headers = _supabase_headers("resolution=merge-duplicates,return=minimal")
+    if not url or not headers:
+        return False
+    try:
+        response = requests.post(
+            f"{url}/rest/v1/saved_routes?on_conflict=route_date",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+        return response.status_code in (200, 201, 204)
+    except requests.RequestException:
+        return False
 
 
 def load_route_snapshot(service_date):
-    conn = db_connect()
-    row = conn.execute(
-        "SELECT * FROM saved_routes WHERE service_date = ?",
-        (str(service_date),),
-    ).fetchone()
-    conn.close()
-    if row is None:
+    url, _ = _supabase_config()
+    headers = _supabase_headers()
+    if not url or not headers:
         return None
-    data = dict(row)
     try:
-        data["route_job_ids"] = json.loads(data.get("route_json") or "[]")
-    except Exception:
+        response = requests.get(
+            f"{url}/rest/v1/saved_routes",
+            headers=headers,
+            params={"route_date": f"eq.{service_date}", "select": "*", "limit": "1"},
+            timeout=20,
+        )
+        if response.status_code != 200:
+            return None
+        rows = response.json()
+        if not rows:
+            return None
+        row = rows[0]
+        data = row.get("route_data") or {}
+        row["route_job_ids"] = [str(x) for x in data.get("route_job_ids", [])]
+        row["jobs_data"] = data.get("jobs_data", [])
+        row["litres"] = float(data.get("litres", 0.0) or 0.0)
+        row["time_s"] = float(data.get("time_s", (row.get("total_minutes") or 0) * 60) or 0.0)
+        row["jobs"] = int(row.get("total_jobs") or len(row["route_job_ids"]))
+        row["miles"] = float(row.get("total_miles") or 0.0)
+        row["saved_at"] = data.get("saved_at") or row.get("updated_at") or row.get("created_at") or ""
+        return row
+    except (requests.RequestException, ValueError, TypeError):
         return None
-    return data
 
 
 def delete_route_snapshot(service_date):
-    conn = db_connect()
-    conn.execute("DELETE FROM saved_routes WHERE service_date = ?", (str(service_date),))
-    conn.commit()
-    conn.close()
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=minimal")
+    if not url or not headers:
+        return False
+    try:
+        response = requests.delete(
+            f"{url}/rest/v1/saved_routes",
+            headers=headers,
+            params={"route_date": f"eq.{service_date}"},
+            timeout=20,
+        )
+        return response.status_code in (200, 204)
+    except requests.RequestException:
+        return False
 
 
 def apply_saved_route_snapshot(service_date):
     snapshot = load_route_snapshot(service_date)
-    day_df = load_day(service_date)
-    if snapshot is None or day_df.empty:
+    if snapshot is None:
         return False, "No saved route is available for this date."
 
     route_ids = [str(x) for x in snapshot.get("route_job_ids", [])]
     if not route_ids:
         return False, "The saved route does not contain any customer stops."
 
-    current_ids = set(day_df["job_id"].astype(str))
-    missing = [job_id for job_id in route_ids if job_id not in current_ids]
-    if missing:
-        return False, "The saved route no longer matches the jobs stored for this date."
+    day_df = load_day(service_date)
+    jobs_data = snapshot.get("jobs_data") or []
+
+    # If local Streamlit storage was restarted, rebuild the working day's jobs
+    # from the permanent locked snapshot instead of losing the route.
+    if day_df.empty:
+        if not jobs_data:
+            return False, "The permanent route exists, but its customer records are unavailable."
+        day_df = pd.DataFrame(jobs_data)
+    else:
+        current_ids = set(day_df["job_id"].astype(str))
+        missing = [job_id for job_id in route_ids if job_id not in current_ids]
+        if missing:
+            # Prefer the immutable locked snapshot rather than mixing two job sets.
+            if jobs_data:
+                day_df = pd.DataFrame(jobs_data)
+            else:
+                return False, "The saved route no longer matches the jobs stored for this date."
+
+    for column, default in {
+        "Status": "pending", "Payment": "Waiting", "PaymentTime": "",
+        "CompletedTime": "", "address_text": "", "geo_query": "",
+    }.items():
+        if column not in day_df.columns:
+            day_df[column] = default
+        day_df[column] = day_df[column].fillna(default)
 
     order_map = {job_id: order for order, job_id in enumerate(route_ids)}
     day_df["route_order"] = day_df["job_id"].astype(str).map(order_map)
+    day_df = day_df[day_df["job_id"].astype(str).isin(route_ids)].copy()
+    day_df = day_df.sort_values("route_order").reset_index(drop=True)
     save_dataframe(day_df)
 
-    st.session_state.master_df = day_df.reset_index(drop=True)
+    st.session_state.master_df = day_df
     st.session_state.route_data = {
-        "revenue": float(snapshot["revenue"]),
-        "fuel_cost": float(snapshot["fuel_cost"]),
-        "take_home": float(snapshot["take_home"]),
-        "miles": float(snapshot["miles"]),
-        "litres": float(snapshot["litres"]),
-        "time": float(snapshot["time_s"]),
+        "revenue": float(snapshot.get("revenue") or 0.0),
+        "fuel_cost": float(snapshot.get("fuel_cost") or 0.0),
+        "take_home": float(snapshot.get("take_home") or 0.0),
+        "miles": float(snapshot.get("miles") or 0.0),
+        "litres": float(snapshot.get("litres") or 0.0),
+        "time": float(snapshot.get("time_s") or 0.0),
         "offline": False,
-        "jobs": int(snapshot["jobs"]),
-        "completed": int(
-            day_df["Status"].astype(str).str.lower().eq("completed").sum()
-        ),
+        "jobs": int(snapshot.get("jobs") or len(route_ids)),
+        "completed": int(day_df["Status"].astype(str).str.lower().eq("completed").sum()),
         "persisted_only": False,
         "saved_route": True,
         "saved_at": clean_val(snapshot.get("saved_at")),
     }
     st.session_state.pop("failed_jobs", None)
-    return True, "Saved route loaded."
+    return True, "Permanent saved route loaded."
 
 
 init_db()
@@ -3804,9 +3885,13 @@ else:
                 )
 
         with st.container(border=True):
-            st.write(
-                f"### {icon} STOP {display_number} — {postcode}"
-            )
+            street_address = clean_val(row.get("Address")) or clean_val(row.get("address_text"))
+            if street_address:
+                st.write(f"### {icon} STOP {display_number} — {street_address}")
+                if postcode:
+                    st.write(f"**{postcode}**")
+            else:
+                st.write(f"### {icon} STOP {display_number} — {postcode}")
 
             if extra:
                 st.write(" | ".join(extra))
