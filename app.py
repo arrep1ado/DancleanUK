@@ -20,7 +20,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "26.11"
+APP_VERSION = "26.12"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2317,6 +2317,126 @@ def intensive_route_polish(
 
     return best
 
+
+def diversified_route_polish(
+    route,
+    distances,
+    durations,
+    fuel_price,
+    mpg,
+    max_seeds=14,
+):
+    """V26.12 deterministic escape-from-local-minimum search.
+
+    V26.11 can only accept an immediately improving 2-opt/swap/Or-opt move.
+    That is deliberately safe, but it can stop at a local minimum when two
+    geographic pockets need to move together before the complete route gets
+    better.  V26.12 creates a small, deterministic set of *temporary* kicked
+    routes, fully re-polishes each one against the SAME verified ORS matrix,
+    and returns a kicked route only when its final complete-route objective is
+    strictly better than the original.
+
+    No postcode, town, bearing, coordinate cluster, or customer-specific rule
+    is used here. Depot remains fixed and every customer must occur once.
+    """
+    if not route or len(route) < 8:
+        return route[:] if route else route
+
+    customer_count = len(route) - 2
+    expected = list(range(1, customer_count + 1))
+
+    def valid(candidate):
+        return (
+            candidate
+            and candidate[0] == 0
+            and candidate[-1] == 0
+            and len(candidate) == customer_count + 2
+            and sorted(candidate[1:-1]) == expected
+        )
+
+    baseline = route[:]
+    if not valid(baseline):
+        return route[:]
+
+    best = baseline[:]
+    best_key = _practical_route_key(
+        best, distances, durations, fuel_price, mpg
+    )
+    customers = baseline[1:-1]
+    n = len(customers)
+    seeds = []
+    seen = {tuple(baseline)}
+
+    def add_seed(customer_order):
+        if len(seeds) >= max_seeds:
+            return
+        candidate = [0] + list(customer_order) + [0]
+        key = tuple(candidate)
+        if key in seen or not valid(candidate):
+            return
+        seen.add(key)
+        seeds.append(candidate)
+
+    # Double-bridge style kicks. Four consecutive route sections are
+    # reconnected in a different order. This can cross an objective barrier
+    # that one downhill-only move cannot cross.
+    cut_sets = []
+    for shift in (0, 1, -1):
+        a = max(1, min(n - 3, n // 4 + shift))
+        b = max(a + 1, min(n - 2, n // 2 + shift))
+        c = max(b + 1, min(n - 1, (3 * n) // 4 + shift))
+        cuts = (a, b, c)
+        if cuts not in cut_sets:
+            cut_sets.append(cuts)
+
+    for a, b, c in cut_sets:
+        A, B, C, D = customers[:a], customers[a:b], customers[b:c], customers[c:]
+        add_seed(A + C + B + D)
+        add_seed(A + C + list(reversed(B)) + D)
+        add_seed(A + list(reversed(C)) + B + D)
+
+    # A few deterministic non-adjacent block swaps provide a different escape
+    # shape from the double-bridge kicks, still without geographic assumptions.
+    block = max(1, min(3, n // 8))
+    anchors = sorted(set([1, max(1, n // 3), max(1, (2 * n) // 3)]))
+    for left in anchors:
+        i = min(left, max(0, n - 2 * block - 1))
+        j = min(n - block, i + max(block + 1, n // 3))
+        if i < 0 or j <= i + block or j + block > n:
+            continue
+        kicked = (
+            customers[:i]
+            + customers[j:j + block]
+            + customers[i + block:j]
+            + customers[i:i + block]
+            + customers[j + block:]
+        )
+        add_seed(kicked)
+
+    for seed in seeds:
+        polished = intensive_route_polish(
+            seed,
+            distances,
+            durations,
+            fuel_price,
+            mpg,
+            max_rounds=6,
+        )
+        if not valid(polished):
+            continue
+        key = _practical_route_key(
+            polished, distances, durations, fuel_price, mpg
+        )
+        if key < best_key:
+            best = polished
+            best_key = key
+
+    # Absolute protection: a diversification experiment can never make the
+    # selected V26.11-quality route worse.
+    return best if best_key < _practical_route_key(
+        baseline, distances, durations, fuel_price, mpg
+    ) else baseline
+
 def surgical_route_polish(
     route,
     distances,
@@ -3051,6 +3171,39 @@ if st.button(
                     max_rounds=8,
                 )
             )
+
+        # V26.12: take only the strongest candidates produced above and try a
+        # deterministic escape from local minima. The original candidates stay
+        # in the pool, so this stage can never force a worse route.
+        if route_candidates:
+            valid_for_diversification = []
+            expected_for_diversification = list(range(1, len(distances)))
+            for candidate in route_candidates:
+                if (
+                    candidate
+                    and candidate[0] == 0
+                    and candidate[-1] == 0
+                    and len(candidate) == len(distances) + 1
+                    and sorted(candidate[1:-1]) == expected_for_diversification
+                ):
+                    valid_for_diversification.append(candidate)
+
+            valid_for_diversification.sort(
+                key=lambda r: _practical_route_key(
+                    r, distances, durations, FUEL_PRICE, MPG
+                )
+            )
+            for seed_route in valid_for_diversification[:2]:
+                route_candidates.append(
+                    diversified_route_polish(
+                        seed_route,
+                        distances,
+                        durations,
+                        FUEL_PRICE,
+                        MPG,
+                        max_seeds=14,
+                    )
+                )
 
         # Reject any malformed candidate before comparison. Depot stays fixed,
         # every customer must appear exactly once, and no job may disappear.
