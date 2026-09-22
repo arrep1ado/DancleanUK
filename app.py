@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.5-STRICT-GEO"
+APP_VERSION = "27.8.5.1-DEPOT-HOTFIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1463,7 +1463,15 @@ def get_coords(query_string, postcode):
     # supplied address, leave the customer unlocated so the UI can flag it.
     # This prevents a plausible-looking but wrong postcode-centre coordinate
     # from entering the ORS matrix.
-    if expected_house and expected_street:
+    # The depot is not an imported customer record. If public house/street
+    # geocoders cannot resolve it, allow the verified live postcode point as
+    # the routing start/finish fallback so STRICT GEO cannot block the whole
+    # day before customer validation begins. Customer jobs remain strict.
+    is_depot = (
+        normalise_postcode(postcode) == normalise_postcode(DEPOT_POSTCODE)
+        and str(query).strip().casefold() == str(DEPOT_FULL_ADDRESS).strip().casefold()
+    )
+    if expected_house and expected_street and not is_depot:
         st.session_state.geocode_cache.pop(key, None)
         return None
 
