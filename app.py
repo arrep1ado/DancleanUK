@@ -22,7 +22,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8"
+APP_VERSION = "27.8.1"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -3140,7 +3140,7 @@ if (
     not driver_mode
     and saved_snapshot is None
     and st.button(
-        "🚀 PLAN / RE-PLAN BEST DAILY ROUTE",
+        "🚀 PLAN BEST DAILY ROUTE",
         type="primary",
         use_container_width=True,
     )
@@ -3813,7 +3813,7 @@ if route_data:
     elif route_data.get("persisted_only"):
         st.info(
             "This day's jobs were restored from saved records. "
-            "Press PLAN / RE-PLAN to refresh live route mileage and time."
+            "Press PLAN BEST DAILY ROUTE to calculate live route mileage and time."
         )
     else:
         st.success(
