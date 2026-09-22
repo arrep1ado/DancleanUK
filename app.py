@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.2-DIAGNOSTIC"
+APP_VERSION = "27.8.3-STABLE-GEO"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -244,6 +244,65 @@ def _supabase_headers(prefer=None):
     if prefer:
         headers["Prefer"] = prefer
     return headers
+
+
+def load_persistent_geocode(query, postcode):
+    """Load the permanently pinned coordinate for one normalized address."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers()
+    if not url or not headers:
+        return None
+    address_key = cache_key_for(query, postcode)
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/geocode_registry",
+            headers=headers,
+            params={
+                "address_key": f"eq.{address_key}",
+                "select": "latitude,longitude,source",
+                "limit": "1",
+            },
+            timeout=12,
+        )
+        if response.status_code != 200:
+            return None
+        rows = response.json() or []
+        if not rows:
+            return None
+        row = rows[0]
+        return (float(row["latitude"]), float(row["longitude"]))
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return None
+
+
+def save_persistent_geocode(query, postcode, coords, source):
+    """Pin a verified address coordinate in Supabase so reruns/devices agree."""
+    if coords is None:
+        return False
+    url, _ = _supabase_config()
+    headers = _supabase_headers("resolution=ignore-duplicates,return=minimal")
+    if not url or not headers:
+        return False
+    try:
+        lat, lon = float(coords[0]), float(coords[1])
+        payload = {
+            "address_key": cache_key_for(query, postcode),
+            "query_text": str(query or "").strip(),
+            "postcode": normalise_postcode(postcode),
+            "latitude": lat,
+            "longitude": lon,
+            "source": str(source or "verified"),
+            "updated_at": datetime.now().astimezone().isoformat(),
+        }
+        response = requests.post(
+            f"{url}/rest/v1/geocode_registry?on_conflict=address_key",
+            headers=headers,
+            json=payload,
+            timeout=12,
+        )
+        return response.status_code in (200, 201, 204, 409)
+    except (requests.RequestException, ValueError, TypeError):
+        return False
 
 
 def _json_safe(value):
@@ -1299,6 +1358,17 @@ def get_coords(query_string, postcode):
 
         return None
 
+    # V27.8.3: permanent address pinning. Once a verified address has been
+    # resolved, every device/reboot uses the same coordinate instead of asking
+    # public geocoders to choose again. The coordinate is still revalidated
+    # under the current postcode safety rules before use.
+    persistent = load_persistent_geocode(query, postcode)
+    if persistent is not None:
+        checked_persistent = safe_exact(persistent)
+        if checked_persistent is not None:
+            st.session_state.geocode_cache[key] = checked_persistent
+            return checked_persistent
+
     # Revalidate cached coordinates under the CURRENT safety rules. This is
     # essential because a previously cached wrong match must not bypass fixes.
     cached = st.session_state.geocode_cache.get(key)
@@ -1318,6 +1388,7 @@ def get_coords(query_string, postcode):
     )
     if exact_ors is not None:
         st.session_state.geocode_cache[key] = exact_ors
+        save_persistent_geocode(query, postcode, exact_ors, "ors_exact")
         return exact_ors
 
     for candidate in geocode_candidates(query, postcode):
@@ -1331,6 +1402,7 @@ def get_coords(query_string, postcode):
         coords = safe_exact(coords)
         if coords is not None:
             st.session_state.geocode_cache[key] = coords
+            save_persistent_geocode(query, postcode, coords, "nominatim_exact")
             return coords
         time.sleep(0.35)
 
@@ -1344,6 +1416,7 @@ def get_coords(query_string, postcode):
     )
     if photon is not None:
         st.session_state.geocode_cache[key] = photon
+        save_persistent_geocode(query, postcode, photon, "photon_exact")
         return photon
 
     # If a geocoder has no house-number record, try the named STREET itself.
@@ -1374,6 +1447,7 @@ def get_coords(query_string, postcode):
             street_coords = safe_exact(street_coords)
             if street_coords is not None:
                 st.session_state.geocode_cache[key] = street_coords
+                save_persistent_geocode(query, postcode, street_coords, "nominatim_street")
                 return street_coords
             time.sleep(0.35)
 
@@ -1381,6 +1455,7 @@ def get_coords(query_string, postcode):
     # acceptable when the exact house/street is unavailable.
     if postcode_anchor is not None:
         st.session_state.geocode_cache[key] = postcode_anchor
+        save_persistent_geocode(query, postcode, postcode_anchor, "postcode_anchor")
         return postcode_anchor
 
     # A terminated postcode can still be useful for older customer records,
@@ -1415,6 +1490,7 @@ def get_coords(query_string, postcode):
 
         if len(address_parts) <= 1:
             st.session_state.geocode_cache[key] = terminated_postcode_anchor
+            save_persistent_geocode(query, postcode, terminated_postcode_anchor, "terminated_postcode_anchor")
             return terminated_postcode_anchor
 
     # No verified location: do not guess.
@@ -2883,6 +2959,10 @@ if st.sidebar.button(
         "uploaded_filename",
     ]:
         st.session_state.pop(key, None)
+    # Clear only the temporary in-memory geocoder cache. Permanent verified
+    # address pins in Supabase remain available, so known customers stay stable
+    # across days/devices without carrying stale session state.
+    st.session_state.geocode_cache = {}
     if current_day is not None and not current_day.empty:
         st.session_state.master_df = current_day.copy()
     st.session_state.start_new_day_mode = True
