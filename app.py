@@ -21,7 +21,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.4"
+APP_VERSION = "27.5"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -72,10 +72,14 @@ def init_db():
             latitude REAL,
             longitude REAL,
             geo_query TEXT,
+            notes TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         )
         """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "notes" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
     conn.commit()
     conn.close()
 
@@ -88,9 +92,9 @@ def save_job(row):
             job_id, service_date, postcode, price, phone,
             status, payment, payment_time, completed_time,
             route_order, address_text, latitude, longitude,
-            geo_query, created_at
+            geo_query, notes, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(job_id) DO UPDATE SET
             service_date=excluded.service_date,
             postcode=excluded.postcode,
@@ -104,7 +108,8 @@ def save_job(row):
             address_text=excluded.address_text,
             latitude=excluded.latitude,
             longitude=excluded.longitude,
-            geo_query=excluded.geo_query
+            geo_query=excluded.geo_query,
+            notes=excluded.notes
         """,
         (
             str(row["job_id"]),
@@ -121,6 +126,7 @@ def save_job(row):
             safe_float(row.get("latitude")),
             safe_float(row.get("longitude")),
             str(row.get("geo_query", "")),
+            str(row.get("Notes", row.get("notes", "")) or ""),
             str(row.get("created_at", datetime.now().isoformat())),
         ),
     )
@@ -169,6 +175,7 @@ def load_day(service_date):
             "payment": "Payment",
             "payment_time": "PaymentTime",
             "completed_time": "CompletedTime",
+            "notes": "Notes",
         }
     )
 
@@ -184,6 +191,7 @@ def load_day(service_date):
         "latitude": None,
         "longitude": None,
         "geo_query": "",
+        "Notes": "",
     }
     for column, default in defaults.items():
         if column not in loaded.columns:
@@ -195,6 +203,7 @@ def load_day(service_date):
     loaded["CompletedTime"] = loaded["CompletedTime"].fillna("")
     loaded["address_text"] = loaded["address_text"].fillna("")
     loaded["geo_query"] = loaded["geo_query"].fillna("")
+    loaded["Notes"] = loaded["Notes"].fillna("")
 
     return loaded
 
@@ -398,7 +407,7 @@ def apply_saved_route_snapshot(service_date):
 
     for column, default in {
         "Status": "pending", "Payment": "Waiting", "PaymentTime": "",
-        "CompletedTime": "", "address_text": "", "geo_query": "",
+        "CompletedTime": "", "address_text": "", "geo_query": "", "Notes": "",
     }.items():
         if column not in day_df.columns:
             day_df[column] = default
@@ -2987,6 +2996,7 @@ if uploaded_file is not None:
             df["Payment"] = "Waiting"
             df["PaymentTime"] = ""
             df["CompletedTime"] = ""
+            df["Notes"] = ""
             df["route_order"] = None
             df["address_text"] = address_texts
             df["latitude"] = None
@@ -3006,6 +3016,7 @@ if uploaded_file is not None:
                         "Payment",
                         "PaymentTime",
                         "CompletedTime",
+                        "Notes",
                         "route_order",
                         "latitude",
                         "longitude",
@@ -3020,6 +3031,7 @@ if uploaded_file is not None:
                         "Payment",
                         "PaymentTime",
                         "CompletedTime",
+                        "Notes",
                         "route_order",
                         "latitude",
                         "longitude",
@@ -3037,6 +3049,7 @@ if uploaded_file is not None:
                 df["Payment"] = df["Payment"].fillna("Waiting")
                 df["PaymentTime"] = df["PaymentTime"].fillna("")
                 df["CompletedTime"] = df["CompletedTime"].fillna("")
+                df["Notes"] = df["Notes"].fillna("")
                 df["address_text"] = df["address_text"].fillna("")
                 df["geo_query"] = df["geo_query"].fillna("")
 
@@ -3930,6 +3943,7 @@ else:
             "longitude",
             "geo_query",
             "created_at",
+            "notes",
             "_route_sort",
         }
 
@@ -3965,10 +3979,13 @@ else:
 
             with col1:
                 if status != "completed":
+                    payment_selected = payment in {"Cash", "Bank Transfer", "Not Paid"}
                     if st.button(
                         "✅ Complete",
                         key=f"complete_{row['job_id']}",
                         use_container_width=True,
+                        disabled=not payment_selected,
+                        help=None if payment_selected else "Choose Cash, Bank or Unpaid first.",
                     ):
                         master_idx = df.index[
                             df["job_id"].astype(str)
@@ -3987,6 +4004,9 @@ else:
 
                         save_job(df.loc[master_idx])
                         st.session_state.master_df = df
+                        current_route_data = st.session_state.get("route_data")
+                        if current_route_data and current_route_data.get("saved_route"):
+                            save_route_snapshot(service_date_str, df, current_route_data)
                         st.rerun()
                 else:
                     st.success("Completed")
@@ -4024,6 +4044,9 @@ else:
 
                     save_job(df.loc[master_idx])
                     st.session_state.master_df = df
+                    current_route_data = st.session_state.get("route_data")
+                    if current_route_data and current_route_data.get("saved_route"):
+                        save_route_snapshot(service_date_str, df, current_route_data)
                     st.rerun()
 
             with pay2:
@@ -4049,6 +4072,9 @@ else:
 
                     save_job(df.loc[master_idx])
                     st.session_state.master_df = df
+                    current_route_data = st.session_state.get("route_data")
+                    if current_route_data and current_route_data.get("saved_route"):
+                        save_route_snapshot(service_date_str, df, current_route_data)
                     st.rerun()
 
             with pay3:
@@ -4074,14 +4100,40 @@ else:
 
                     save_job(df.loc[master_idx])
                     st.session_state.master_df = df
+                    current_route_data = st.session_state.get("route_data")
+                    if current_route_data and current_route_data.get("saved_route"):
+                        save_route_snapshot(service_date_str, df, current_route_data)
                     st.rerun()
 
-            if status == "completed" and phone:
+            if payment == "Not Paid" and phone:
                 st.link_button(
-                    "💬 Send WhatsApp Payment Message",
+                    "💬 WhatsApp — Service Done + Bank Details",
                     whatsapp_url(phone, price),
                     use_container_width=True,
                 )
+
+            current_notes = clean_val(row.get("Notes"))
+            notes_value = st.text_area(
+                "📝 Job notes",
+                value=current_notes,
+                key=f"notes_{row['job_id']}",
+                placeholder="e.g. Full house, front + back, gate code, access details…",
+                height=70,
+            )
+            if notes_value.strip() != current_notes.strip():
+                if st.button(
+                    "💾 Save Notes",
+                    key=f"save_notes_{row['job_id']}",
+                    use_container_width=True,
+                ):
+                    master_idx = df.index[df["job_id"].astype(str) == str(row["job_id"])][0]
+                    df.at[master_idx, "Notes"] = notes_value.strip()
+                    save_job(df.loc[master_idx])
+                    st.session_state.master_df = df
+                    current_route_data = st.session_state.get("route_data")
+                    if current_route_data and current_route_data.get("saved_route"):
+                        save_route_snapshot(service_date_str, df, current_route_data)
+                    st.rerun()
 
 with st.container(border=True):
     st.write("### 🏁 FINISH — GRANTHAM DEPOT")
@@ -4161,6 +4213,7 @@ if not export_df.empty:
 
     # Put useful columns first.
     preferred = [
+        "address_text",
         "Postcode",
         "Price",
         "Phone",
@@ -4168,6 +4221,7 @@ if not export_df.empty:
         "Payment",
         "PaymentTime",
         "CompletedTime",
+        "Notes",
         "route_order",
         "address_text",
         "job_id",
@@ -4186,112 +4240,63 @@ if not export_df.empty:
     output = io.BytesIO()
     workbook = Workbook()
 
-    summary_ws = workbook.active
-    summary_ws.title = "Daily Summary"
+    report_ws = workbook.active
+    report_ws.title = "Daily Report"
 
-    total_revenue = float(export_df["Price"].sum()) if not export_df.empty else 0
-    completed_count = int(
-        export_df["Status"]
-        .astype(str)
-        .str.lower()
-        .eq("completed")
-        .sum()
-    ) if not export_df.empty else 0
+    header_fill = PatternFill(start_color="2F4F4F", end_color="2F4F4F", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
 
-    cash_total = float(
-        export_df.loc[
-            export_df["Payment"].astype(str).str.lower() == "cash",
-            "Price",
-        ].sum()
-    ) if not export_df.empty else 0
+    report_df = export_df.copy()
+    if "address_text" in report_df.columns:
+        report_df = report_df.rename(columns={"address_text": "Address"})
+    if "Payment" in report_df.columns:
+        report_df = report_df.rename(columns={"Payment": "Payment Method"})
+    if "Status" in report_df.columns:
+        report_df = report_df.rename(columns={"Status": "Completion Status"})
 
-    bank_total = float(
-        export_df.loc[
-            export_df["Payment"].astype(str).str.lower() == "bank transfer",
-            "Price",
-        ].sum()
-    ) if not export_df.empty else 0
+    visible_first = ["Address", "Postcode", "Price", "Payment Method", "Completion Status", "Notes", "PaymentTime", "CompletedTime", "Phone", "route_order"]
+    first = [c for c in visible_first if c in report_df.columns]
+    rest = [c for c in report_df.columns if c not in first and c != "job_id"]
+    report_df = report_df[first + rest]
 
-    unpaid_total = float(
-        export_df.loc[
-            export_df["Payment"].astype(str).str.lower().isin(
-                ["waiting", "not paid"]
-            ),
-            "Price",
-        ].sum()
-    ) if not export_df.empty else 0
-
-    summary_rows = [
-        ["DanCleanUK Daily Report", ""],
-        ["Route Date", service_date_str],
-        ["Depot", DEPOT_FULL_ADDRESS],
-        ["Total Jobs", len(export_df)],
-        ["Completed Jobs", completed_count],
-        ["Revenue", total_revenue],
-        ["Cash Received", cash_total],
-        ["Bank Transfer Received", bank_total],
-        ["Outstanding / Unpaid", unpaid_total],
-        ["Fuel Cost", route_data["fuel_cost"] if route_data else 0],
-        ["Fuel Used (litres)", route_data["litres"] if route_data else 0],
-        ["Driving Miles", route_data["miles"] if route_data else 0],
-        ["Driving Time", format_duration(route_data["time"]) if route_data else "0m"],
-        ["Tax Rate", f"{TAX_RATE * 100:.0f}%"],
-        ["Estimated Take-Home", route_data["take_home"] if route_data else 0],
-    ]
-
-    for row in summary_rows:
-        summary_ws.append(row)
-
-    header_fill = PatternFill(
-        start_color="2F4F4F",
-        end_color="2F4F4F",
-        fill_type="solid",
-    )
-
-    header_font = Font(
-        color="FFFFFF",
-        bold=True,
-    )
-
-    summary_ws["A1"].fill = header_fill
-    summary_ws["A1"].font = header_font
-
-    summary_ws.column_dimensions["A"].width = 28
-    summary_ws.column_dimensions["B"].width = 45
-
-    records_ws = workbook.create_sheet("Customer Records")
-
-    for row in dataframe_to_rows(
-        export_df,
-        index=False,
-        header=True,
-    ):
-        records_ws.append(row)
-
-    for cell in records_ws[1]:
+    for values in dataframe_to_rows(report_df, index=False, header=True):
+        report_ws.append(values)
+    for cell in report_ws[1]:
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = Alignment(
-            horizontal="center"
-        )
+        cell.alignment = Alignment(horizontal="center")
 
-    for column_cells in records_ws.columns:
+    total_revenue = float(export_df["Price"].sum()) if not export_df.empty else 0
+    completed_count = int(export_df["Status"].astype(str).str.lower().eq("completed").sum()) if not export_df.empty else 0
+    cash_total = float(export_df.loc[export_df["Payment"].astype(str).str.lower() == "cash", "Price"].sum()) if not export_df.empty else 0
+    bank_total = float(export_df.loc[export_df["Payment"].astype(str).str.lower() == "bank transfer", "Price"].sum()) if not export_df.empty else 0
+    unpaid_total = float(export_df.loc[export_df["Payment"].astype(str).str.lower().isin(["waiting", "not paid"]), "Price"].sum()) if not export_df.empty else 0
+
+    summary_start = report_ws.max_row + 3
+    summary_rows = [
+        ["DanCleanUK Daily Summary", ""], ["Route Date", service_date_str], ["Depot", DEPOT_FULL_ADDRESS],
+        ["Total Jobs", len(export_df)], ["Completed Jobs", completed_count], ["Revenue", total_revenue],
+        ["Cash Received", cash_total], ["Bank Transfer Received", bank_total], ["Outstanding / Unpaid", unpaid_total],
+        ["Fuel Cost", route_data["fuel_cost"] if route_data else 0], ["Fuel Used (litres)", route_data["litres"] if route_data else 0],
+        ["Driving Miles", route_data["miles"] if route_data else 0], ["Driving Time", format_duration(route_data["time"]) if route_data else "0m"],
+        ["Tax Rate", f"{TAX_RATE * 100:.0f}%"], ["Estimated Take-Home", route_data["take_home"] if route_data else 0],
+    ]
+    for offset, values in enumerate(summary_rows):
+        row_num = summary_start + offset
+        report_ws.cell(row=row_num, column=1, value=values[0])
+        report_ws.cell(row=row_num, column=2, value=values[1])
+    report_ws.cell(row=summary_start, column=1).fill = header_fill
+    report_ws.cell(row=summary_start, column=1).font = header_font
+
+    for column_cells in report_ws.columns:
         max_length = 0
         letter = column_cells[0].column_letter
-
         for cell in column_cells:
             try:
-                max_length = max(
-                    max_length,
-                    len(str(cell.value)),
-                )
+                max_length = max(max_length, len(str(cell.value or "")))
             except Exception:
                 pass
-
-        records_ws.column_dimensions[letter].width = min(
-            max_length + 2,
-            50,
-        )
+        report_ws.column_dimensions[letter].width = min(max(max_length + 2, 12), 50)
 
     workbook.save(output)
 
