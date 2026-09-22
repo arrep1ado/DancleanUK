@@ -1,4 +1,5 @@
 import io
+import base64
 import json
 import math
 import re
@@ -21,7 +22,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.6.1"
+APP_VERSION = "27.7"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -300,6 +301,12 @@ def save_route_snapshot(service_date, df, route_data):
         "saved_at": now_text(),
         "app_version": APP_VERSION,
     }
+    existing_snapshot = load_route_snapshot(service_date)
+    if existing_snapshot:
+        existing_data = existing_snapshot.get("route_data") or {}
+        for key in ("report_b64", "report_filename", "report_saved_at"):
+            if existing_data.get(key):
+                route_payload[key] = existing_data[key]
     total_minutes = int(round(float(route_data.get("time", 0.0)) / 60.0))
     payload = {
         "route_date": str(service_date),
@@ -348,6 +355,9 @@ def load_route_snapshot(service_date):
             return None
         row = rows[0]
         data = row.get("route_data") or {}
+        row["route_data"] = data
+        row["report_b64"] = data.get("report_b64") or ""
+        row["report_filename"] = data.get("report_filename") or ""
         row["route_job_ids"] = [str(x) for x in data.get("route_job_ids", [])]
         row["jobs_data"] = data.get("jobs_data", [])
         row["litres"] = float(data.get("litres", 0.0) or 0.0)
@@ -406,6 +416,7 @@ def apply_saved_route_snapshot(service_date):
     for column, default in {
         "Status": "pending", "Payment": "Waiting", "PaymentTime": "",
         "CompletedTime": "", "address_text": "", "geo_query": "", "Notes": "",
+        "WhatsAppSent": False, "WhatsAppTime": "",
     }.items():
         if column not in day_df.columns:
             day_df[column] = default
@@ -592,27 +603,8 @@ TAX_RATE = (
 )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🏦 Payment Settings")
-
-BUSINESS_NAME = st.sidebar.text_input(
-    "Business name",
-    value="DanCleanUK",
-)
-
-BANK_NAME = st.sidebar.text_input(
-    "Bank name",
-    value="Mettle",
-)
-
-SORT_CODE = st.sidebar.text_input(
-    "Sort code",
-    value="04-03-33",
-)
-
-ACCOUNT_NUMBER = st.sidebar.text_input(
-    "Account number",
-    value="72515806",
-)
+st.sidebar.subheader("💬 Customer Messages")
+BUSINESS_NAME = st.sidebar.text_input("Business name", value="DanCleanUK")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 Route Optimisation")
@@ -2723,21 +2715,18 @@ def get_destination(row):
 
 
 def whatsapp_url(phone, price):
-    message = (
-        f"Hi from {BUSINESS_NAME}! "
-        f"Your service is complete today. "
-        f"Total: £{price:.2f}. "
-        f"Please pay via bank transfer to {BANK_NAME} - "
-        f"Sort Code: {SORT_CODE} "
-        f"Account: {ACCOUNT_NUMBER}. "
-        f"Thank you!"
-    )
-
-    return (
-        "https://wa.me/"
-        f"{quote(normalise_phone(phone))}"
-        f"?text={quote(message)}"
-    )
+    # Bank details stay out of the visible app and source code. They come only
+    # from private Streamlit Secrets and are inserted into the WhatsApp text.
+    bank_name = clean_val(st.secrets.get("PAYMENT_BANK_NAME", ""))
+    sort_code = clean_val(st.secrets.get("PAYMENT_SORT_CODE", ""))
+    account_number = clean_val(st.secrets.get("PAYMENT_ACCOUNT_NUMBER", ""))
+    payment_text = "Please use the bank details on your DanCleanUK payment flyer."
+    if bank_name and sort_code and account_number:
+        payment_text = (f"Please pay by bank transfer to {bank_name} - "
+                        f"Sort Code: {sort_code} Account: {account_number}.")
+    message = (f"Hi from {BUSINESS_NAME}! Your service is complete today. "
+               f"Total: £{price:.2f}. {payment_text} Thank you!")
+    return "https://wa.me/" + quote(normalise_phone(phone)) + "?text=" + quote(message)
 
 
 # ============================================================
@@ -4057,6 +4046,8 @@ else:
                         master_idx,
                         "PaymentTime",
                     ] = now_text()
+                    df.at[master_idx, "WhatsAppSent"] = False
+                    df.at[master_idx, "WhatsAppTime"] = ""
 
                     save_job(df.loc[master_idx])
                     st.session_state.master_df = df
@@ -4085,6 +4076,8 @@ else:
                         master_idx,
                         "PaymentTime",
                     ] = now_text()
+                    df.at[master_idx, "WhatsAppSent"] = False
+                    df.at[master_idx, "WhatsAppTime"] = ""
 
                     save_job(df.loc[master_idx])
                     st.session_state.master_df = df
@@ -4093,12 +4086,24 @@ else:
                         save_route_snapshot(service_date_str, df, current_route_data)
                     st.rerun()
 
-            if payment in {"Bank Transfer", "Not Paid"} and phone:
-                st.link_button(
-                    "💬 WhatsApp — Service Done + Bank Details",
-                    whatsapp_url(phone, price),
-                    use_container_width=True,
-                )
+            if payment in {"Bank Transfer", "Not Paid"}:
+                whatsapp_sent = bool(row.get("WhatsAppSent", False))
+                if phone:
+                    st.link_button("💬 1. Open WhatsApp Message", whatsapp_url(phone, price), use_container_width=True)
+                    if not whatsapp_sent:
+                        if st.button("✅ 2. Confirm WhatsApp Sent", key=f"whatsapp_sent_{row['job_id']}", use_container_width=True):
+                            master_idx = df.index[df["job_id"].astype(str) == str(row["job_id"])][0]
+                            df.at[master_idx, "WhatsAppSent"] = True
+                            df.at[master_idx, "WhatsAppTime"] = now_text()
+                            st.session_state.master_df = df
+                            current_route_data = st.session_state.get("route_data")
+                            if current_route_data and current_route_data.get("saved_route"):
+                                save_route_snapshot(service_date_str, df, current_route_data)
+                            st.rerun()
+                    else:
+                        st.success("💬 WhatsApp confirmed sent — Complete is unlocked.")
+                else:
+                    st.warning("No phone number is stored for this customer, so WhatsApp cannot be sent.")
 
             current_notes = clean_val(row.get("Notes"))
             edit_key = f"edit_notes_{row['job_id']}"
@@ -4179,6 +4184,25 @@ if not completed_df.empty and not driver_mode:
         use_container_width=True,
         hide_index=True,
     )
+
+
+def save_report_to_snapshot(service_date, report_bytes, filename):
+    snapshot = load_route_snapshot(service_date)
+    if not snapshot:
+        return False
+    data = dict(snapshot.get("route_data") or {})
+    data["report_b64"] = base64.b64encode(report_bytes).decode("ascii")
+    data["report_filename"] = filename
+    data["report_saved_at"] = now_text()
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=minimal")
+    if not url or not headers:
+        return False
+    try:
+        r = requests.patch(f"{url}/rest/v1/saved_routes", headers=headers, params={"route_date": f"eq.{service_date}"}, json={"route_data": data, "updated_at": datetime.now().astimezone().isoformat()}, timeout=20)
+        return r.status_code in (200, 204)
+    except requests.RequestException:
+        return False
 
 
 # ============================================================
@@ -4299,13 +4323,19 @@ if not export_df.empty:
         report_ws.column_dimensions[letter].width = min(max(max_length + 2, 12), 50)
 
     workbook.save(output)
-
-    st.sidebar.download_button(
-        "⬇️ Download Excel Report",
-        output.getvalue(),
-        f"DanCleanUK_{service_date_str}.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    report_bytes = output.getvalue()
+    report_filename = f"DanCleanUK_{service_date_str}.xlsx"
+    if st.sidebar.button("💾 Get Report / Save for Laptop", use_container_width=True):
+        if save_report_to_snapshot(service_date_str, report_bytes, report_filename):
+            st.sidebar.success("Report saved permanently — available from your laptop for this date.")
+        else:
+            st.sidebar.error("Could not save the report permanently. You can still download it on this device.")
+    saved = load_route_snapshot(service_date_str)
+    if saved and saved.get("report_b64"):
+        try:
+            st.sidebar.download_button("💻 Download Saved Report", base64.b64decode(saved["report_b64"]), saved.get("report_filename") or report_filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        except Exception:
+            pass
+    st.sidebar.download_button("⬇️ Download Report on This Device", report_bytes, report_filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
 st.sidebar.caption(f"DanCleanUK Route Optimizer v{APP_VERSION}")
