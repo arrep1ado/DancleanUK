@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.3-STABLE-GEO"
+APP_VERSION = "27.8.4-ACCURATE-GEO"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -270,6 +270,11 @@ def load_persistent_geocode(query, postcode):
         if not rows:
             return None
         row = rows[0]
+        source = str(row.get("source") or "").strip().lower()
+        # V27.8.4: legacy postcode-centroid rows are not address-level pins.
+        # Ignore them so the normal exact/street geocoders get another chance.
+        if source in {"postcode_anchor", "terminated_postcode_anchor"}:
+            return None
         return (float(row["latitude"]), float(row["longitude"]))
     except (requests.RequestException, ValueError, TypeError, KeyError):
         return None
@@ -1451,11 +1456,12 @@ def get_coords(query_string, postcode):
                 return street_coords
             time.sleep(0.35)
 
-    # Final safe postcode-level fallback. A LIVE postcode centroid is always
-    # acceptable when the exact house/street is unavailable.
+    # Final safe postcode-level fallback. A LIVE postcode centroid may be used
+    # for this run when the exact house/street is unavailable, but it is NOT
+    # permanently pinned as an address-level coordinate. A postcode centroid
+    # represents the postcode area, not necessarily the customer's property.
     if postcode_anchor is not None:
         st.session_state.geocode_cache[key] = postcode_anchor
-        save_persistent_geocode(query, postcode, postcode_anchor, "postcode_anchor")
         return postcode_anchor
 
     # A terminated postcode can still be useful for older customer records,
@@ -1489,8 +1495,9 @@ def get_coords(query_string, postcode):
         ]
 
         if len(address_parts) <= 1:
+            # Validation-safe fallback for this run only. Do not permanently
+            # pin a terminated-postcode centroid as the customer's address.
             st.session_state.geocode_cache[key] = terminated_postcode_anchor
-            save_persistent_geocode(query, postcode, terminated_postcode_anchor, "terminated_postcode_anchor")
             return terminated_postcode_anchor
 
     # No verified location: do not guess.
