@@ -22,7 +22,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.7.1"
+APP_VERSION = "27.7.2"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -4191,20 +4191,46 @@ if not completed_df.empty and not driver_mode:
 
 
 def save_report_to_snapshot(service_date, report_bytes, filename):
+    """Attach a generated XLSX report to an existing saved route.
+
+    Use the same Supabase UPSERT path as route saving. This avoids relying on
+    PATCH behaviour and keeps the exact saved route payload untouched apart
+    from the three report fields below.
+    """
     snapshot = load_route_snapshot(service_date)
     if not snapshot:
         return False
+
     data = dict(snapshot.get("route_data") or {})
     data["report_b64"] = base64.b64encode(report_bytes).decode("ascii")
-    data["report_filename"] = filename
+    data["report_filename"] = str(filename)
     data["report_saved_at"] = now_text()
+
+    payload = {
+        "route_date": str(service_date),
+        "route_data": data,
+        "total_jobs": int(snapshot.get("total_jobs") or snapshot.get("jobs") or 0),
+        "total_miles": float(snapshot.get("total_miles") or snapshot.get("miles") or 0.0),
+        "total_minutes": int(snapshot.get("total_minutes") or round(float(snapshot.get("time_s") or 0.0) / 60.0)),
+        "revenue": float(snapshot.get("revenue") or 0.0),
+        "fuel_cost": float(snapshot.get("fuel_cost") or 0.0),
+        "take_home": float(snapshot.get("take_home") or 0.0),
+        "updated_at": datetime.now().astimezone().isoformat(),
+    }
+
     url, _ = _supabase_config()
-    headers = _supabase_headers("return=minimal")
+    headers = _supabase_headers("resolution=merge-duplicates,return=minimal")
     if not url or not headers:
         return False
+
     try:
-        r = requests.patch(f"{url}/rest/v1/saved_routes", headers=headers, params={"route_date": f"eq.{service_date}"}, json={"route_data": data, "updated_at": datetime.now().astimezone().isoformat()}, timeout=20)
-        return r.status_code in (200, 204)
+        response = requests.post(
+            f"{url}/rest/v1/saved_routes?on_conflict=route_date",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        return response.status_code in (200, 201, 204)
     except requests.RequestException:
         return False
 
