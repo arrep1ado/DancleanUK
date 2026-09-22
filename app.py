@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.4-ACCURATE-GEO"
+APP_VERSION = "27.8.5-STRICT-GEO"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -285,7 +285,7 @@ def save_persistent_geocode(query, postcode, coords, source):
     if coords is None:
         return False
     url, _ = _supabase_config()
-    headers = _supabase_headers("resolution=ignore-duplicates,return=minimal")
+    headers = _supabase_headers("resolution=merge-duplicates,return=minimal")
     if not url or not headers:
         return False
     try:
@@ -1456,49 +1456,31 @@ def get_coords(query_string, postcode):
                 return street_coords
             time.sleep(0.35)
 
-    # Final safe postcode-level fallback. A LIVE postcode centroid may be used
-    # for this run when the exact house/street is unavailable, but it is NOT
-    # permanently pinned as an address-level coordinate. A postcode centroid
-    # represents the postcode area, not necessarily the customer's property.
+    # V27.8.5 STRICT GEO:
+    # If the imported record contains a house number + street, NEVER silently
+    # turn that customer into a postcode centroid. The postcode remains a
+    # validation anchor only. If exact/street geocoding could not resolve the
+    # supplied address, leave the customer unlocated so the UI can flag it.
+    # This prevents a plausible-looking but wrong postcode-centre coordinate
+    # from entering the ORS matrix.
+    if expected_house and expected_street:
+        st.session_state.geocode_cache.pop(key, None)
+        return None
+
+    # Postcode-only records (no usable house + street supplied) may still use
+    # the official live postcode coordinate because there is no more precise
+    # customer location in the imported data. This is a deliberate fallback,
+    # not an address-level pin, so it is never written to geocode_registry.
     if postcode_anchor is not None:
         st.session_state.geocode_cache[key] = postcode_anchor
         return postcode_anchor
 
-    # A terminated postcode can still be useful for older customer records,
-    # but only when the imported address does NOT contain an additional
-    # locality/town that could conflict with that historic postcode.
-    # Example safe shape: "45 Dysart Road, NG31 7AN, United Kingdom".
-    # Example unsafe shape: "7 Church Street, Muston, OLD POSTCODE, UK".
-    # In the unsafe case we keep the hard stop rather than silently routing to
-    # the wrong village/town.
-    if terminated_postcode_anchor is not None:
-        address_without_country = re.sub(
-            r",?\s*united kingdom\s*$",
-            "",
-            query,
-            flags=re.IGNORECASE,
-        )
-        address_without_pc = re.sub(
-            re.escape(postcode),
-            "",
-            address_without_country,
-            flags=re.IGNORECASE,
-        ).strip(" ,")
-
-        # Split the remaining address. One component means house + street only;
-        # two or more components usually means an explicit locality/town was
-        # supplied and must be resolved rather than ignored.
-        address_parts = [
-            part.strip()
-            for part in address_without_pc.split(",")
-            if part.strip()
-        ]
-
-        if len(address_parts) <= 1:
-            # Validation-safe fallback for this run only. Do not permanently
-            # pin a terminated-postcode centroid as the customer's address.
-            st.session_state.geocode_cache[key] = terminated_postcode_anchor
-            return terminated_postcode_anchor
+    # Likewise, a terminated postcode is only a last-resort coordinate for a
+    # postcode-only record. It is never treated as a resolved house address and
+    # is never persisted as one.
+    if terminated_postcode_anchor is not None and not expected_street:
+        st.session_state.geocode_cache[key] = terminated_postcode_anchor
+        return terminated_postcode_anchor
 
     # No verified location: do not guess.
     return None
