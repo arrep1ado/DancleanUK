@@ -21,7 +21,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.6"
+APP_VERSION = "27.6.1"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -37,8 +37,6 @@ st.markdown(
     <style>
         html, body { overscroll-behavior-y: none; }
         .small-muted { color: #777; font-size: 0.9rem; }
-        #MainMenu { visibility: hidden; }
-        div[data-testid="stToolbar"] { display: none !important; }
     </style>
     """,
     unsafe_allow_html=True,
