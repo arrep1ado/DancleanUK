@@ -21,7 +21,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.5"
+APP_VERSION = "27.6"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -37,6 +37,8 @@ st.markdown(
     <style>
         html, body { overscroll-behavior-y: none; }
         .small-muted { color: #777; font-size: 0.9rem; }
+        #MainMenu { visibility: hidden; }
+        div[data-testid="stToolbar"] { display: none !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -389,21 +391,19 @@ def apply_saved_route_snapshot(service_date):
     day_df = load_day(service_date)
     jobs_data = snapshot.get("jobs_data") or []
 
-    # If local Streamlit storage was restarted, rebuild the working day's jobs
-    # from the permanent locked snapshot instead of losing the route.
-    if day_df.empty:
-        if not jobs_data:
-            return False, "The permanent route exists, but its customer records are unavailable."
+    # The permanent saved route is the master working-day record. Its job rows
+    # carry the latest completion/payment/notes state between phone and laptop.
+    # Local SQLite is only a working cache and must never overwrite newer
+    # Supabase state after a reconnect or device change.
+    if jobs_data:
         day_df = pd.DataFrame(jobs_data)
+    elif day_df.empty:
+        return False, "The permanent route exists, but its customer records are unavailable."
     else:
         current_ids = set(day_df["job_id"].astype(str))
         missing = [job_id for job_id in route_ids if job_id not in current_ids]
         if missing:
-            # Prefer the immutable locked snapshot rather than mixing two job sets.
-            if jobs_data:
-                day_df = pd.DataFrame(jobs_data)
-            else:
-                return False, "The saved route no longer matches the jobs stored for this date."
+            return False, "The saved route no longer matches the jobs stored for this date."
 
     for column, default in {
         "Status": "pending", "Payment": "Waiting", "PaymentTime": "",
@@ -2748,6 +2748,16 @@ def whatsapp_url(phone, price):
 
 existing_day = load_day(service_date_str)
 
+# V27.6 reconnect recovery: if Streamlit/Chrome restarted and the permanent
+# route exists, rebuild the working day from Supabase automatically. This
+# never optimises or changes the saved stop order.
+if "master_df" not in st.session_state and existing_day.empty:
+    reconnect_snapshot = load_route_snapshot(service_date_str)
+    if reconnect_snapshot is not None:
+        ok, _ = apply_saved_route_snapshot(service_date_str)
+        if ok:
+            existing_day = st.session_state.master_df.copy()
+
 if (
     not existing_day.empty
     and "master_df" not in st.session_state
@@ -2996,7 +3006,12 @@ if uploaded_file is not None:
             df["Payment"] = "Waiting"
             df["PaymentTime"] = ""
             df["CompletedTime"] = ""
-            df["Notes"] = ""
+            # Notes may be supplied in the daily route spreadsheet. Keep them
+            # with the customer from import -> locked route -> phone -> report.
+            if "Notes" not in df.columns:
+                df["Notes"] = ""
+            else:
+                df["Notes"] = df["Notes"].fillna("").astype(str).str.strip()
             df["route_order"] = None
             df["address_text"] = address_texts
             df["latitude"] = None
@@ -3708,7 +3723,7 @@ if route_data:
                         padding:.75rem .9rem;margin:.25rem 0 .65rem 0;">
               <div style="font-size:1.05rem;font-weight:700;margin-bottom:.45rem;">📱 Driver Mode</div>
               <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.45rem;text-align:center;">
-                <div><b>{route_data.get('jobs',0)}</b><br><span style="font-size:.78rem;opacity:.75">Jobs</span></div>
+                <div><b>{max(total_jobs - completed_jobs, 0)}</b><br><span style="font-size:.78rem;opacity:.75">Remaining</span></div>
                 <div><b>{route_data['miles']:.1f} mi</b><br><span style="font-size:.78rem;opacity:.75">Distance</span></div>
                 <div><b>{format_duration(route_data['time'])}</b><br><span style="font-size:.78rem;opacity:.75">Driving</span></div>
                 <div><b>{completed_jobs}</b><br><span style="font-size:.78rem;opacity:.75">Done</span></div>
@@ -3821,7 +3836,7 @@ if not failed_jobs.empty:
 
 
 # ============================================================
-# SIDEBAR NEXT STOP
+# WORKING-DAY PROGRESS
 # ============================================================
 
 customers = df[
@@ -3842,36 +3857,8 @@ if "route_order" in pending.columns:
         na_position="last",
     )
 
-if not pending.empty:
-    next_row = pending.iloc[0]
-    destination = get_destination(next_row)
-    route_navigation_ready = bool(
-        pending["route_order"].notna().all()
-        and pd.to_numeric(pending["route_order"], errors="coerce").notna().all()
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🧭 Route Navigation")
-
-    st.sidebar.link_button(
-        "🚗 Navigate to Next Stop",
-        maps_url(destination),
-        use_container_width=True,
-        disabled=not route_navigation_ready,
-    )
-
-    st.sidebar.caption(
-        f"Next: {destination}"
-    )
-
-    st.sidebar.caption(
-        f"{len(pending)} stops remaining"
-    )
-else:
-    st.sidebar.markdown("---")
-    st.sidebar.success(
-        "🎉 All customer stops completed!"
-    )
+# V27.6: navigation lives on each customer card. The duplicate sidebar
+# navigation/next-stop block was intentionally removed.
 
 
 # ============================================================
@@ -3948,7 +3935,10 @@ else:
         }
 
         for column in row.index:
-            if str(column).lower() in ignored:
+            column_key = str(column).lower()
+            if column_key in ignored:
+                continue
+            if driver_mode and column_key in {"address", "dates", "date"}:
                 continue
 
             value = clean_val(row.get(column))
@@ -4105,7 +4095,7 @@ else:
                         save_route_snapshot(service_date_str, df, current_route_data)
                     st.rerun()
 
-            if payment == "Not Paid" and phone:
+            if payment in {"Bank Transfer", "Not Paid"} and phone:
                 st.link_button(
                     "💬 WhatsApp — Service Done + Bank Details",
                     whatsapp_url(phone, price),
@@ -4113,16 +4103,27 @@ else:
                 )
 
             current_notes = clean_val(row.get("Notes"))
-            notes_value = st.text_area(
-                "📝 Job notes",
-                value=current_notes,
-                key=f"notes_{row['job_id']}",
-                placeholder="e.g. Full house, front + back, gate code, access details…",
-                height=70,
-            )
-            if notes_value.strip() != current_notes.strip():
+            edit_key = f"edit_notes_{row['job_id']}"
+            if not st.session_state.get(edit_key, False):
+                st.markdown("**📝 Job notes 🔒**")
+                st.caption(current_notes if current_notes else "No notes for this job.")
                 if st.button(
-                    "💾 Save Notes",
+                    "✏️ Edit Notes",
+                    key=f"open_notes_{row['job_id']}",
+                    use_container_width=True,
+                ):
+                    st.session_state[edit_key] = True
+                    st.rerun()
+            else:
+                notes_value = st.text_area(
+                    "📝 Edit job notes",
+                    value=current_notes,
+                    key=f"notes_{row['job_id']}",
+                    placeholder="e.g. Full house, front + back, gate code, access details…",
+                    height=70,
+                )
+                if st.button(
+                    "💾 Save / Lock Notes 🔒",
                     key=f"save_notes_{row['job_id']}",
                     use_container_width=True,
                 ):
@@ -4133,6 +4134,7 @@ else:
                     current_route_data = st.session_state.get("route_data")
                     if current_route_data and current_route_data.get("saved_route"):
                         save_route_snapshot(service_date_str, df, current_route_data)
+                    st.session_state[edit_key] = False
                     st.rerun()
 
 with st.container(border=True):
