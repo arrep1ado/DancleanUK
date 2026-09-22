@@ -1,6 +1,7 @@
 import io
 import base64
 import json
+import hashlib
 import math
 import re
 import sqlite3
@@ -22,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.1"
+APP_VERSION = "27.8.2-DIAGNOSTIC"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1477,6 +1478,60 @@ def location_cache_key(locations):
     )
 
 
+
+
+
+def _diagnostic_sha256(value):
+    """Stable SHA-256 for diagnostic comparison only; never affects routing."""
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _diagnostic_matrix_payload(matrix):
+    """Convert ORS matrix values to plain floats without changing them."""
+    return [[float(value) for value in row] for row in matrix]
+
+
+def build_route_input_diagnostic(routing_df, locations, distances, durations):
+    """Capture the exact inputs presented to the protected optimiser."""
+    jobs = []
+    for node_idx in range(len(routing_df)):
+        row = routing_df.iloc[node_idx]
+        lon, lat = locations[node_idx]
+        jobs.append({
+            "node": int(node_idx),
+            "job_id": clean_val(row.get("job_id", "")),
+            "address": clean_val(row.get("Address", row.get("address_text", ""))),
+            "postcode": clean_val(row.get("Postcode", "")),
+            "latitude": float(lat),
+            "longitude": float(lon),
+        })
+
+    coord_payload = [[float(point[0]), float(point[1])] for point in locations]
+    distance_payload = _diagnostic_matrix_payload(distances)
+    duration_payload = _diagnostic_matrix_payload(durations)
+
+    coordinate_fingerprint = _diagnostic_sha256(coord_payload)
+    distance_fingerprint = _diagnostic_sha256(distance_payload)
+    duration_fingerprint = _diagnostic_sha256(duration_payload)
+
+    input_payload = {
+        "jobs": jobs,
+        "locations_lon_lat": coord_payload,
+        "distance_matrix_sha256": distance_fingerprint,
+        "duration_matrix_sha256": duration_fingerprint,
+    }
+
+    return {
+        "app_version": APP_VERSION,
+        "captured_at": datetime.now().astimezone().isoformat(),
+        "jobs": jobs,
+        "locations_lon_lat": coord_payload,
+        "coordinate_sha256": coordinate_fingerprint,
+        "distance_matrix_sha256": distance_fingerprint,
+        "duration_matrix_sha256": duration_fingerprint,
+        "optimizer_input_sha256": _diagnostic_sha256(input_payload),
+    }
 
 
 def get_ors_matrix(locations):
@@ -3424,6 +3479,11 @@ if (
 
     using_offline = False
 
+    # V27.8.2 DIAGNOSTIC ONLY. This snapshot is never read by the optimiser.
+    route_input_diagnostic = build_route_input_diagnostic(
+        routing_df, locations, distances, durations
+    )
+
     # Authoritative duplicate groups are based on the exact coordinates used
     # by this route matrix.
     duplicate_groups = build_duplicate_groups(locations)
@@ -3619,6 +3679,39 @@ if (
         FUEL_PRICE,
         MPG,
     )
+
+    # V27.8.2 DIAGNOSTIC ONLY. Captured after route selection.
+    route_input_diagnostic["final_route_nodes"] = [int(x) for x in route]
+    route_input_diagnostic["final_route_sha256"] = _diagnostic_sha256([int(x) for x in route])
+    route_input_diagnostic["result_miles"] = float(metrics["miles"])
+    route_input_diagnostic["result_time_seconds"] = float(metrics["time_s"])
+    route_input_diagnostic["diagnostic_run_id"] = (
+        route_input_diagnostic["optimizer_input_sha256"][:12]
+        + "-"
+        + route_input_diagnostic["final_route_sha256"][:12]
+    )
+    st.session_state.route_input_diagnostic = route_input_diagnostic
+
+    with st.expander("🧪 V27.8.2 Route Input Diagnostic", expanded=True):
+        st.caption(
+            "Diagnostic only — this does not change geocoding, ORS data, "
+            "candidate generation, scoring, or the V26.13 optimiser."
+        )
+        st.code(
+            "RUN ID: " + route_input_diagnostic["diagnostic_run_id"] + "\n"
+            "INPUT: " + route_input_diagnostic["optimizer_input_sha256"] + "\n"
+            "COORDS: " + route_input_diagnostic["coordinate_sha256"] + "\n"
+            "DISTANCE MATRIX: " + route_input_diagnostic["distance_matrix_sha256"] + "\n"
+            "DURATION MATRIX: " + route_input_diagnostic["duration_matrix_sha256"] + "\n"
+            "FINAL ROUTE: " + route_input_diagnostic["final_route_sha256"]
+        )
+        st.download_button(
+            "⬇️ Download Diagnostic JSON",
+            data=json.dumps(route_input_diagnostic, indent=2, ensure_ascii=False),
+            file_name=f"DanCleanUK_route_diagnostic_{service_date_str}_{route_input_diagnostic['diagnostic_run_id']}.json",
+            mime="application/json",
+            key="download_route_diagnostic_json",
+        )
 
     # V26.2 final-leg audit. This makes any remaining bad leg visible instead
     # of hiding it inside the day's total.
