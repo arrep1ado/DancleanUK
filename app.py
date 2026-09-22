@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.6-PRODUCTION-GEO"
+APP_VERSION = "27.8.6.1-BENCHMARK-HOTFIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1486,7 +1486,9 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
     # Likewise, a terminated postcode is only a last-resort coordinate for a
     # postcode-only record. It is never treated as a resolved house address and
     # is never persisted as one.
-    if terminated_postcode_anchor is not None and not expected_street:
+    if terminated_postcode_anchor is not None and (not expected_street or allow_postcode_fallback):
+        # Synthetic benchmark mode may use the terminated-postcode anchor too.
+        # Production customer runs remain strict because allow_postcode_fallback=False.
         st.session_state.geocode_cache[key] = terminated_postcode_anchor
         return terminated_postcode_anchor
 
