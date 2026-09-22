@@ -22,7 +22,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.7.2"
+APP_VERSION = "27.8"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -275,6 +275,13 @@ def save_route_snapshot(service_date, df, route_data):
     if df is None or df.empty or not route_data:
         return False
 
+    # V27.8 lock protection: a newly optimised route must never silently
+    # replace an existing permanent route. Updates are allowed only when the
+    # exact saved route has first been loaded (progress/payment/notes sync).
+    existing_snapshot = load_route_snapshot(service_date)
+    if existing_snapshot is not None and not route_data.get("saved_route", False):
+        return False
+
     routed = df[
         df["route_order"].notna()
         & (df["Status"].astype(str).str.lower() != "depot")
@@ -301,7 +308,6 @@ def save_route_snapshot(service_date, df, route_data):
         "saved_at": now_text(),
         "app_version": APP_VERSION,
     }
-    existing_snapshot = load_route_snapshot(service_date)
     if existing_snapshot:
         existing_data = existing_snapshot.get("route_data") or {}
         for key in ("report_b64", "report_filename", "report_saved_at"):
@@ -566,6 +572,9 @@ if service_date_str != st.session_state.service_date:
     st.session_state.service_date = service_date_str
     st.session_state.pop("master_df", None)
     st.session_state.pop("route_data", None)
+    st.session_state.pop("failed_jobs", None)
+    # Leaving a reset/new-day screen for another date starts a clean session.
+    st.session_state.pop("start_new_day_mode", None)
     st.rerun()
 
 DEPOT_POSTCODE = st.sidebar.text_input(
@@ -2740,7 +2749,11 @@ existing_day = load_day(service_date_str)
 # V27.6 reconnect recovery: if Streamlit/Chrome restarted and the permanent
 # route exists, rebuild the working day from Supabase automatically. This
 # never optimises or changes the saved stop order.
-if "master_df" not in st.session_state and existing_day.empty:
+if (
+    "master_df" not in st.session_state
+    and existing_day.empty
+    and not st.session_state.get("start_new_day_mode", False)
+):
     reconnect_snapshot = load_route_snapshot(service_date_str)
     if reconnect_snapshot is not None:
         ok, _ = apply_saved_route_snapshot(service_date_str)
@@ -2756,7 +2769,11 @@ if (
     # If the laptop has explicitly saved a finished route, restore its exact
     # summary and stop order instead of creating a zero-mile placeholder.
     saved_snapshot = load_route_snapshot(service_date_str)
-    if saved_snapshot is not None and "route_data" not in st.session_state:
+    if (
+        saved_snapshot is not None
+        and "route_data" not in st.session_state
+        and not st.session_state.get("start_new_day_mode", False)
+    ):
         apply_saved_route_snapshot(service_date_str)
         existing_day = st.session_state.master_df.copy()
 
@@ -2799,17 +2816,28 @@ if st.sidebar.button(
     "🔄 Start New Day / Reset",
     use_container_width=True,
 ):
-    # V27.7.1 safety fix: starting a new working session must NEVER delete
-    # either the local day record or the permanent Supabase route snapshot.
-    # It only clears the active in-memory route so a different date/day can
-    # be selected. Returning to this date will offer/load its saved route.
+    # V27.8: this is a SESSION reset only. Never delete or overwrite either
+    # the local customer records or a permanent Supabase route snapshot.
+    # Keep the selected day's customer rows available so the laptop does not
+    # appear empty after reset, but clear active route/temporary state.
+    current_day = load_day(service_date_str)
     for key in [
         "master_df",
         "route_data",
         "failed_jobs",
+        "uploaded_filename",
     ]:
         st.session_state.pop(key, None)
+    if current_day is not None and not current_day.empty:
+        st.session_state.master_df = current_day.copy()
+    st.session_state.start_new_day_mode = True
     st.rerun()
+
+if st.session_state.get("start_new_day_mode", False):
+    st.sidebar.info(
+        "New-day session ready. Saved routes are still protected. "
+        "Choose another route date or upload the next day's file."
+    )
 
 
 # ============================================================
@@ -2820,8 +2848,8 @@ saved_snapshot = load_route_snapshot(service_date_str)
 
 if saved_snapshot is not None:
     st.success(
-        "📱 A saved route is available for this date. "
-        "On your phone/tablet, load it instead of optimising again."
+        "🔒 A permanent saved route exists for this date. "
+        "Load it exactly as stored — it cannot be overwritten by a new optimisation."
     )
     if st.button(
         "📱 LOAD SAVED ROUTE — NO OPTIMISATION",
@@ -3084,13 +3112,33 @@ if "master_df" not in st.session_state:
 
 df = st.session_state.master_df
 
+# V27.8: after Start New Day, keep the full customer list visible even when
+# there is no active planned route. This is a display/workflow aid only and
+# never changes routing inputs or the optimiser.
+if not driver_mode and not df.empty and not df["route_order"].notna().any():
+    st.markdown("### 📋 Jobs Ready for Planning")
+    ready_cols = [c for c in ["Address", "address_text", "Postcode", "Price", "Phone", "Notes"] if c in df.columns]
+    ready_view = df[ready_cols].copy()
+    if "Address" not in ready_view.columns and "address_text" in ready_view.columns:
+        ready_view = ready_view.rename(columns={"address_text": "Address"})
+    elif "Address" in ready_view.columns and "address_text" in ready_view.columns:
+        ready_view = ready_view.drop(columns=["address_text"], errors="ignore")
+    st.dataframe(ready_view, use_container_width=True, hide_index=True)
+
 
 # ============================================================
 # PLAN ROUTE
 # ============================================================
 
+if saved_snapshot is not None and not driver_mode:
+    st.info(
+        "🔒 This date already has a locked route. Load the saved route above; "
+        "re-optimisation is disabled to protect its exact stop order."
+    )
+
 if (
     not driver_mode
+    and saved_snapshot is None
     and st.button(
         "🚀 PLAN / RE-PLAN BEST DAILY ROUTE",
         type="primary",
