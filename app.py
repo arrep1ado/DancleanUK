@@ -22,7 +22,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.7"
+APP_VERSION = "27.7.1"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2717,13 +2717,15 @@ def get_destination(row):
 def whatsapp_url(phone, price):
     # Bank details stay out of the visible app and source code. They come only
     # from private Streamlit Secrets and are inserted into the WhatsApp text.
+    account_name = clean_val(st.secrets.get("PAYMENT_ACCOUNT_NAME", ""))
     bank_name = clean_val(st.secrets.get("PAYMENT_BANK_NAME", ""))
     sort_code = clean_val(st.secrets.get("PAYMENT_SORT_CODE", ""))
     account_number = clean_val(st.secrets.get("PAYMENT_ACCOUNT_NUMBER", ""))
     payment_text = "Please use the bank details on your DanCleanUK payment flyer."
-    if bank_name and sort_code and account_number:
-        payment_text = (f"Please pay by bank transfer to {bank_name} - "
-                        f"Sort Code: {sort_code} Account: {account_number}.")
+    if account_name and bank_name and sort_code and account_number:
+        payment_text = (f"Please pay by bank transfer to {account_name} - "
+                        f"Bank: {bank_name}, Sort Code: {sort_code}, "
+                        f"Account Number: {account_number}.")
     message = (f"Hi from {BUSINESS_NAME}! Your service is complete today. "
                f"Total: £{price:.2f}. {payment_text} Thank you!")
     return "https://wa.me/" + quote(normalise_phone(phone)) + "?text=" + quote(message)
@@ -2797,8 +2799,10 @@ if st.sidebar.button(
     "🔄 Start New Day / Reset",
     use_container_width=True,
 ):
-    delete_day(service_date_str)
-    delete_route_snapshot(service_date_str)
+    # V27.7.1 safety fix: starting a new working session must NEVER delete
+    # either the local day record or the permanent Supabase route snapshot.
+    # It only clears the active in-memory route so a different date/day can
+    # be selected. Returning to this date will offer/load its saved route.
     for key in [
         "master_df",
         "route_data",
