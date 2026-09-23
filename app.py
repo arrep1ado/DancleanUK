@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.7-UK-STREET-GEO"
+APP_VERSION = "27.8.7.1-STREET-CLUSTER-HOTFIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1526,7 +1526,16 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
     # NAMED STREET inside a tight box around the official postcode coordinate.
     # This is explicitly street-level: it is not persisted as a house pin and
     # the UI warns when it is used.
-    if expected_house and expected_street and postcode_anchor is not None and not allow_postcode_fallback:
+    # Keep the depot distinct from nearby customer street clusters. The depot
+    # is the fixed start/finish and may use its verified postcode anchor if its
+    # individual building point is unavailable. Customer houses on the same
+    # street may legitimately share one verified street-level routing point;
+    # we do NOT invent house-number offsets.
+    is_depot = (
+        normalise_postcode(postcode) == normalise_postcode(DEPOT_POSTCODE)
+        and str(query).strip().casefold() == str(DEPOT_FULL_ADDRESS).strip().casefold()
+    )
+    if expected_house and expected_street and postcode_anchor is not None and not allow_postcode_fallback and not is_depot:
         nearby_street = nominatim_nearby_street_geocode(
             expected_street, postcode_anchor, headers
         )
@@ -1552,10 +1561,6 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
     # geocoders cannot resolve it, allow the verified live postcode point as
     # the routing start/finish fallback so STRICT GEO cannot block the whole
     # day before customer validation begins. Customer jobs remain strict.
-    is_depot = (
-        normalise_postcode(postcode) == normalise_postcode(DEPOT_POSTCODE)
-        and str(query).strip().casefold() == str(DEPOT_FULL_ADDRESS).strip().casefold()
-    )
     if expected_house and expected_street and not is_depot and not allow_postcode_fallback:
         st.session_state.geocode_cache.pop(key, None)
         return None
