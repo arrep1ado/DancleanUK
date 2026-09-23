@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.1-MESSAGE-CONFIRM-LOCK"
+APP_VERSION = "27.8.8.2-PAYMENT-REFERENCE"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2944,7 +2944,7 @@ def get_destination(row):
     return postcode
 
 
-def payment_message(price):
+def payment_message(price, reference=""):
     # Bank details stay out of the visible app and source code. They come only
     # from private Streamlit Secrets and are inserted into the outgoing message.
     account_name = clean_val(st.secrets.get("PAYMENT_ACCOUNT_NAME", ""))
@@ -2969,20 +2969,23 @@ def payment_message(price):
             f"Sort code: {sort_code}",
             f"Account number: {account_number}",
         ])
+        reference = clean_val(reference)
+        if reference:
+            lines.append(f"Reference: {reference}")
     else:
         lines.extend(["", "Please use the bank details on your DanCleanUK payment flyer."])
     return "\n".join(lines)
 
 
-def whatsapp_url(phone, price):
-    return "https://wa.me/" + quote(normalise_phone(phone)) + "?text=" + quote(payment_message(price))
+def whatsapp_url(phone, price, reference=""):
+    return "https://wa.me/" + quote(normalise_phone(phone)) + "?text=" + quote(payment_message(price, reference))
 
 
-def sms_url(phone, price):
+def sms_url(phone, price, reference=""):
     number = normalise_phone(phone)
     if number and not number.startswith("+"):
         number = "+" + number
-    return "sms:" + quote(number, safe="+") + "?body=" + quote(payment_message(price))
+    return "sms:" + quote(number, safe="+") + "?body=" + quote(payment_message(price, reference))
 
 
 def mark_payment_message_opened(job_id, method):
@@ -4539,7 +4542,7 @@ else:
                         else:
                             st.link_button(
                                 "💬 WhatsApp",
-                                whatsapp_url(phone, price),
+                                whatsapp_url(phone, price, street_address),
                                 key=f"whatsapp_open_{row['job_id']}",
                                 on_click=mark_payment_message_opened,
                                 args=(row["job_id"], "WhatsApp"),
@@ -4551,7 +4554,7 @@ else:
                         else:
                             st.link_button(
                                 "📱 Text Message",
-                                sms_url(phone, price),
+                                sms_url(phone, price, street_address),
                                 key=f"sms_open_{row['job_id']}",
                                 on_click=mark_payment_message_opened,
                                 args=(row["job_id"], "Text Message"),
