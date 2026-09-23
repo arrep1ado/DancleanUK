@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8-MESSAGING-WORKFLOW"
+APP_VERSION = "27.8.8.1-MESSAGE-CONFIRM-LOCK"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -488,6 +488,7 @@ def apply_saved_route_snapshot(service_date):
         "Status": "pending", "Payment": "Waiting", "PaymentTime": "",
         "CompletedTime": "", "address_text": "", "geo_query": "", "Notes": "",
         "WhatsAppSent": False, "WhatsAppTime": "",
+        "MessageOpened": False, "MessageConfirmed": False, "MessageConfirmedTime": "",
     }.items():
         if column not in day_df.columns:
             day_df[column] = default
@@ -2985,6 +2986,7 @@ def sms_url(phone, price):
 
 
 def mark_payment_message_opened(job_id, method):
+    """Record which messaging app was opened, but do NOT unlock Complete yet."""
     df = st.session_state.get("master_df")
     if df is None or df.empty or "job_id" not in df.columns:
         return
@@ -2992,11 +2994,35 @@ def mark_payment_message_opened(job_id, method):
     if len(matches) == 0:
         return
     master_idx = matches[0]
-    df.at[master_idx, "WhatsAppSent"] = True  # Backwards-compatible payment-message flag.
-    df.at[master_idx, "WhatsAppTime"] = now_text()
+    df.at[master_idx, "WhatsAppSent"] = False  # True only after explicit Message sent confirmation.
+    df.at[master_idx, "WhatsAppTime"] = ""
     df.at[master_idx, "MessageMethod"] = method
     df.at[master_idx, "MessageTime"] = now_text()
+    df.at[master_idx, "MessageOpened"] = True
     st.session_state.master_df = df
+    current_route_data = st.session_state.get("route_data")
+    if current_route_data and current_route_data.get("saved_route"):
+        save_route_snapshot(service_date_str, df, current_route_data)
+
+
+def confirm_payment_message_sent(job_id):
+    """Explicit confirmation: unlock Complete and permanently lock both message buttons."""
+    df = st.session_state.get("master_df")
+    if df is None or df.empty or "job_id" not in df.columns:
+        return
+    matches = df.index[df["job_id"].astype(str) == str(job_id)]
+    if len(matches) == 0:
+        return
+    master_idx = matches[0]
+    if not bool(df.at[master_idx, "MessageOpened"] if "MessageOpened" in df.columns else False):
+        return
+    confirmed_at = now_text()
+    df.at[master_idx, "WhatsAppSent"] = True  # Backwards-compatible confirmed-message flag.
+    df.at[master_idx, "WhatsAppTime"] = confirmed_at
+    df.at[master_idx, "MessageConfirmed"] = True
+    df.at[master_idx, "MessageConfirmedTime"] = confirmed_at
+    st.session_state.master_df = df
+    save_job(df.loc[master_idx])
     current_route_data = st.session_state.get("route_data")
     if current_route_data and current_route_data.get("saved_route"):
         save_route_snapshot(service_date_str, df, current_route_data)
@@ -4357,9 +4383,9 @@ else:
 
             with col1:
                 if status != "completed":
-                    message_opened = bool(row.get("WhatsAppSent", False))
+                    message_confirmed = bool(row.get("MessageConfirmed", False))
                     payment_selected = payment in {"Cash", "Bank Transfer", "Not Paid"}
-                    completion_ready = payment == "Cash" or (payment in {"Bank Transfer", "Not Paid"} and message_opened)
+                    completion_ready = payment == "Cash" or (payment in {"Bank Transfer", "Not Paid"} and message_confirmed)
                     if st.button(
                         "✅ Complete",
                         key=f"complete_{row['job_id']}",
@@ -4367,7 +4393,7 @@ else:
                         disabled=not completion_ready,
                         help=(None if completion_ready else (
                             "Choose Cash, Bank or Unpaid first." if not payment_selected
-                            else "Open WhatsApp or Text Message first."
+                            else "Send the payment message and confirm Message sent first."
                         )),
                     ):
                         master_idx = df.index[
@@ -4456,6 +4482,9 @@ else:
                     df.at[master_idx, "WhatsAppTime"] = ""
                     df.at[master_idx, "MessageMethod"] = ""
                     df.at[master_idx, "MessageTime"] = ""
+                    df.at[master_idx, "MessageOpened"] = False
+                    df.at[master_idx, "MessageConfirmed"] = False
+                    df.at[master_idx, "MessageConfirmedTime"] = ""
 
                     save_job(df.loc[master_idx])
                     st.session_state.master_df = df
@@ -4488,6 +4517,9 @@ else:
                     df.at[master_idx, "WhatsAppTime"] = ""
                     df.at[master_idx, "MessageMethod"] = ""
                     df.at[master_idx, "MessageTime"] = ""
+                    df.at[master_idx, "MessageOpened"] = False
+                    df.at[master_idx, "MessageConfirmed"] = False
+                    df.at[master_idx, "MessageConfirmedTime"] = ""
 
                     save_job(df.loc[master_idx])
                     st.session_state.master_df = df
@@ -4497,32 +4529,50 @@ else:
                     st.rerun()
 
             if payment in {"Bank Transfer", "Not Paid"}:
-                message_opened = bool(row.get("WhatsAppSent", False))
+                message_confirmed = bool(row.get("MessageConfirmed", False))
+                message_opened = bool(row.get("MessageOpened", False)) or bool(clean_val(row.get("MessageMethod")))
                 if phone:
                     msg1, msg2 = st.columns(2)
                     with msg1:
-                        st.link_button(
-                            "💬 WhatsApp",
-                            whatsapp_url(phone, price),
-                            key=f"whatsapp_open_{row['job_id']}",
-                            on_click=mark_payment_message_opened,
-                            args=(row["job_id"], "WhatsApp"),
-                            use_container_width=True,
-                        )
+                        if message_confirmed:
+                            st.button("💬 WhatsApp 🔒", key=f"whatsapp_locked_{row['job_id']}", use_container_width=True, disabled=True)
+                        else:
+                            st.link_button(
+                                "💬 WhatsApp",
+                                whatsapp_url(phone, price),
+                                key=f"whatsapp_open_{row['job_id']}",
+                                on_click=mark_payment_message_opened,
+                                args=(row["job_id"], "WhatsApp"),
+                                use_container_width=True,
+                            )
                     with msg2:
-                        st.link_button(
-                            "📱 Text Message",
-                            sms_url(phone, price),
-                            key=f"sms_open_{row['job_id']}",
-                            on_click=mark_payment_message_opened,
-                            args=(row["job_id"], "Text Message"),
-                            use_container_width=True,
-                        )
-                    if message_opened:
+                        if message_confirmed:
+                            st.button("📱 Text Message 🔒", key=f"sms_locked_{row['job_id']}", use_container_width=True, disabled=True)
+                        else:
+                            st.link_button(
+                                "📱 Text Message",
+                                sms_url(phone, price),
+                                key=f"sms_open_{row['job_id']}",
+                                on_click=mark_payment_message_opened,
+                                args=(row["job_id"], "Text Message"),
+                                use_container_width=True,
+                            )
+
+                    if message_confirmed:
                         method = clean_val(row.get("MessageMethod")) or "Payment message"
-                        st.success(f"{method} opened — Complete is unlocked.")
+                        st.success(f"✅ {method} confirmed sent — message buttons locked. Complete is unlocked.")
+                    elif message_opened:
+                        method = clean_val(row.get("MessageMethod")) or "Payment message"
+                        st.info(f"{method} opened. After you press Send, come back here and confirm below.")
+                        if st.button(
+                            "☑️ Message sent",
+                            key=f"confirm_message_sent_{row['job_id']}",
+                            use_container_width=True,
+                        ):
+                            confirm_payment_message_sent(row["job_id"])
+                            st.rerun()
                     else:
-                        st.caption("Open WhatsApp or Text Message to unlock Complete. You still press Send in the messaging app.")
+                        st.caption("Open WhatsApp or Text Message, press Send there, then return here and confirm Message sent.")
                 else:
                     st.warning("No phone number is stored for this customer, so a payment message cannot be prepared.")
 
