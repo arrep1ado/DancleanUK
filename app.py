@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.6.1-BENCHMARK-HOTFIX"
+APP_VERSION = "27.8.7-UK-STREET-GEO"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1275,6 +1275,70 @@ def reverse_postcode_outcode(lat, lon):
         return ""
 
 
+
+def nominatim_nearby_street_geocode(street, postcode_anchor, headers):
+    """Resolve a real street near the supplied UK postcode anchor.
+
+    This is a transparent STREET-level fallback for genuine addresses when
+    public map data has no house-number point. It never pretends the postcode
+    centroid is the property and never invents an offset for a house number.
+    """
+    street = clean_val(street).strip()
+    if not street or postcode_anchor is None:
+        return None
+
+    try:
+        anchor_lat, anchor_lon = float(postcode_anchor[0]), float(postcode_anchor[1])
+    except Exception:
+        return None
+
+    # Roughly a 2 km box around the official postcode point. This prevents a
+    # same-named road elsewhere in Britain from being accepted.
+    lat_pad = 0.018
+    lon_pad = 0.030
+    viewbox = f"{anchor_lon-lon_pad},{anchor_lat+lat_pad},{anchor_lon+lon_pad},{anchor_lat-lat_pad}"
+
+    try:
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={
+                "q": street,
+                "format": "jsonv2",
+                "addressdetails": 1,
+                "limit": 20,
+                "countrycodes": "gb",
+                "viewbox": viewbox,
+                "bounded": 1,
+            },
+            headers=headers,
+            timeout=20,
+        )
+        if response.status_code != 200:
+            return None
+
+        wanted = re.sub(r"[^a-z0-9]+", " ", street.lower()).strip()
+        for item in response.json() or []:
+            address = item.get("address") or {}
+            returned = clean_val(
+                address.get("road")
+                or address.get("pedestrian")
+                or address.get("residential")
+                or item.get("display_name")
+            ).lower()
+            returned_norm = re.sub(r"[^a-z0-9]+", " ", returned).strip()
+            if wanted not in returned_norm:
+                continue
+            try:
+                lat, lon = float(item["lat"]), float(item["lon"])
+            except Exception:
+                continue
+            if haversine_km(anchor_lat, anchor_lon, lat, lon) <= 2.5:
+                return (lat, lon)
+    except Exception:
+        return None
+
+    return None
+
 def get_coords(query_string, postcode, allow_postcode_fallback=False):
     """Locate a customer safely before any ORS road calculation.
 
@@ -1455,6 +1519,27 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
                 save_persistent_geocode(query, postcode, street_coords, "nominatim_street")
                 return street_coords
             time.sleep(0.35)
+
+    # V27.8.7 UK STREET GEO:
+    # Many valid UK residential addresses are absent as individual house points
+    # from free public geocoders. Before rejecting a genuine house, resolve the
+    # NAMED STREET inside a tight box around the official postcode coordinate.
+    # This is explicitly street-level: it is not persisted as a house pin and
+    # the UI warns when it is used.
+    if expected_house and expected_street and postcode_anchor is not None and not allow_postcode_fallback:
+        nearby_street = nominatim_nearby_street_geocode(
+            expected_street, postcode_anchor, headers
+        )
+        nearby_street = safe_exact(nearby_street)
+        if nearby_street is not None:
+            st.session_state.geocode_cache[key] = nearby_street
+            approx = st.session_state.setdefault("approximate_geocodes", {})
+            approx[key] = {
+                "query": query,
+                "postcode": postcode,
+                "level": "street",
+            }
+            return nearby_street
 
     # V27.8.5 STRICT GEO:
     # If the imported record contains a house number + street, NEVER silently
@@ -3308,6 +3393,9 @@ if (
         st.error("No valid customer jobs found.")
         st.stop()
 
+    # Per-run transparency: track any customer resolved only to street level.
+    st.session_state.approximate_geocodes = {}
+
     with st.spinner("📍 Locating your depot..."):
         depot_coords = get_coords(
             DEPOT_FULL_ADDRESS,
@@ -3381,6 +3469,15 @@ if (
             time.sleep(1)
 
     progress.empty()
+
+    approximate_geocodes = st.session_state.get("approximate_geocodes", {})
+    if approximate_geocodes:
+        st.warning(
+            f"{len(approximate_geocodes)} customer address(es) were verified to the correct "
+            "street/postcode area, but the public map data did not provide an individual "
+            "house-number point. Road routing will use the verified street location; no "
+            "postcode-centre coordinate or invented house offset was used."
+        )
 
     if failed_rows:
         # Failed geocodes must never retain an old route position.
