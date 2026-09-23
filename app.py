@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.7.1-STREET-CLUSTER-HOTFIX"
+APP_VERSION = "27.8.8-MESSAGING-WORKFLOW"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2943,21 +2943,63 @@ def get_destination(row):
     return postcode
 
 
-def whatsapp_url(phone, price):
+def payment_message(price):
     # Bank details stay out of the visible app and source code. They come only
-    # from private Streamlit Secrets and are inserted into the WhatsApp text.
+    # from private Streamlit Secrets and are inserted into the outgoing message.
     account_name = clean_val(st.secrets.get("PAYMENT_ACCOUNT_NAME", ""))
     bank_name = clean_val(st.secrets.get("PAYMENT_BANK_NAME", ""))
     sort_code = clean_val(st.secrets.get("PAYMENT_SORT_CODE", ""))
     account_number = clean_val(st.secrets.get("PAYMENT_ACCOUNT_NUMBER", ""))
-    payment_text = "Please use the bank details on your DanCleanUK payment flyer."
+
+    lines = [
+        f"Hi from {BUSINESS_NAME}!",
+        "",
+        "Your service is complete today.",
+        f"Amount due: £{price:.2f}",
+        "",
+        "Thank you!",
+    ]
     if account_name and bank_name and sort_code and account_number:
-        payment_text = (f"Please pay by bank transfer to {account_name} - "
-                        f"Bank: {bank_name}, Sort Code: {sort_code}, "
-                        f"Account Number: {account_number}.")
-    message = (f"Hi from {BUSINESS_NAME}! Your service is complete today. "
-               f"Total: £{price:.2f}. {payment_text} Thank you!")
-    return "https://wa.me/" + quote(normalise_phone(phone)) + "?text=" + quote(message)
+        lines.extend([
+            "",
+            "Bank transfer details",
+            f"Account name: {account_name}",
+            f"Bank: {bank_name}",
+            f"Sort code: {sort_code}",
+            f"Account number: {account_number}",
+        ])
+    else:
+        lines.extend(["", "Please use the bank details on your DanCleanUK payment flyer."])
+    return "\n".join(lines)
+
+
+def whatsapp_url(phone, price):
+    return "https://wa.me/" + quote(normalise_phone(phone)) + "?text=" + quote(payment_message(price))
+
+
+def sms_url(phone, price):
+    number = normalise_phone(phone)
+    if number and not number.startswith("+"):
+        number = "+" + number
+    return "sms:" + quote(number, safe="+") + "?body=" + quote(payment_message(price))
+
+
+def mark_payment_message_opened(job_id, method):
+    df = st.session_state.get("master_df")
+    if df is None or df.empty or "job_id" not in df.columns:
+        return
+    matches = df.index[df["job_id"].astype(str) == str(job_id)]
+    if len(matches) == 0:
+        return
+    master_idx = matches[0]
+    df.at[master_idx, "WhatsAppSent"] = True  # Backwards-compatible payment-message flag.
+    df.at[master_idx, "WhatsAppTime"] = now_text()
+    df.at[master_idx, "MessageMethod"] = method
+    df.at[master_idx, "MessageTime"] = now_text()
+    st.session_state.master_df = df
+    current_route_data = st.session_state.get("route_data")
+    if current_route_data and current_route_data.get("saved_route"):
+        save_route_snapshot(service_date_str, df, current_route_data)
 
 
 # ============================================================
@@ -4315,13 +4357,18 @@ else:
 
             with col1:
                 if status != "completed":
+                    message_opened = bool(row.get("WhatsAppSent", False))
                     payment_selected = payment in {"Cash", "Bank Transfer", "Not Paid"}
+                    completion_ready = payment == "Cash" or (payment in {"Bank Transfer", "Not Paid"} and message_opened)
                     if st.button(
                         "✅ Complete",
                         key=f"complete_{row['job_id']}",
                         use_container_width=True,
-                        disabled=not payment_selected,
-                        help=None if payment_selected else "Choose Cash, Bank or Unpaid first.",
+                        disabled=not completion_ready,
+                        help=(None if completion_ready else (
+                            "Choose Cash, Bank or Unpaid first." if not payment_selected
+                            else "Open WhatsApp or Text Message first."
+                        )),
                     ):
                         master_idx = df.index[
                             df["job_id"].astype(str)
@@ -4407,6 +4454,8 @@ else:
                     ] = now_text()
                     df.at[master_idx, "WhatsAppSent"] = False
                     df.at[master_idx, "WhatsAppTime"] = ""
+                    df.at[master_idx, "MessageMethod"] = ""
+                    df.at[master_idx, "MessageTime"] = ""
 
                     save_job(df.loc[master_idx])
                     st.session_state.master_df = df
@@ -4437,6 +4486,8 @@ else:
                     ] = now_text()
                     df.at[master_idx, "WhatsAppSent"] = False
                     df.at[master_idx, "WhatsAppTime"] = ""
+                    df.at[master_idx, "MessageMethod"] = ""
+                    df.at[master_idx, "MessageTime"] = ""
 
                     save_job(df.loc[master_idx])
                     st.session_state.master_df = df
@@ -4446,23 +4497,34 @@ else:
                     st.rerun()
 
             if payment in {"Bank Transfer", "Not Paid"}:
-                whatsapp_sent = bool(row.get("WhatsAppSent", False))
+                message_opened = bool(row.get("WhatsAppSent", False))
                 if phone:
-                    st.link_button("💬 1. Open WhatsApp Message", whatsapp_url(phone, price), use_container_width=True)
-                    if not whatsapp_sent:
-                        if st.button("✅ 2. Confirm WhatsApp Sent", key=f"whatsapp_sent_{row['job_id']}", use_container_width=True):
-                            master_idx = df.index[df["job_id"].astype(str) == str(row["job_id"])][0]
-                            df.at[master_idx, "WhatsAppSent"] = True
-                            df.at[master_idx, "WhatsAppTime"] = now_text()
-                            st.session_state.master_df = df
-                            current_route_data = st.session_state.get("route_data")
-                            if current_route_data and current_route_data.get("saved_route"):
-                                save_route_snapshot(service_date_str, df, current_route_data)
-                            st.rerun()
+                    msg1, msg2 = st.columns(2)
+                    with msg1:
+                        st.link_button(
+                            "💬 WhatsApp",
+                            whatsapp_url(phone, price),
+                            key=f"whatsapp_open_{row['job_id']}",
+                            on_click=mark_payment_message_opened,
+                            args=(row["job_id"], "WhatsApp"),
+                            use_container_width=True,
+                        )
+                    with msg2:
+                        st.link_button(
+                            "📱 Text Message",
+                            sms_url(phone, price),
+                            key=f"sms_open_{row['job_id']}",
+                            on_click=mark_payment_message_opened,
+                            args=(row["job_id"], "Text Message"),
+                            use_container_width=True,
+                        )
+                    if message_opened:
+                        method = clean_val(row.get("MessageMethod")) or "Payment message"
+                        st.success(f"{method} opened — Complete is unlocked.")
                     else:
-                        st.success("💬 WhatsApp confirmed sent — Complete is unlocked.")
+                        st.caption("Open WhatsApp or Text Message to unlock Complete. You still press Send in the messaging app.")
                 else:
-                    st.warning("No phone number is stored for this customer, so WhatsApp cannot be sent.")
+                    st.warning("No phone number is stored for this customer, so a payment message cannot be prepared.")
 
             current_notes = clean_val(row.get("Notes"))
             edit_key = f"edit_notes_{row['job_id']}"
@@ -4663,7 +4725,7 @@ if not export_df.empty:
     if "Status" in report_df.columns:
         report_df = report_df.rename(columns={"Status": "Completion Status"})
 
-    visible_first = ["Address", "Postcode", "Price", "Payment Method", "Completion Status", "Notes", "PaymentTime", "CompletedTime", "Phone", "route_order"]
+    visible_first = ["Address", "Postcode", "Price", "Payment Method", "Completion Status", "Notes", "MessageMethod", "MessageTime", "PaymentTime", "CompletedTime", "Phone", "route_order"]
     first = [c for c in visible_first if c in report_df.columns]
     rest = [c for c in report_df.columns if c not in first and c != "job_id"]
     report_df = report_df[first + rest]
