@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.2-PAYMENT-REFERENCE"
+APP_VERSION = "27.8.9-REPORT-REFRESH"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -677,23 +677,16 @@ TAX_RATE = (
     / 100
 )
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("💬 Customer Messages")
-BUSINESS_NAME = st.sidebar.text_input("Business name", value="DanCleanUK")
+# Business name is fixed for customer payment messages; no daily sidebar control needed.
+BUSINESS_NAME = "DanCleanUK"
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🧠 Route Optimisation")
 
 # V25.49 uses one consistent whole-day economic objective.
 # There are deliberately no separate time/distance/nearby sliders.
 # Those competing filters could override the route search itself.
 DRIVING_TIME_VALUE_PER_HOUR = 6.0
 
-st.sidebar.caption(
-    "The optimiser compares complete routes using actual road fuel cost "
-    "plus a modest value for driving time. It does not impose a driving-time "
-    "limit or force nearby customers to be consecutive."
-)
 
 # ============================================================
 # API KEY
@@ -4117,21 +4110,11 @@ if route_data:
         .sum()
     )
 
-    paid_jobs = int(
-        customer_df["Payment"]
-        .astype(str)
-        .str.lower()
-        .isin(["cash", "bank transfer", "card", "paid"])
-        .sum()
-    )
-
-    unpaid_jobs = int(
-        customer_df["Payment"]
-        .astype(str)
-        .str.lower()
-        .isin(["not paid", "waiting"])
-        .sum()
-    )
+    payment_lower = customer_df["Payment"].astype(str).str.lower()
+    payment_time_present = customer_df["PaymentTime"].fillna("").astype(str).str.strip().ne("")
+    paid_mask = payment_lower.eq("cash") | (payment_lower.eq("bank transfer") & payment_time_present) | payment_lower.isin(["card", "paid"])
+    paid_jobs = int(paid_mask.sum())
+    unpaid_jobs = int((~paid_mask).sum())
 
     if driver_mode:
         st.markdown(
@@ -4348,6 +4331,13 @@ else:
             "geo_query",
             "created_at",
             "notes",
+            "whatsappsent",
+            "whatsapptime",
+            "messagemethod",
+            "messagetime",
+            "messageopened",
+            "messageconfirmed",
+            "messageconfirmedtime",
             "_route_sort",
         }
 
@@ -4477,10 +4467,8 @@ else:
                         "Payment",
                     ] = "Bank Transfer"
 
-                    df.at[
-                        master_idx,
-                        "PaymentTime",
-                    ] = now_text()
+                    # Bank transfer is outstanding until manually marked Paid.
+                    df.at[master_idx, "PaymentTime"] = ""
                     df.at[master_idx, "WhatsAppSent"] = False
                     df.at[master_idx, "WhatsAppTime"] = ""
                     df.at[master_idx, "MessageMethod"] = ""
@@ -4512,10 +4500,8 @@ else:
                         "Payment",
                     ] = "Not Paid"
 
-                    df.at[
-                        master_idx,
-                        "PaymentTime",
-                    ] = now_text()
+                    # Not Paid remains outstanding; no received-payment time.
+                    df.at[master_idx, "PaymentTime"] = ""
                     df.at[master_idx, "WhatsAppSent"] = False
                     df.at[master_idx, "WhatsAppTime"] = ""
                     df.at[master_idx, "MessageMethod"] = ""
@@ -4578,6 +4564,26 @@ else:
                         st.caption("Open WhatsApp or Text Message, press Send there, then return here and confirm Message sent.")
                 else:
                     st.warning("No phone number is stored for this customer, so a payment message cannot be prepared.")
+
+            # A bank transfer is only money received after the user confirms it in Mettle.
+            # Keep the payment method as Bank Transfer and record the actual confirmation time.
+            if payment == "Bank Transfer":
+                payment_received = bool(clean_val(row.get("PaymentTime")))
+                if payment_received:
+                    st.success("💷 Bank transfer received — Paid")
+                elif st.button(
+                    "💷 Mark Bank Transfer as Paid",
+                    key=f"mark_bank_paid_{row['job_id']}",
+                    use_container_width=True,
+                ):
+                    master_idx = df.index[df["job_id"].astype(str) == str(row["job_id"])][0]
+                    df.at[master_idx, "PaymentTime"] = now_text()
+                    save_job(df.loc[master_idx])
+                    st.session_state.master_df = df
+                    current_route_data = st.session_state.get("route_data")
+                    if current_route_data and current_route_data.get("saved_route"):
+                        save_route_snapshot(service_date_str, df, current_route_data)
+                    st.rerun()
 
             current_notes = clean_val(row.get("Notes"))
             edit_key = f"edit_notes_{row['job_id']}"
@@ -4770,18 +4776,59 @@ if not export_df.empty:
     header_fill = PatternFill(start_color="2F4F4F", end_color="2F4F4F", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
 
-    report_df = export_df.copy()
-    if "address_text" in report_df.columns:
-        report_df = report_df.rename(columns={"address_text": "Address"})
-    if "Payment" in report_df.columns:
-        report_df = report_df.rename(columns={"Payment": "Payment Method"})
-    if "Status" in report_df.columns:
-        report_df = report_df.rename(columns={"Status": "Completion Status"})
+    # Build a clean business-facing report rather than exporting internal app fields.
+    report_df = pd.DataFrame(index=export_df.index)
+    route_order = pd.to_numeric(export_df.get("route_order", pd.Series(index=export_df.index, dtype=float)), errors="coerce")
+    # Stored route order may be zero-based; report is always human-friendly 1..N.
+    if route_order.notna().any():
+        min_order = route_order.dropna().min()
+        report_df["Route Order"] = (route_order + (1 if min_order == 0 else 0)).astype("Int64")
+    else:
+        report_df["Route Order"] = range(1, len(export_df) + 1)
 
-    visible_first = ["Address", "Postcode", "Price", "Payment Method", "Completion Status", "Notes", "MessageMethod", "MessageTime", "PaymentTime", "CompletedTime", "Phone", "route_order"]
-    first = [c for c in visible_first if c in report_df.columns]
-    rest = [c for c in report_df.columns if c not in first and c != "job_id"]
-    report_df = report_df[first + rest]
+    report_df["Address"] = export_df.get("Address", export_df.get("address_text", "")).fillna("").astype(str)
+    report_df["Postcode"] = export_df.get("Postcode", "")
+    report_df["Price"] = pd.to_numeric(export_df.get("Price", 0), errors="coerce").fillna(0)
+    report_df["Phone"] = export_df.get("Phone", "")
+    report_df["Payment Method"] = export_df.get("Payment", "Waiting")
+
+    payment_lower = export_df.get("Payment", pd.Series("Waiting", index=export_df.index)).fillna("Waiting").astype(str).str.lower()
+    payment_time = export_df.get("PaymentTime", pd.Series("", index=export_df.index)).fillna("").astype(str)
+    payment_received = payment_time.str.strip().ne("")
+    report_df["Payment Status"] = [
+        "Paid" if (method == "cash" or (method == "bank transfer" and received) or method in {"card", "paid"}) else "Outstanding"
+        for method, received in zip(payment_lower, payment_received)
+    ]
+
+    def _time_only(value):
+        text = clean_val(value)
+        if not text:
+            return ""
+        try:
+            return pd.to_datetime(text).strftime("%H:%M:%S")
+        except Exception:
+            match = re.search(r"(?:T|\s)(\d{2}:\d{2}:\d{2})", text)
+            return match.group(1) if match else text
+
+    report_df["Payment Time"] = [_time_only(v) for v in payment_time]
+    status_series = export_df.get("Status", pd.Series("pending", index=export_df.index)).fillna("pending").astype(str)
+    report_df["Completion Status"] = status_series.str.title()
+    completed_time = export_df.get("CompletedTime", pd.Series("", index=export_df.index)).fillna("").astype(str)
+    report_df["Completed Time"] = [_time_only(v) for v in completed_time]
+    report_df["Notes"] = export_df.get("Notes", "")
+
+    confirmed = export_df.get("MessageConfirmed", pd.Series(False, index=export_df.index)).fillna(False).astype(bool)
+    report_df["Message"] = ["Sent" if c else "" for c in confirmed]
+    sent_time_source = export_df.get("MessageConfirmedTime", export_df.get("MessageTime", pd.Series("", index=export_df.index))).fillna("").astype(str)
+    report_df["Sent Time"] = [_time_only(v) if c else "" for v, c in zip(sent_time_source, confirmed)]
+
+    service_source = export_df.get("service_date", pd.Series(service_date_str, index=export_df.index)).fillna(service_date_str)
+    def _uk_date(value):
+        try:
+            return pd.to_datetime(value).strftime("%d/%m/%Y")
+        except Exception:
+            return str(value or "")
+    report_df["Service Date"] = [_uk_date(v) for v in service_source]
 
     for values in dataframe_to_rows(report_df, index=False, header=True):
         report_ws.append(values)
@@ -4790,25 +4837,48 @@ if not export_df.empty:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
 
-    total_revenue = float(export_df["Price"].sum()) if not export_df.empty else 0
-    completed_count = int(export_df["Status"].astype(str).str.lower().eq("completed").sum()) if not export_df.empty else 0
-    cash_total = float(export_df.loc[export_df["Payment"].astype(str).str.lower() == "cash", "Price"].sum()) if not export_df.empty else 0
-    bank_total = float(export_df.loc[export_df["Payment"].astype(str).str.lower() == "bank transfer", "Price"].sum()) if not export_df.empty else 0
-    unpaid_total = float(export_df.loc[export_df["Payment"].astype(str).str.lower().isin(["waiting", "not paid"]), "Price"].sum()) if not export_df.empty else 0
+    # Excel formatting for business-facing values.
+    headers = {cell.value: cell.column for cell in report_ws[1]}
+    if "Price" in headers:
+        for row_num in range(2, report_ws.max_row + 1):
+            report_ws.cell(row=row_num, column=headers["Price"]).number_format = '£0.00'
+
+    total_revenue = float(pd.to_numeric(export_df.get("Price", 0), errors="coerce").fillna(0).sum()) if not export_df.empty else 0
+    completed_count = int(status_series.str.lower().eq("completed").sum()) if not export_df.empty else 0
+    prices = pd.to_numeric(export_df.get("Price", 0), errors="coerce").fillna(0)
+    cash_mask = payment_lower.eq("cash")
+    bank_received_mask = payment_lower.eq("bank transfer") & payment_received
+    outstanding_mask = ~(cash_mask | bank_received_mask | payment_lower.isin(["card", "paid"]))
+    cash_total = float(prices[cash_mask].sum())
+    bank_total = float(prices[bank_received_mask].sum())
+    unpaid_total = float(prices[outstanding_mask].sum())
 
     summary_start = report_ws.max_row + 3
     summary_rows = [
-        ["DanCleanUK Daily Summary", ""], ["Route Date", service_date_str], ["Depot", DEPOT_FULL_ADDRESS],
+        ["DanCleanUK — Daily Summary", ""], ["Service Date", _uk_date(service_date_str)], ["Depot", DEPOT_FULL_ADDRESS],
         ["Total Jobs", len(export_df)], ["Completed Jobs", completed_count], ["Revenue", total_revenue],
         ["Cash Received", cash_total], ["Bank Transfer Received", bank_total], ["Outstanding / Unpaid", unpaid_total],
-        ["Fuel Cost", route_data["fuel_cost"] if route_data else 0], ["Fuel Used (litres)", route_data["litres"] if route_data else 0],
-        ["Driving Miles", route_data["miles"] if route_data else 0], ["Driving Time", format_duration(route_data["time"]) if route_data else "0m"],
-        ["Tax Rate", f"{TAX_RATE * 100:.0f}%"], ["Estimated Take-Home", route_data["take_home"] if route_data else 0],
+        ["Fuel Cost", round(float(route_data["fuel_cost"] if route_data else 0), 2)],
+        ["Fuel Used", round(float(route_data["litres"] if route_data else 0), 1)],
+        ["Driving Distance", round(float(route_data["miles"] if route_data else 0), 1)],
+        ["Driving Time", format_duration(route_data["time"]) if route_data else "0m"],
+        ["Tax Rate", f"{TAX_RATE * 100:.0f}%"], ["Estimated Take-Home", round(float(route_data["take_home"] if route_data else 0), 2)],
     ]
     for offset, values in enumerate(summary_rows):
         row_num = summary_start + offset
         report_ws.cell(row=row_num, column=1, value=values[0])
         report_ws.cell(row=row_num, column=2, value=values[1])
+    # Currency and unit formatting in the summary.
+    summary_currency_labels = {"Revenue", "Cash Received", "Bank Transfer Received", "Outstanding / Unpaid", "Fuel Cost", "Estimated Take-Home"}
+    for row_num in range(summary_start, summary_start + len(summary_rows)):
+        label = report_ws.cell(row=row_num, column=1).value
+        if label in summary_currency_labels:
+            report_ws.cell(row=row_num, column=2).number_format = '£0.00'
+        elif label == "Fuel Used":
+            report_ws.cell(row=row_num, column=2).number_format = '0.0 "litres"'
+        elif label == "Driving Distance":
+            report_ws.cell(row=row_num, column=2).number_format = '0.0 "miles"'
+
     report_ws.cell(row=summary_start, column=1).fill = header_fill
     report_ws.cell(row=summary_start, column=1).font = header_font
 
