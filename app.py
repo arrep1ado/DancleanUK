@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.9-REPORT-REFRESH"
+APP_VERSION = "27.8.9.1-FINAL-REPORT-CLEANUP"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -4444,6 +4444,16 @@ else:
                         "PaymentTime",
                     ] = now_text()
 
+                    # Cash requires no payment message. Clear any previous
+                    # WhatsApp/SMS state if the payment method was changed.
+                    df.at[master_idx, "WhatsAppSent"] = False
+                    df.at[master_idx, "WhatsAppTime"] = ""
+                    df.at[master_idx, "MessageMethod"] = ""
+                    df.at[master_idx, "MessageTime"] = ""
+                    df.at[master_idx, "MessageOpened"] = False
+                    df.at[master_idx, "MessageConfirmed"] = False
+                    df.at[master_idx, "MessageConfirmedTime"] = ""
+
                     save_job(df.loc[master_idx])
                     st.session_state.master_df = df
                     current_route_data = st.session_state.get("route_data")
@@ -4564,26 +4574,6 @@ else:
                         st.caption("Open WhatsApp or Text Message, press Send there, then return here and confirm Message sent.")
                 else:
                     st.warning("No phone number is stored for this customer, so a payment message cannot be prepared.")
-
-            # A bank transfer is only money received after the user confirms it in Mettle.
-            # Keep the payment method as Bank Transfer and record the actual confirmation time.
-            if payment == "Bank Transfer":
-                payment_received = bool(clean_val(row.get("PaymentTime")))
-                if payment_received:
-                    st.success("💷 Bank transfer received — Paid")
-                elif st.button(
-                    "💷 Mark Bank Transfer as Paid",
-                    key=f"mark_bank_paid_{row['job_id']}",
-                    use_container_width=True,
-                ):
-                    master_idx = df.index[df["job_id"].astype(str) == str(row["job_id"])][0]
-                    df.at[master_idx, "PaymentTime"] = now_text()
-                    save_job(df.loc[master_idx])
-                    st.session_state.master_df = df
-                    current_route_data = st.session_state.get("route_data")
-                    if current_route_data and current_route_data.get("saved_route"):
-                        save_route_snapshot(service_date_str, df, current_route_data)
-                    st.rerun()
 
             current_notes = clean_val(row.get("Notes"))
             edit_key = f"edit_notes_{row['job_id']}"
@@ -4718,6 +4708,30 @@ def save_report_to_snapshot(service_date, report_bytes, filename):
 st.sidebar.markdown("---")
 st.sidebar.subheader("📊 Export Records")
 
+# At-home reconciliation: completed bank-transfer jobs stay outstanding until
+# the money is actually seen in the bank. Reconcile them here, never in Driver Mode.
+outstanding_bank = df[
+    (df["Status"].astype(str).str.lower() == "completed")
+    & (df["Payment"].astype(str).str.lower() == "bank transfer")
+    & (df["PaymentTime"].fillna("").astype(str).str.strip() == "")
+].copy()
+if not outstanding_bank.empty:
+    with st.sidebar.expander(f"💷 Outstanding Bank Transfers ({len(outstanding_bank)})"):
+        st.caption("At home, mark a transfer Paid only after you see the money in your bank.")
+        for _, bank_row in outstanding_bank.iterrows():
+            bank_address = clean_val(bank_row.get("Address")) or clean_val(bank_row.get("address_text")) or clean_val(bank_row.get("Postcode"))
+            bank_price = safe_float(bank_row.get("Price")) or 0.0
+            st.write(f"{bank_address} — £{bank_price:.2f}")
+            if st.button("Mark Paid", key=f"report_mark_bank_paid_{bank_row['job_id']}", use_container_width=True):
+                master_idx = df.index[df["job_id"].astype(str) == str(bank_row["job_id"])][0]
+                df.at[master_idx, "PaymentTime"] = now_text()
+                save_job(df.loc[master_idx])
+                st.session_state.master_df = df
+                current_route_data = st.session_state.get("route_data")
+                if current_route_data and current_route_data.get("saved_route"):
+                    save_route_snapshot(service_date_str, df, current_route_data)
+                st.rerun()
+
 export_df = df.copy()
 
 if not export_df.empty:
@@ -4818,9 +4832,11 @@ if not export_df.empty:
     report_df["Notes"] = export_df.get("Notes", "")
 
     confirmed = export_df.get("MessageConfirmed", pd.Series(False, index=export_df.index)).fillna(False).astype(bool)
-    report_df["Message"] = ["Sent" if c else "" for c in confirmed]
+    # Cash never needs a payment message, even if legacy/session message flags exist.
+    message_reportable = confirmed & ~payment_lower.eq("cash")
+    report_df["Message"] = ["Sent" if c else "" for c in message_reportable]
     sent_time_source = export_df.get("MessageConfirmedTime", export_df.get("MessageTime", pd.Series("", index=export_df.index))).fillna("").astype(str)
-    report_df["Sent Time"] = [_time_only(v) if c else "" for v, c in zip(sent_time_source, confirmed)]
+    report_df["Sent Time"] = [_time_only(v) if c else "" for v, c in zip(sent_time_source, message_reportable)]
 
     service_source = export_df.get("service_date", pd.Series(service_date_str, index=export_df.index)).fillna(service_date_str)
     def _uk_date(value):
@@ -4864,33 +4880,36 @@ if not export_df.empty:
         ["Driving Time", format_duration(route_data["time"]) if route_data else "0m"],
         ["Tax Rate", f"{TAX_RATE * 100:.0f}%"], ["Estimated Take-Home", round(float(route_data["take_home"] if route_data else 0), 2)],
     ]
-    for offset, values in enumerate(summary_rows):
-        row_num = summary_start + offset
-        report_ws.cell(row=row_num, column=1, value=values[0])
-        report_ws.cell(row=row_num, column=2, value=values[1])
-    # Currency and unit formatting in the summary.
-    summary_currency_labels = {"Revenue", "Cash Received", "Bank Transfer Received", "Outstanding / Unpaid", "Fuel Cost", "Estimated Take-Home"}
-    for row_num in range(summary_start, summary_start + len(summary_rows)):
-        label = report_ws.cell(row=row_num, column=1).value
-        if label in summary_currency_labels:
-            report_ws.cell(row=row_num, column=2).number_format = '£0.00'
-        elif label == "Fuel Used":
-            report_ws.cell(row=row_num, column=2).number_format = '0.0 "litres"'
-        elif label == "Driving Distance":
-            report_ws.cell(row=row_num, column=2).number_format = '0.0 "miles"'
-
+    # Keep the summary below the table without forcing Route Order (column A)
+    # to become very wide. Labels use column B and values use column C.
+    report_ws.merge_cells(start_row=summary_start, start_column=1, end_row=summary_start, end_column=3)
+    report_ws.cell(row=summary_start, column=1, value=summary_rows[0][0])
     report_ws.cell(row=summary_start, column=1).fill = header_fill
     report_ws.cell(row=summary_start, column=1).font = header_font
+    for offset, values in enumerate(summary_rows[1:], start=1):
+        row_num = summary_start + offset
+        report_ws.cell(row=row_num, column=2, value=values[0])
+        report_ws.cell(row=row_num, column=3, value=values[1])
 
-    for column_cells in report_ws.columns:
-        max_length = 0
-        letter = column_cells[0].column_letter
-        for cell in column_cells:
-            try:
-                max_length = max(max_length, len(str(cell.value or "")))
-            except Exception:
-                pass
-        report_ws.column_dimensions[letter].width = min(max(max_length + 2, 12), 50)
+    # Currency and unit formatting in the summary.
+    summary_currency_labels = {"Revenue", "Cash Received", "Bank Transfer Received", "Outstanding / Unpaid", "Fuel Cost", "Estimated Take-Home"}
+    for row_num in range(summary_start + 1, summary_start + len(summary_rows)):
+        label = report_ws.cell(row=row_num, column=2).value
+        if label in summary_currency_labels:
+            report_ws.cell(row=row_num, column=3).number_format = '£0.00'
+        elif label == "Fuel Used":
+            report_ws.cell(row=row_num, column=3).number_format = '0.0 "litres"'
+        elif label == "Driving Distance":
+            report_ws.cell(row=row_num, column=3).number_format = '0.0 "miles"'
+
+    # Deliberate business-report widths. Do not auto-fit from the summary,
+    # otherwise Route Order becomes unnecessarily wide.
+    report_widths = {
+        "A": 13, "B": 28, "C": 14, "D": 12, "E": 16, "F": 18, "G": 16,
+        "H": 14, "I": 18, "J": 15, "K": 28, "L": 12, "M": 14, "N": 14,
+    }
+    for letter, width in report_widths.items():
+        report_ws.column_dimensions[letter].width = width
 
     workbook.save(output)
     report_bytes = output.getvalue()
@@ -4900,12 +4919,12 @@ if not export_df.empty:
             st.sidebar.success("Report saved permanently — available from your laptop for this date.")
         else:
             st.sidebar.error("Could not save the report permanently. You can still download it on this device.")
-    saved = load_route_snapshot(service_date_str)
-    if saved and saved.get("report_b64"):
-        try:
-            st.sidebar.download_button("💻 Download Saved Report", base64.b64decode(saved["report_b64"]), saved.get("report_filename") or report_filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-        except Exception:
-            pass
-    st.sidebar.download_button("⬇️ Download Report on This Device", report_bytes, report_filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    st.sidebar.download_button(
+        "⬇️ Download Report",
+        report_bytes,
+        report_filename,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 st.sidebar.caption(f"DanCleanUK Route Optimizer v{APP_VERSION}")
