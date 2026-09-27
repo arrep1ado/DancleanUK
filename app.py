@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.9.6-DRIVER-PHONE-CLEAN-MESSAGES"
+APP_VERSION = "27.8.8.4.9.7-DRIVER-PHONE-FINAL-CLEAN"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -48,7 +48,9 @@ st.markdown(
         .st-key-desktop_input_diagnostic,
         .st-key-desktop_routing_diagnostics,
         .st-key-phone_hide_new_day_info,
-        .st-key-phone_hide_street_warning {
+        .st-key-phone_hide_street_warning,
+        .st-key-phone_hide_unpaid_warning,
+        .st-key-phone_hide_ors_success {
             display: none !important;
         }
         section[data-testid="stSidebar"] hr {
@@ -4619,9 +4621,10 @@ if route_data:
             st.metric("Paid", paid_jobs)
 
     if unpaid_jobs:
-        st.warning(
-            f"{unpaid_jobs} job(s) are still showing as Waiting / Not Paid."
-        )
+        with st.container(key="phone_hide_unpaid_warning"):
+            st.warning(
+                f"{unpaid_jobs} job(s) are still showing as Waiting / Not Paid."
+            )
 
     if route_data["offline"]:
         st.warning(
@@ -4634,9 +4637,10 @@ if route_data:
             "Press PLAN BEST DAILY ROUTE to calculate live route mileage and time."
         )
     else:
-        st.success(
-            "✅ Route calculated using verified ORS driving-road distance and driving time."
-        )
+        with st.container(key="phone_hide_ors_success"):
+            st.success(
+                "✅ Route calculated using verified ORS driving-road distance and driving time."
+            )
 
 
 # ============================================================
