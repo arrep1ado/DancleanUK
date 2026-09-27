@@ -24,7 +24,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.4-CLEANING-PLAN-NEXT-DUE"
+APP_VERSION = "27.8.8.4.5-NEW-DAY-REPORT-HOTFIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -396,7 +396,11 @@ def save_route_snapshot(service_date, df, route_data):
     # replace an existing permanent route. Updates are allowed only when the
     # exact saved route has first been loaded (progress/payment/notes sync).
     existing_snapshot = load_route_snapshot(service_date)
-    if existing_snapshot is not None and not route_data.get("saved_route", False):
+    if (
+        existing_snapshot is not None
+        and not route_data.get("saved_route", False)
+        and not st.session_state.get("replace_saved_route_allowed", False)
+    ):
         return False
 
     routed = df[
@@ -3220,7 +3224,11 @@ if st.sidebar.button(
     # the local customer records or a permanent Supabase route snapshot.
     # Keep the selected day's customer rows available so the laptop does not
     # appear empty after reset, but clear active route/temporary state.
-    current_day = load_day(service_date_str)
+    # Clear ONLY the local working copy for this date. The permanent Supabase
+    # snapshot remains untouched and can still be loaded until a newly planned
+    # route is deliberately saved/locked. Clearing SQLite here prevents the old
+    # jobs from being merged into a newly uploaded route for the same date.
+    delete_day(service_date_str)
     for key in [
         "master_df",
         "route_data",
@@ -3228,13 +3236,9 @@ if st.sidebar.button(
         "uploaded_filename",
     ]:
         st.session_state.pop(key, None)
-    # Clear only the temporary in-memory geocoder cache. Permanent verified
-    # address pins in Supabase remain available, so known customers stay stable
-    # across days/devices without carrying stale session state.
     st.session_state.geocode_cache = {}
-    if current_day is not None and not current_day.empty:
-        st.session_state.master_df = current_day.copy()
     st.session_state.start_new_day_mode = True
+    st.session_state.replace_saved_route_allowed = True
     st.rerun()
 
 if st.session_state.get("start_new_day_mode", False):
@@ -3250,7 +3254,7 @@ if st.session_state.get("start_new_day_mode", False):
 
 saved_snapshot = load_route_snapshot(service_date_str)
 
-if saved_snapshot is not None:
+if saved_snapshot is not None and not st.session_state.get("start_new_day_mode", False):
     st.success(
         "🔒 A permanent saved route exists for this date. "
         "Load it exactly as stored — it cannot be overwritten by a new optimisation."
@@ -3571,7 +3575,7 @@ def is_protected_benchmark(frame):
 # PLAN ROUTE
 # ============================================================
 
-if saved_snapshot is not None and not driver_mode:
+if saved_snapshot is not None and not driver_mode and not st.session_state.get("start_new_day_mode", False):
     st.info(
         "🔒 This date already has a locked route. Load the saved route above; "
         "re-optimisation is disabled to protect its exact stop order."
@@ -3579,7 +3583,7 @@ if saved_snapshot is not None and not driver_mode:
 
 if (
     not driver_mode
-    and saved_snapshot is None
+    and (saved_snapshot is None or st.session_state.get("start_new_day_mode", False))
     and st.button(
         "🚀 PLAN BEST DAILY ROUTE",
         type="primary",
@@ -4773,11 +4777,10 @@ if not completed_df.empty and not driver_mode:
 
 
 def save_report_to_snapshot(service_date, report_bytes, filename):
-    """Attach a generated XLSX report to the already-saved route snapshot.
+    """Save the generated XLSX inside the existing permanent route snapshot.
 
-    First use the same upsert path as route saving. If PostgREST rejects the
-    full-row upsert, fall back to a narrow PATCH of route_data only. The route
-    order/jobs and routing metrics are preserved exactly.
+    Report saving must never recreate, delete or recalculate a route. We PATCH
+    only route_data, preserving the exact saved order, jobs and route metrics.
     """
     snapshot = load_route_snapshot(service_date)
     if not snapshot:
@@ -4786,52 +4789,32 @@ def save_report_to_snapshot(service_date, report_bytes, filename):
     data = dict(snapshot.get("route_data") or {})
     data["report_b64"] = base64.b64encode(report_bytes).decode("ascii")
     data["report_filename"] = str(filename)
-    data["report_saved_at"] = now_text()
+    data["report_saved_at"] = datetime.now(timezone.utc).isoformat()
 
     url, _ = _supabase_config()
-    if not url:
+    headers = _supabase_headers("return=representation")
+    if not url or not headers:
         return False
 
-    payload = {
-        "route_date": str(service_date),
-        "route_data": data,
-        "total_jobs": int(snapshot.get("total_jobs") or snapshot.get("jobs") or 0),
-        "total_miles": float(snapshot.get("total_miles") or snapshot.get("miles") or 0.0),
-        "total_minutes": int(snapshot.get("total_minutes") or round(float(snapshot.get("time_s") or 0.0) / 60.0)),
-        "revenue": float(snapshot.get("revenue") or 0.0),
-        "fuel_cost": float(snapshot.get("fuel_cost") or 0.0),
-        "take_home": float(snapshot.get("take_home") or 0.0),
-        "updated_at": datetime.now().astimezone().isoformat(),
-    }
-
-    headers = _supabase_headers("resolution=merge-duplicates,return=minimal")
-    if not headers:
-        return False
     try:
-        response = requests.post(
-            f"{url}/rest/v1/saved_routes?on_conflict=route_date",
-            headers=headers,
-            json=payload,
-            timeout=30,
-        )
-        if response.status_code in (200, 201, 204):
-            return True
-
-        # Safe fallback: update only report-bearing route_data on the existing
-        # date row. Never create/delete a route and never alter optimiser data.
-        patch_headers = _supabase_headers("return=minimal")
-        patch = requests.patch(
+        response = requests.patch(
             f"{url}/rest/v1/saved_routes",
-            headers=patch_headers,
-            params={"route_date": f"eq.{service_date}"},
+            headers=headers,
+            params={
+                "route_date": f"eq.{service_date}",
+                "select": "route_date",
+            },
             json={
                 "route_data": data,
-                "updated_at": datetime.now().astimezone().isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             },
             timeout=30,
         )
-        return patch.status_code in (200, 204)
-    except requests.RequestException:
+        if response.status_code != 200:
+            return False
+        rows = response.json() or []
+        return any(str(row.get("route_date")) == str(service_date) for row in rows)
+    except (requests.RequestException, ValueError, TypeError):
         return False
 
 
