@@ -24,7 +24,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.5-NEW-DAY-REPORT-HOTFIX"
+APP_VERSION = "27.8.8.4.6-ORS-MATRIX-VALIDATION-HOTFIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2006,6 +2006,11 @@ def get_validated_ors_matrix(locations, postcode_fallbacks, max_repairs=4):
             distances,
             durations,
         )
+
+        # A structurally valid ORS matrix with no suspicious nodes is the
+        # successful result. Do not fall through into the repair-failure path.
+        if not suspects:
+            return distances, durations, working_locations, repaired
 
         repair_idx = None
         for idx in suspects:
