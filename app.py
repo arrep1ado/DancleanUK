@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.1-SEPARATE-ADMIN-DASHBOARD"
+APP_VERSION = "27.8.8.5.0.2-ADMIN-CUSTOMERS-PAYMENTS-REPORTS"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -34,7 +34,8 @@ st.set_page_config(
     layout="centered",
 )
 
-st.title("🚗 DanCleanUK Daily Route Optimizer")
+if not st.session_state.get("admin_office_view", False):
+    st.title("🚗 DanCleanUK Daily Route Optimizer")
 
 # Phone presentation: keep office/admin and routine planning clutter off the
 # mobile front. The emergency PLAN BEST DAILY ROUTE control remains available.
@@ -833,29 +834,123 @@ def calculate_next_cleaning_due(service_date_value, cleaning_plan):
 # ============================================================
 # ADMIN / OFFICE — SEPARATE FRONT
 # ============================================================
-# The Driver/Route app is a locked front.  When Admin is selected we stop
-# BEFORE route settings, uploads, saved-route controls or driver cards render.
-# Both fronts still share the same permanent Supabase data.
+# IMPORTANT: this block is office-only. The locked Driver front and V26.13
+# route engine below are not changed by the Admin dashboard.
 if "admin_office_view" not in st.session_state:
     st.session_state["admin_office_view"] = False
 
+
+def _admin_load_saved_routes():
+    """Read permanent route snapshots for office views only."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers()
+    if not url or not headers:
+        return []
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/saved_routes",
+            headers=headers,
+            params={"select": "*", "order": "route_date.desc", "limit": "1000"},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            return []
+        return response.json() or []
+    except (requests.RequestException, ValueError, TypeError):
+        return []
+
+
+def _admin_jobs_from_routes(routes):
+    rows = []
+    for snapshot in routes:
+        route_date = clean_val(snapshot.get("route_date"))
+        route_data = snapshot.get("route_data") or {}
+        for job in route_data.get("jobs_data", []) or []:
+            item = dict(job)
+            item["_route_date"] = route_date
+            item["_route_data"] = route_data
+            rows.append(item)
+    return rows
+
+
+def _admin_mark_job_paid(route_date, job_id):
+    """Settle one permanent saved-route job without recalculating the route."""
+    snapshot = load_route_snapshot(route_date)
+    if not snapshot:
+        return False
+    route_data = dict(snapshot.get("route_data") or {})
+    jobs_data = [dict(x) for x in (route_data.get("jobs_data") or [])]
+    changed = False
+    for job in jobs_data:
+        if str(job.get("job_id")) == str(job_id):
+            job["Payment"] = "Bank Transfer Paid"
+            job["PaymentTime"] = now_text()
+            changed = True
+            break
+    if not changed:
+        return False
+    route_data["jobs_data"] = jobs_data
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=representation")
+    if not url or not headers:
+        return False
+    try:
+        response = requests.patch(
+            f"{url}/rest/v1/saved_routes",
+            headers=headers,
+            params={"route_date": f"eq.{route_date}", "select": "route_date"},
+            json={"route_data": route_data, "updated_at": datetime.now(timezone.utc).isoformat()},
+            timeout=30,
+        )
+        return response.status_code == 200 and bool(response.json())
+    except (requests.RequestException, ValueError, TypeError):
+        return False
+
+
+def _admin_customer_rows(routes):
+    """Build one latest permanent customer record from saved route history."""
+    latest = {}
+    for job in _admin_jobs_from_routes(routes):
+        address = clean_val(job.get("Address")) or clean_val(job.get("address_text"))
+        postcode = normalise_postcode(job.get("Postcode"))
+        phone = clean_val(job.get("Phone"))
+        if not address and not postcode:
+            continue
+        key = "|".join([address.casefold(), postcode.casefold(), phone.casefold()])
+        candidate = {
+            "Address": address,
+            "Postcode": postcode,
+            "Phone": phone,
+            "Price": float(job.get("Price", 0) or 0),
+            "Cleaning Plan": normalise_cleaning_plan(job.get("Cleaning Plan")),
+            "Next Cleaning Due": clean_val(job.get("Next Cleaning Due")),
+            "Notes": clean_val(job.get("Notes")),
+            "Last Service": clean_val(job.get("service_date")) or clean_val(job.get("Dates")) or job["_route_date"],
+            "_route_date": job["_route_date"],
+        }
+        previous = latest.get(key)
+        if previous is None or candidate["_route_date"] >= previous["_route_date"]:
+            latest[key] = candidate
+    return list(latest.values())
+
+
 if st.session_state.get("admin_office_view", False):
     st.title("🏢 DanCleanUK — Admin Dashboard")
-    st.caption("Office planning, payments and reports")
+    st.caption("Office management")
 
     if st.button("🚗 Return to Driver / Route App", type="primary", use_container_width=True):
         st.session_state["admin_office_view"] = False
         st.rerun()
 
     st.markdown("---")
-
     admin_tab = st.radio(
         "Admin section",
-        ["📅 Upcoming Work / Planner", "💷 Outstanding Payments", "🚐 Prepare Route", "📊 Daily Reports"],
+        ["📅 Upcoming Work / Planner", "💷 Outstanding Payments", "🚐 Prepare Route", "📊 Daily Reports", "👥 Customers"],
         horizontal=True,
         label_visibility="collapsed",
         key="admin_dashboard_section",
     )
+    routes = _admin_load_saved_routes()
 
     if admin_tab == "📅 Upcoming Work / Planner":
         st.header("📅 Upcoming Work / Planner")
@@ -869,18 +964,12 @@ if st.session_state.get("admin_office_view", False):
             today = date.today()
             tomorrow = today + pd.Timedelta(days=1)
             week_end = today + pd.Timedelta(days=7)
-
             def _admin_due_group(due):
-                if due < today:
-                    return "Overdue"
-                if due == today:
-                    return "Due Today"
-                if due == tomorrow:
-                    return "Due Tomorrow"
-                if due <= week_end:
-                    return "Due This Week"
+                if due < today: return "Overdue"
+                if due == today: return "Due Today"
+                if due == tomorrow: return "Due Tomorrow"
+                if due <= week_end: return "Due This Week"
                 return "Later"
-
             planner_df["Due"] = planner_df["_due"].map(_admin_due_group)
             visible = planner_df[planner_df["Due"] != "Later"].copy()
             counts = visible["Due"].value_counts() if not visible.empty else {}
@@ -889,13 +978,9 @@ if st.session_state.get("admin_office_view", False):
             c2.metric("Today", int(counts.get("Due Today", 0)))
             c3.metric("Tomorrow", int(counts.get("Due Tomorrow", 0)))
             c4.metric("Next 7 Days", int(len(visible)))
-
             if visible.empty:
                 next_due = planner_df["_due"].min() if not planner_df.empty else None
-                if next_due:
-                    st.info(f"Nothing is due in the next 7 days. Next due: {next_due.strftime('%d/%m/%Y')}")
-                else:
-                    st.info("No recurring work is due yet.")
+                st.info(f"Nothing is due in the next 7 days. Next due: {next_due.strftime('%d/%m/%Y')}" if next_due else "No recurring work is due yet.")
             else:
                 st.metric("Due work value", f"£{float(visible['Price'].sum()):.2f}")
                 display = visible[["Due", "Address", "Postcode", "Price", "Cleaning Plan", "Next Cleaning Due", "Phone", "Notes"]].copy()
@@ -905,17 +990,90 @@ if st.session_state.get("admin_office_view", False):
 
     elif admin_tab == "💷 Outstanding Payments":
         st.header("💷 Outstanding Payments")
-        st.info("This is now the dedicated office area for payment reconciliation. We will move the existing reconciliation controls here next.")
+        jobs = _admin_jobs_from_routes(routes)
+        outstanding = []
+        for job in jobs:
+            status = clean_val(job.get("Status")).lower()
+            payment = clean_val(job.get("Payment"))
+            if status == "completed" and payment in {"Bank Transfer", "Not Paid"}:
+                outstanding.append(job)
+        if not outstanding:
+            st.success("No outstanding payments.")
+        else:
+            total = sum(float(x.get("Price", 0) or 0) for x in outstanding)
+            c1, c2 = st.columns(2)
+            c1.metric("Outstanding jobs", len(outstanding))
+            c2.metric("Outstanding total", f"£{total:.2f}")
+            for job in sorted(outstanding, key=lambda x: (x.get("_route_date", ""), clean_val(x.get("address_text"))), reverse=True):
+                address = clean_val(job.get("Address")) or clean_val(job.get("address_text")) or clean_val(job.get("Postcode"))
+                amount = float(job.get("Price", 0) or 0)
+                payment = clean_val(job.get("Payment"))
+                try:
+                    service_display = pd.to_datetime(job.get("_route_date")).strftime("%d/%m/%Y")
+                except Exception:
+                    service_display = clean_val(job.get("_route_date"))
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([4, 2, 2])
+                    c1.markdown(f"**{address}**  \n{normalise_postcode(job.get('Postcode'))} · {service_display}")
+                    c2.markdown(f"**£{amount:.2f}**  \n{payment}")
+                    if c3.button("✅ Mark Paid", key=f"admin_paid_{job.get('_route_date')}_{job.get('job_id')}", use_container_width=True):
+                        if _admin_mark_job_paid(job.get("_route_date"), job.get("job_id")):
+                            st.rerun()
+                        else:
+                            st.error("Could not update this payment. Please try again.")
 
     elif admin_tab == "🚐 Prepare Route":
         st.header("🚐 Prepare Route")
-        st.info("This is the dedicated office area for selecting work and preparing the next route. The locked V26.13 optimiser is not changed.")
+        st.info("We’ll build this section next. The locked V26.13 optimiser is not changed.")
+
+    elif admin_tab == "📊 Daily Reports":
+        st.header("📊 Daily Reports")
+        report_routes = []
+        for snapshot in routes:
+            data = snapshot.get("route_data") or {}
+            if data.get("report_b64"):
+                report_routes.append((snapshot, data))
+        if not report_routes:
+            st.info("No saved Daily Reports yet. Reports saved by the Driver/Route workflow will appear here automatically.")
+        else:
+            st.caption(f"{len(report_routes)} saved report(s)")
+            for snapshot, data in report_routes:
+                route_date = clean_val(snapshot.get("route_date"))
+                try:
+                    date_label = pd.to_datetime(route_date).strftime("%d/%m/%Y")
+                except Exception:
+                    date_label = route_date
+                jobs_data = data.get("jobs_data", []) or []
+                completed = [j for j in jobs_data if clean_val(j.get("Status")).lower() == "completed"]
+                revenue = sum(float(j.get("Price", 0) or 0) for j in completed)
+                filename = clean_val(data.get("report_filename")) or f"DanCleanUK_Daily_Report_{route_date}.xlsx"
+                try:
+                    report_bytes = base64.b64decode(data.get("report_b64") or "")
+                except Exception:
+                    report_bytes = b""
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([3, 2, 2])
+                    c1.markdown(f"**{date_label}**")
+                    c2.markdown(f"{len(completed)} completed job(s)  \n**£{revenue:.2f}**")
+                    if report_bytes:
+                        c3.download_button("⬇️ Download Excel", data=report_bytes, file_name=filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"admin_report_{route_date}", use_container_width=True)
 
     else:
-        st.header("📊 Daily Reports")
-        st.info("This is now the dedicated office area for completed-work reports and downloads.")
+        st.header("👥 Customers")
+        customers = _admin_customer_rows(routes)
+        if not customers:
+            st.info("No customers have been recorded yet. Customers will build automatically from permanent saved routes.")
+        else:
+            customer_df = pd.DataFrame(customers)
+            customer_df = customer_df.sort_values(["Address", "Postcode"], na_position="last").reset_index(drop=True)
+            st.metric("Customers", len(customer_df))
+            display = customer_df[["Address", "Postcode", "Phone", "Price", "Cleaning Plan", "Next Cleaning Due", "Notes", "Last Service"]].copy()
+            display["Price"] = display["Price"].map(lambda x: f"£{float(x):.2f}")
+            for col in ["Next Cleaning Due", "Last Service"]:
+                display[col] = pd.to_datetime(display[col], errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
+            st.dataframe(display, use_container_width=True, hide_index=True)
 
-    # Critical separation: nothing from the Driver/Route front renders below.
+    # Critical separation: nothing from the locked Driver/Route front renders below.
     st.stop()
 
 # ============================================================
