@@ -24,7 +24,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.2-REPORT-SAVE-TIME-HOTFIX"
+APP_VERSION = "27.8.8.4.3-LIVE-CROSS-DEVICE-PROGRESS"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -4279,10 +4279,18 @@ if route_data and not route_data.get("persisted_only") and not driver_mode:
         disabled=not route_ready_to_save,
     ):
         if save_route_snapshot(service_date_str, df, route_data):
+            # The route has now become the permanent working-day record.
+            # Mark the current session as attached to that saved route immediately,
+            # so every later Complete / Payment / Message action updates Supabase
+            # instead of leaving the original locked snapshot unchanged.
+            route_data["saved_route"] = True
+            route_data["saved_at"] = now_text()
+            st.session_state.route_data = route_data
             st.success(
                 "✅ Route locked. Open the same date on your phone/tablet and "
                 "press LOAD SAVED ROUTE — NO OPTIMISATION."
             )
+            st.rerun()
         else:
             st.error("The route could not be locked safely. No saved route was changed.")
 
