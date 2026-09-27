@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.9.1-FINAL-REPORT-CLEANUP"
+APP_VERSION = "27.9.0-CLEANING-PLAN-SMS"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -75,6 +75,10 @@ def init_db():
             longitude REAL,
             geo_query TEXT,
             notes TEXT NOT NULL DEFAULT '',
+            cleaning_plan TEXT NOT NULL DEFAULT '',
+            next_cleaning_due TEXT,
+            reminder_sent INTEGER NOT NULL DEFAULT 0,
+            reminder_time TEXT,
             created_at TEXT NOT NULL
         )
         """
@@ -82,6 +86,14 @@ def init_db():
     columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
     if "notes" not in columns:
         conn.execute("ALTER TABLE jobs ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
+    if "cleaning_plan" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN cleaning_plan TEXT NOT NULL DEFAULT ''")
+    if "next_cleaning_due" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN next_cleaning_due TEXT")
+    if "reminder_sent" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0")
+    if "reminder_time" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN reminder_time TEXT")
     conn.commit()
     conn.close()
 
@@ -94,9 +106,9 @@ def save_job(row):
             job_id, service_date, postcode, price, phone,
             status, payment, payment_time, completed_time,
             route_order, address_text, latitude, longitude,
-            geo_query, notes, created_at
+            geo_query, notes, cleaning_plan, next_cleaning_due, reminder_sent, reminder_time, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(job_id) DO UPDATE SET
             service_date=excluded.service_date,
             postcode=excluded.postcode,
@@ -111,7 +123,11 @@ def save_job(row):
             latitude=excluded.latitude,
             longitude=excluded.longitude,
             geo_query=excluded.geo_query,
-            notes=excluded.notes
+            notes=excluded.notes,
+            cleaning_plan=excluded.cleaning_plan,
+            next_cleaning_due=excluded.next_cleaning_due,
+            reminder_sent=excluded.reminder_sent,
+            reminder_time=excluded.reminder_time
         """,
         (
             str(row["job_id"]),
@@ -129,6 +145,10 @@ def save_job(row):
             safe_float(row.get("longitude")),
             str(row.get("geo_query", "")),
             str(row.get("Notes", row.get("notes", "")) or ""),
+            str(row.get("CleaningPlan", row.get("Cleaning Plan", row.get("cleaning_plan", ""))) or ""),
+            clean_optional(row.get("NextCleaningDue", row.get("Next Cleaning Due", row.get("next_cleaning_due")))),
+            1 if bool(row.get("ReminderSent", row.get("reminder_sent", False))) else 0,
+            clean_optional(row.get("ReminderTime", row.get("reminder_time"))),
             str(row.get("created_at", datetime.now().isoformat())),
         ),
     )
@@ -178,6 +198,10 @@ def load_day(service_date):
             "payment_time": "PaymentTime",
             "completed_time": "CompletedTime",
             "notes": "Notes",
+            "cleaning_plan": "CleaningPlan",
+            "next_cleaning_due": "NextCleaningDue",
+            "reminder_sent": "ReminderSent",
+            "reminder_time": "ReminderTime",
         }
     )
 
@@ -194,6 +218,10 @@ def load_day(service_date):
         "longitude": None,
         "geo_query": "",
         "Notes": "",
+        "CleaningPlan": "",
+        "NextCleaningDue": "",
+        "ReminderSent": False,
+        "ReminderTime": "",
     }
     for column, default in defaults.items():
         if column not in loaded.columns:
@@ -206,6 +234,10 @@ def load_day(service_date):
     loaded["address_text"] = loaded["address_text"].fillna("")
     loaded["geo_query"] = loaded["geo_query"].fillna("")
     loaded["Notes"] = loaded["Notes"].fillna("")
+    loaded["CleaningPlan"] = loaded["CleaningPlan"].fillna("")
+    loaded["NextCleaningDue"] = loaded["NextCleaningDue"].fillna("")
+    loaded["ReminderSent"] = loaded["ReminderSent"].fillna(0).astype(bool)
+    loaded["ReminderTime"] = loaded["ReminderTime"].fillna("")
 
     return loaded
 
@@ -489,6 +521,7 @@ def apply_saved_route_snapshot(service_date):
         "CompletedTime": "", "address_text": "", "geo_query": "", "Notes": "",
         "WhatsAppSent": False, "WhatsAppTime": "",
         "MessageOpened": False, "MessageConfirmed": False, "MessageConfirmedTime": "",
+        "CleaningPlan": "", "NextCleaningDue": "", "ReminderSent": False, "ReminderTime": "",
     }.items():
         if column not in day_df.columns:
             day_df[column] = default
@@ -620,6 +653,33 @@ def make_job_id(service_date, row_number, postcode, phone):
 
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def normalise_cleaning_plan(value):
+    """Return a clean month-based plan such as '1 Month' or '3 Months'."""
+    text = clean_val(value)
+    if not text:
+        return ""
+    match = re.fullmatch(r"\s*(\d+)\s*months?\s*", text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    months = int(match.group(1))
+    if months < 1 or months > 60:
+        return ""
+    return f"{months} Month" if months == 1 else f"{months} Months"
+
+
+def calculate_next_cleaning_due(service_date_value, cleaning_plan):
+    """Calculate the next due date using calendar months, never fixed 30-day blocks."""
+    plan = normalise_cleaning_plan(cleaning_plan)
+    if not plan:
+        return ""
+    months = int(re.search(r"\d+", plan).group())
+    try:
+        base = pd.Timestamp(service_date_value).normalize()
+        return (base + pd.DateOffset(months=months)).date().isoformat()
+    except Exception:
+        return ""
 
 
 # ============================================================
@@ -2970,10 +3030,6 @@ def payment_message(price, reference=""):
     return "\n".join(lines)
 
 
-def whatsapp_url(phone, price, reference=""):
-    return "https://wa.me/" + quote(normalise_phone(phone)) + "?text=" + quote(payment_message(price, reference))
-
-
 def sms_url(phone, price, reference=""):
     number = normalise_phone(phone)
     if number and not number.startswith("+"):
@@ -2981,8 +3037,49 @@ def sms_url(phone, price, reference=""):
     return "sms:" + quote(number, safe="+") + "?body=" + quote(payment_message(price, reference))
 
 
+def reminder_message(service_date_value):
+    try:
+        service_text = pd.to_datetime(service_date_value).strftime("%d/%m/%Y")
+    except Exception:
+        service_text = clean_val(service_date_value)
+    return (
+        f"Hi, just a reminder that {BUSINESS_NAME} is due to carry out your "
+        f"window cleaning service tomorrow, {service_text}. Thank you 👍"
+    )
+
+
+def reminder_sms_url(phone, service_date_value):
+    number = normalise_phone(phone)
+    if number and not number.startswith("+"):
+        number = "+" + number
+    return "sms:" + quote(number, safe="+") + "?body=" + quote(reminder_message(service_date_value))
+
+
+def mark_reminder_opened(job_id):
+    st.session_state[f"reminder_opened_{job_id}"] = True
+
+
+def confirm_reminder_sent(job_id):
+    if not st.session_state.get(f"reminder_opened_{job_id}", False):
+        return
+    df = st.session_state.get("master_df")
+    if df is None or df.empty or "job_id" not in df.columns:
+        return
+    matches = df.index[df["job_id"].astype(str) == str(job_id)]
+    if len(matches) == 0:
+        return
+    master_idx = matches[0]
+    df.at[master_idx, "ReminderSent"] = True
+    df.at[master_idx, "ReminderTime"] = now_text()
+    st.session_state.master_df = df
+    save_job(df.loc[master_idx])
+    current_route_data = st.session_state.get("route_data")
+    if current_route_data and current_route_data.get("saved_route"):
+        save_route_snapshot(service_date_str, df, current_route_data)
+
+
 def mark_payment_message_opened(job_id, method):
-    """Record which messaging app was opened, but do NOT unlock Complete yet."""
+    """Record that the SMS composer was opened, but do NOT unlock Complete yet."""
     df = st.session_state.get("master_df")
     if df is None or df.empty or "job_id" not in df.columns:
         return
@@ -3002,7 +3099,7 @@ def mark_payment_message_opened(job_id, method):
 
 
 def confirm_payment_message_sent(job_id):
-    """Explicit confirmation: unlock Complete and permanently lock both message buttons."""
+    """Explicit confirmation: unlock Complete and permanently lock the SMS button."""
     df = st.session_state.get("master_df")
     if df is None or df.empty or "job_id" not in df.columns:
         return
@@ -3313,6 +3410,15 @@ if uploaded_file is not None:
             df["Payment"] = "Waiting"
             df["PaymentTime"] = ""
             df["CompletedTime"] = ""
+            if "Cleaning Plan" in df.columns:
+                df["CleaningPlan"] = df["Cleaning Plan"].map(normalise_cleaning_plan)
+            elif "CleaningPlan" in df.columns:
+                df["CleaningPlan"] = df["CleaningPlan"].map(normalise_cleaning_plan)
+            else:
+                df["CleaningPlan"] = ""
+            df["NextCleaningDue"] = ""
+            df["ReminderSent"] = False
+            df["ReminderTime"] = ""
             # Notes may be supplied in the daily route spreadsheet. Keep them
             # with the customer from import -> locked route -> phone -> report.
             if "Notes" not in df.columns:
@@ -3338,6 +3444,9 @@ if uploaded_file is not None:
                         "Payment",
                         "PaymentTime",
                         "CompletedTime",
+                        "NextCleaningDue",
+                        "ReminderSent",
+                        "ReminderTime",
                         "Notes",
                         "route_order",
                         "latitude",
@@ -3353,6 +3462,9 @@ if uploaded_file is not None:
                         "Payment",
                         "PaymentTime",
                         "CompletedTime",
+                        "NextCleaningDue",
+                        "ReminderSent",
+                        "ReminderTime",
                         "Notes",
                         "route_order",
                         "latitude",
@@ -3371,6 +3483,10 @@ if uploaded_file is not None:
                 df["Payment"] = df["Payment"].fillna("Waiting")
                 df["PaymentTime"] = df["PaymentTime"].fillna("")
                 df["CompletedTime"] = df["CompletedTime"].fillna("")
+                df["CleaningPlan"] = df["CleaningPlan"].fillna("")
+                df["NextCleaningDue"] = df["NextCleaningDue"].fillna("")
+                df["ReminderSent"] = df["ReminderSent"].fillna(False).astype(bool)
+                df["ReminderTime"] = df["ReminderTime"].fillna("")
                 df["Notes"] = df["Notes"].fillna("")
                 df["address_text"] = df["address_text"].fillna("")
                 df["geo_query"] = df["geo_query"].fillna("")
@@ -4338,6 +4454,11 @@ else:
             "messageopened",
             "messageconfirmed",
             "messageconfirmedtime",
+            "cleaningplan",
+            "cleaning plan",
+            "nextcleaningdue",
+            "remindersent",
+            "remindertime",
             "_route_sort",
         }
 
@@ -4403,6 +4524,10 @@ else:
                             master_idx,
                             "CompletedTime",
                         ] = now_text()
+                        df.at[master_idx, "NextCleaningDue"] = calculate_next_cleaning_due(
+                            df.at[master_idx, "service_date"],
+                            df.at[master_idx, "CleaningPlan"] if "CleaningPlan" in df.columns else "",
+                        )
 
                         save_job(df.loc[master_idx])
                         st.session_state.master_df = df
@@ -4531,38 +4656,22 @@ else:
                 message_confirmed = bool(row.get("MessageConfirmed", False))
                 message_opened = bool(row.get("MessageOpened", False)) or bool(clean_val(row.get("MessageMethod")))
                 if phone:
-                    msg1, msg2 = st.columns(2)
-                    with msg1:
-                        if message_confirmed:
-                            st.button("💬 WhatsApp 🔒", key=f"whatsapp_locked_{row['job_id']}", use_container_width=True, disabled=True)
-                        else:
-                            st.link_button(
-                                "💬 WhatsApp",
-                                whatsapp_url(phone, price, street_address),
-                                key=f"whatsapp_open_{row['job_id']}",
-                                on_click=mark_payment_message_opened,
-                                args=(row["job_id"], "WhatsApp"),
-                                use_container_width=True,
-                            )
-                    with msg2:
-                        if message_confirmed:
-                            st.button("📱 Text Message 🔒", key=f"sms_locked_{row['job_id']}", use_container_width=True, disabled=True)
-                        else:
-                            st.link_button(
-                                "📱 Text Message",
-                                sms_url(phone, price, street_address),
-                                key=f"sms_open_{row['job_id']}",
-                                on_click=mark_payment_message_opened,
-                                args=(row["job_id"], "Text Message"),
-                                use_container_width=True,
-                            )
+                    if message_confirmed:
+                        st.button("📱 Text Message 🔒", key=f"sms_locked_{row['job_id']}", use_container_width=True, disabled=True)
+                    else:
+                        st.link_button(
+                            "📱 Text Message",
+                            sms_url(phone, price, street_address),
+                            key=f"sms_open_{row['job_id']}",
+                            on_click=mark_payment_message_opened,
+                            args=(row["job_id"], "Text Message"),
+                            use_container_width=True,
+                        )
 
                     if message_confirmed:
-                        method = clean_val(row.get("MessageMethod")) or "Payment message"
-                        st.success(f"✅ {method} confirmed sent — message buttons locked. Complete is unlocked.")
+                        st.success("✅ Text message confirmed sent — Complete is unlocked.")
                     elif message_opened:
-                        method = clean_val(row.get("MessageMethod")) or "Payment message"
-                        st.info(f"{method} opened. After you press Send, come back here and confirm below.")
+                        st.info("Text message opened. After you press Send, come back here and confirm below.")
                         if st.button(
                             "☑️ Message sent",
                             key=f"confirm_message_sent_{row['job_id']}",
@@ -4571,7 +4680,7 @@ else:
                             confirm_payment_message_sent(row["job_id"])
                             st.rerun()
                     else:
-                        st.caption("Open WhatsApp or Text Message, press Send there, then return here and confirm Message sent.")
+                        st.caption("Open Text Message, press Send there, then return here and confirm Message sent.")
                 else:
                     st.warning("No phone number is stored for this customer, so a payment message cannot be prepared.")
 
@@ -4702,6 +4811,49 @@ def save_report_to_snapshot(service_date, report_bytes, filename):
 
 
 # ============================================================
+# DAY-BEFORE SMS REMINDERS
+# ============================================================
+
+try:
+    tomorrow_iso = (pd.Timestamp(date.today()) + pd.Timedelta(days=1)).date().isoformat()
+except Exception:
+    tomorrow_iso = ""
+
+if service_date_str == tomorrow_iso:
+    reminder_jobs = df[
+        (df["Status"].astype(str).str.lower() != "completed")
+        & df["route_order"].notna()
+    ].copy()
+    if not reminder_jobs.empty:
+        st.sidebar.markdown("---")
+        with st.sidebar.expander(f"🔔 Tomorrow's SMS Reminders ({len(reminder_jobs)})", expanded=False):
+            st.caption("Send these reminders the day before the service. Confirm only after the text has actually been sent.")
+            for _, reminder_row in reminder_jobs.iterrows():
+                reminder_address = clean_val(reminder_row.get("Address")) or clean_val(reminder_row.get("address_text")) or clean_val(reminder_row.get("Postcode"))
+                reminder_phone = clean_val(reminder_row.get("Phone"))
+                reminder_sent = bool(reminder_row.get("ReminderSent", False))
+                st.write(f"**{reminder_address}**")
+                if reminder_sent:
+                    st.success("✅ Reminder sent")
+                elif reminder_phone:
+                    st.link_button(
+                        "📱 Send Reminder",
+                        reminder_sms_url(reminder_phone, service_date_str),
+                        key=f"reminder_sms_{reminder_row['job_id']}",
+                        on_click=mark_reminder_opened,
+                        args=(reminder_row["job_id"],),
+                        use_container_width=True,
+                    )
+                    if st.session_state.get(f"reminder_opened_{reminder_row['job_id']}", False):
+                        st.info("Text message opened. After you press Send, come back here and confirm below.")
+                        if st.button("☑️ Reminder sent", key=f"confirm_reminder_{reminder_row['job_id']}", use_container_width=True):
+                            confirm_reminder_sent(reminder_row["job_id"])
+                            st.rerun()
+                else:
+                    st.warning("No phone number stored.")
+
+
+# ============================================================
 # EXCEL EXPORT
 # ============================================================
 
@@ -4736,7 +4888,7 @@ export_df = df.copy()
 
 if not export_df.empty:
     export_df = export_df[
-        export_df["Status"].astype(str).str.lower() != "depot"
+        export_df["Status"].astype(str).str.lower() == "completed"
     ].copy()
 
     export_columns_to_remove = [
@@ -4845,6 +4997,9 @@ if not export_df.empty:
         except Exception:
             return str(value or "")
     report_df["Service Date"] = [_uk_date(v) for v in service_source]
+    report_df["Cleaning Plan"] = export_df.get("CleaningPlan", pd.Series("", index=export_df.index)).fillna("").astype(str)
+    next_due_source = export_df.get("NextCleaningDue", pd.Series("", index=export_df.index)).fillna("").astype(str)
+    report_df["Next Cleaning Due"] = [_uk_date(v) if clean_val(v) else "" for v in next_due_source]
 
     for values in dataframe_to_rows(report_df, index=False, header=True):
         report_ws.append(values)
@@ -4872,13 +5027,9 @@ if not export_df.empty:
     summary_start = report_ws.max_row + 3
     summary_rows = [
         ["DanCleanUK — Daily Summary", ""], ["Service Date", _uk_date(service_date_str)], ["Depot", DEPOT_FULL_ADDRESS],
-        ["Total Jobs", len(export_df)], ["Completed Jobs", completed_count], ["Revenue", total_revenue],
+        ["Completed Jobs", completed_count], ["Completed Revenue", total_revenue],
         ["Cash Received", cash_total], ["Bank Transfer Received", bank_total], ["Outstanding / Unpaid", unpaid_total],
-        ["Fuel Cost", round(float(route_data["fuel_cost"] if route_data else 0), 2)],
-        ["Fuel Used", round(float(route_data["litres"] if route_data else 0), 1)],
-        ["Driving Distance", round(float(route_data["miles"] if route_data else 0), 1)],
-        ["Driving Time", format_duration(route_data["time"]) if route_data else "0m"],
-        ["Tax Rate", f"{TAX_RATE * 100:.0f}%"], ["Estimated Take-Home", round(float(route_data["take_home"] if route_data else 0), 2)],
+        ["Tax Rate", f"{TAX_RATE * 100:.0f}%"],
     ]
     # Keep the summary below the table without forcing Route Order (column A)
     # to become very wide. Labels use column B and values use column C.
@@ -4892,7 +5043,7 @@ if not export_df.empty:
         report_ws.cell(row=row_num, column=3, value=values[1])
 
     # Currency and unit formatting in the summary.
-    summary_currency_labels = {"Revenue", "Cash Received", "Bank Transfer Received", "Outstanding / Unpaid", "Fuel Cost", "Estimated Take-Home"}
+    summary_currency_labels = {"Completed Revenue", "Cash Received", "Bank Transfer Received", "Outstanding / Unpaid"}
     for row_num in range(summary_start + 1, summary_start + len(summary_rows)):
         label = report_ws.cell(row=row_num, column=2).value
         if label in summary_currency_labels:
@@ -4906,7 +5057,7 @@ if not export_df.empty:
     # otherwise Route Order becomes unnecessarily wide.
     report_widths = {
         "A": 13, "B": 28, "C": 14, "D": 12, "E": 16, "F": 18, "G": 16,
-        "H": 14, "I": 18, "J": 15, "K": 28, "L": 12, "M": 14, "N": 14,
+        "H": 14, "I": 18, "J": 15, "K": 28, "L": 12, "M": 14, "N": 14, "O": 16, "P": 18,
     }
     for letter, width in report_widths.items():
         report_ws.column_dimensions[letter].width = width
