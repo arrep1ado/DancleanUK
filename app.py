@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.9.5-DRIVER-APP-SIGNOFF"
+APP_VERSION = "27.8.8.4.9.5-DRIVER-PHONE-SIGNOFF"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -45,9 +45,13 @@ st.markdown(
         .st-key-open_admin_office,
         .st-key-open_upcoming_work_planner,
         .st-key-jobs_ready_for_planning_panel,
-        .st-key-admin_office_switch_panel,
-        .st-key-office_payments_sidebar {
+        .st-key-desktop_input_diagnostic,
+        .st-key-desktop_routing_diagnostics {
             display: none !important;
+        }
+        section[data-testid="stSidebar"] hr {
+            margin-top: 0.35rem !important;
+            margin-bottom: 0.35rem !important;
         }
     }
     </style>
@@ -3389,25 +3393,24 @@ _saved_route_loaded = bool(
 if "admin_office_view" not in st.session_state:
     st.session_state["admin_office_view"] = False
 
-with st.sidebar.container(key="admin_office_switch_panel"):
-    st.markdown("---")
-    if st.session_state.get("admin_office_view", False):
-        st.subheader("💻 Admin / Office")
-        if _saved_route_loaded and st.button(
-            "🚐 Return to Driver Mode",
-            use_container_width=True,
-            key="return_to_driver_mode",
-        ):
-            st.session_state["admin_office_view"] = False
-            st.rerun()
-    else:
-        if st.button(
-            "💻 Admin / Office",
-            use_container_width=True,
-            key="open_admin_office",
-        ):
-            st.session_state["admin_office_view"] = True
-            st.rerun()
+st.sidebar.markdown("---")
+if st.session_state.get("admin_office_view", False):
+    st.sidebar.subheader("💻 Admin / Office")
+    if _saved_route_loaded and st.sidebar.button(
+        "🚐 Return to Driver Mode",
+        use_container_width=True,
+        key="return_to_driver_mode",
+    ):
+        st.session_state["admin_office_view"] = False
+        st.rerun()
+else:
+    if st.sidebar.button(
+        "💻 Admin / Office",
+        use_container_width=True,
+        key="open_admin_office",
+    ):
+        st.session_state["admin_office_view"] = True
+        st.rerun()
 
 driver_mode = bool(
     _saved_route_loaded and not st.session_state.get("admin_office_view", False)
@@ -3457,10 +3460,14 @@ if driver_mode:
                is deliberately NOT hidden. */
             .st-key-open_admin_office,
             .st-key-open_upcoming_work_planner,
-            .st-key-jobs_ready_for_planning_panel,
-            .st-key-admin_office_switch_panel,
-            .st-key-office_payments_sidebar {
+                .st-key-jobs_ready_for_planning_panel,
+            .st-key-desktop_input_diagnostic,
+            .st-key-desktop_routing_diagnostics {
                 display: none !important;
+            }
+            section[data-testid="stSidebar"] hr {
+                margin-top: 0.35rem !important;
+                margin-bottom: 0.35rem !important;
             }
         }
         </style>
@@ -3631,13 +3638,11 @@ if st.session_state.get("admin_office_view", False):
 # FILE UPLOAD
 # ============================================================
 
-uploaded_file = None
-if not driver_mode:
-    uploaded_file = st.file_uploader(
-        "📁 Upload your day's CSV or Excel file",
-        type=["csv", "xlsx"],
-        key="daily_route_file_uploader",
-    )
+uploaded_file = st.file_uploader(
+    "📁 Upload your day's CSV or Excel file",
+    type=["csv", "xlsx"],
+    key="daily_route_file_uploader",
+)
 
 if uploaded_file is not None:
     if st.session_state.get("uploaded_filename") != uploaded_file.name:
@@ -4406,26 +4411,27 @@ if (
     )
     st.session_state.route_input_diagnostic = route_input_diagnostic
 
-    with st.expander("🧪 V27.8.2 Route Input Diagnostic", expanded=True):
-        st.caption(
-            "Diagnostic only — this does not change geocoding, ORS data, "
-            "candidate generation, scoring, or the V26.13 optimiser."
-        )
-        st.code(
-            "RUN ID: " + route_input_diagnostic["diagnostic_run_id"] + "\n"
-            "INPUT: " + route_input_diagnostic["optimizer_input_sha256"] + "\n"
-            "COORDS: " + route_input_diagnostic["coordinate_sha256"] + "\n"
-            "DISTANCE MATRIX: " + route_input_diagnostic["distance_matrix_sha256"] + "\n"
-            "DURATION MATRIX: " + route_input_diagnostic["duration_matrix_sha256"] + "\n"
-            "FINAL ROUTE: " + route_input_diagnostic["final_route_sha256"]
-        )
-        st.download_button(
-            "⬇️ Download Diagnostic JSON",
-            data=json.dumps(route_input_diagnostic, indent=2, ensure_ascii=False),
-            file_name=f"DanCleanUK_route_diagnostic_{service_date_str}_{route_input_diagnostic['diagnostic_run_id']}.json",
-            mime="application/json",
-            key="download_route_diagnostic_json",
-        )
+    with st.container(key="desktop_input_diagnostic"):
+        with st.expander("🧪 V27.8.2 Route Input Diagnostic", expanded=True):
+            st.caption(
+                "Diagnostic only — this does not change geocoding, ORS data, "
+                "candidate generation, scoring, or the V26.13 optimiser."
+            )
+            st.code(
+                "RUN ID: " + route_input_diagnostic["diagnostic_run_id"] + "\n"
+                "INPUT: " + route_input_diagnostic["optimizer_input_sha256"] + "\n"
+                "COORDS: " + route_input_diagnostic["coordinate_sha256"] + "\n"
+                "DISTANCE MATRIX: " + route_input_diagnostic["distance_matrix_sha256"] + "\n"
+                "DURATION MATRIX: " + route_input_diagnostic["duration_matrix_sha256"] + "\n"
+                "FINAL ROUTE: " + route_input_diagnostic["final_route_sha256"]
+            )
+            st.download_button(
+                "⬇️ Download Diagnostic JSON",
+                data=json.dumps(route_input_diagnostic, indent=2, ensure_ascii=False),
+                file_name=f"DanCleanUK_route_diagnostic_{service_date_str}_{route_input_diagnostic['diagnostic_run_id']}.json",
+                mime="application/json",
+                key="download_route_diagnostic_json",
+            )
 
     # V26.2 final-leg audit. This makes any remaining bad leg visible instead
     # of hiding it inside the day's total.
@@ -4436,38 +4442,39 @@ if (
         durations,
     )
 
-    with st.expander("🔎 Routing diagnostics", expanded=False):
-        diagnostic_rows = []
-        for item in leg_audit:
-            a = item["from_node"]
-            b = item["to_node"]
-
-            def node_label(node_idx):
-                if node_idx == 0:
-                    return "DEPOT"
-                row = routing_df.iloc[node_idx]
-                address = clean_val(row.get("Address", ""))
-                postcode = clean_val(row.get("Postcode", ""))
-                return f"{address} ({postcode})" if address else postcode
-
-            diagnostic_rows.append({
-                "Leg": item["leg"],
-                "From": node_label(a),
-                "To": node_label(b),
-                "Road miles": round(item["road_miles"], 2),
-                "Drive min": round(item["minutes"], 1),
-                "Straight miles": round(item["straight_miles"], 2),
-                "Road / straight": (
-                    round(item["ratio"], 2)
-                    if item["ratio"] is not None else ""
-                ),
-            })
-
-        st.dataframe(
-            pd.DataFrame(diagnostic_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
+    with st.container(key="desktop_routing_diagnostics"):
+        with st.expander("🔎 Routing diagnostics", expanded=False):
+            diagnostic_rows = []
+            for item in leg_audit:
+                a = item["from_node"]
+                b = item["to_node"]
+    
+                def node_label(node_idx):
+                    if node_idx == 0:
+                        return "DEPOT"
+                    row = routing_df.iloc[node_idx]
+                    address = clean_val(row.get("Address", ""))
+                    postcode = clean_val(row.get("Postcode", ""))
+                    return f"{address} ({postcode})" if address else postcode
+    
+                diagnostic_rows.append({
+                    "Leg": item["leg"],
+                    "From": node_label(a),
+                    "To": node_label(b),
+                    "Road miles": round(item["road_miles"], 2),
+                    "Drive min": round(item["minutes"], 1),
+                    "Straight miles": round(item["straight_miles"], 2),
+                    "Road / straight": (
+                        round(item["ratio"], 2)
+                        if item["ratio"] is not None else ""
+                    ),
+                })
+    
+            st.dataframe(
+                pd.DataFrame(diagnostic_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     revenue = float(
         routing_df["Price"].sum()
@@ -5129,40 +5136,40 @@ def save_report_to_snapshot(service_date, report_bytes, filename):
 # STEP 1 — OFFICE PAYMENT RECONCILIATION + CLEAN DAILY REPORT
 # ============================================================
 
-with st.sidebar.container(key="office_payments_sidebar"):
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("💷 Outstanding Payments")
+st.sidebar.markdown("---")
+st.sidebar.subheader("💷 Outstanding Payments")
 
-    # Reconciliation belongs on the office/laptop side, never Driver Mode.
-    if not driver_mode and df is not None and not df.empty:
-        outstanding_bank = df[
-            df["Status"].astype(str).str.lower().eq("completed")
-            & df["Payment"].astype(str).str.lower().eq("bank transfer")
-        ].copy()
-        if outstanding_bank.empty:
-            st.sidebar.caption("No completed bank transfers waiting for payment.")
-        else:
-            outstanding_total = float(outstanding_bank["Price"].sum())
-            st.sidebar.metric("Outstanding", f"£{outstanding_total:.2f}")
-            for _, pay_row in outstanding_bank.sort_values(["route_order", "address_text"], na_position="last").iterrows():
-                address = clean_val(pay_row.get("Address")) or clean_val(pay_row.get("address_text")) or clean_val(pay_row.get("Postcode"))
-                amount = float(pay_row.get("Price", 0) or 0)
-                st.sidebar.caption(f"{address} — £{amount:.2f}")
-                if st.sidebar.button("✅ Mark Paid", key=f"reconcile_paid_{pay_row['job_id']}", use_container_width=True):
-                    matches = df.index[df["job_id"].astype(str) == str(pay_row["job_id"])]
-                    if len(matches):
-                        idx = matches[0]
-                        df.at[idx, "Payment"] = "Bank Transfer Paid"
-                        df.at[idx, "PaymentTime"] = now_text()
-                        save_job(df.loc[idx])
-                        st.session_state.master_df = df
-                        current_route_data = st.session_state.get("route_data")
-                        if current_route_data and current_route_data.get("saved_route"):
-                            save_route_snapshot(service_date_str, df, current_route_data)
-                        st.rerun()
+# Reconciliation belongs on the office/laptop side, never Driver Mode.
+if not driver_mode and df is not None and not df.empty:
+    outstanding_bank = df[
+        df["Status"].astype(str).str.lower().eq("completed")
+        & df["Payment"].astype(str).str.lower().eq("bank transfer")
+    ].copy()
+    if outstanding_bank.empty:
+        st.sidebar.caption("No completed bank transfers waiting for payment.")
     else:
-        if driver_mode:
-            st.sidebar.caption("Payment reconciliation is available on the office view.")
+        outstanding_total = float(outstanding_bank["Price"].sum())
+        st.sidebar.metric("Outstanding", f"£{outstanding_total:.2f}")
+        for _, pay_row in outstanding_bank.sort_values(["route_order", "address_text"], na_position="last").iterrows():
+            address = clean_val(pay_row.get("Address")) or clean_val(pay_row.get("address_text")) or clean_val(pay_row.get("Postcode"))
+            amount = float(pay_row.get("Price", 0) or 0)
+            st.sidebar.caption(f"{address} — £{amount:.2f}")
+            if st.sidebar.button("✅ Mark Paid", key=f"reconcile_paid_{pay_row['job_id']}", use_container_width=True):
+                matches = df.index[df["job_id"].astype(str) == str(pay_row["job_id"])]
+                if len(matches):
+                    idx = matches[0]
+                    df.at[idx, "Payment"] = "Bank Transfer Paid"
+                    df.at[idx, "PaymentTime"] = now_text()
+                    save_job(df.loc[idx])
+                    st.session_state.master_df = df
+                    current_route_data = st.session_state.get("route_data")
+                    if current_route_data and current_route_data.get("saved_route"):
+                        save_route_snapshot(service_date_str, df, current_route_data)
+                    st.rerun()
+else:
+    if driver_mode:
+        st.sidebar.caption("Payment reconciliation is available on the office view.")
+
 st.sidebar.markdown("---")
 st.sidebar.subheader("📊 Daily Report")
 
