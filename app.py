@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.9.10-PHONE-SETTINGS-ACTUAL-FIX"
+APP_VERSION = "27.8.8.5.0.0-ADMIN-UPCOMING-WORK"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
