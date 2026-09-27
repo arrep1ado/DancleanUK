@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.9.9-PHONE-SETTINGS-FIX"
+APP_VERSION = "27.8.8.4.9.10-PHONE-SETTINGS-ACTUAL-FIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -837,7 +837,7 @@ def calculate_next_cleaning_due(service_date_value, cleaning_plan):
 with st.sidebar.container(key="phone_hide_driver_settings"):
     st.title("⚙️ Settings")
 
-    service_date = st.sidebar.date_input(
+    service_date = st.date_input(
         "Route date",
         value=date.fromisoformat(st.session_state.service_date),
     )
@@ -852,24 +852,24 @@ with st.sidebar.container(key="phone_hide_driver_settings"):
         st.session_state.pop("start_new_day_mode", None)
         st.rerun()
 
-    DEPOT_POSTCODE = st.sidebar.text_input(
+    DEPOT_POSTCODE = st.text_input(
         "Depot Postcode",
         value="NG31 9RA",
     )
 
-    DEPOT_FULL_ADDRESS = st.sidebar.text_input(
+    DEPOT_FULL_ADDRESS = st.text_input(
         "Depot Address",
         value="192 Queensway, Grantham NG31 9RA",
     )
 
-    FUEL_PRICE = st.sidebar.number_input(
+    FUEL_PRICE = st.number_input(
         "Fuel Price (£/litre)",
         min_value=0.01,
         value=1.50,
         step=0.01,
     )
 
-    MPG = st.sidebar.number_input(
+    MPG = st.number_input(
         "Vehicle MPG",
         min_value=1.0,
         value=30.0,
@@ -877,7 +877,7 @@ with st.sidebar.container(key="phone_hide_driver_settings"):
     )
 
     TAX_RATE = (
-        st.sidebar.slider(
+        st.slider(
             "Tax Deduction (%)",
             0,
             50,
