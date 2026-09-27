@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.9.0.1-QUEENSWAY-HOTFIX"
+APP_VERSION = "27.9.0.2-STREET-VERIFY-HOTFIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1330,6 +1330,56 @@ def reverse_postcode_outcode(lat, lon):
 
 
 
+def ors_nearby_street_geocode(street, postcode, postcode_anchor):
+    """Resolve a named street with ORS and validate it against the UK postcode.
+
+    This is a generic street-level fallback for genuine addresses when public
+    house points are unavailable. It never invents a house coordinate and it
+    never uses the postcode centroid as the customer routing point.
+    """
+    street = clean_val(street).strip()
+    postcode = normalise_postcode(postcode)
+    if not street or postcode_anchor is None:
+        return None
+
+    queries = [
+        f"{street}, {postcode}, United Kingdom" if postcode else "",
+        f"{street}, United Kingdom",
+    ]
+    headers = {"Authorization": API_KEY, "Accept": "application/json"}
+    wanted = re.sub(r"[^a-z0-9]+", " ", street.lower()).strip()
+
+    for text_query in dict.fromkeys(q for q in queries if q):
+        try:
+            response = requests.get(
+                "https://api.heigit.org/openrouteservice/geocode/search",
+                params={"api_key": API_KEY, "text": text_query, "size": 20},
+                headers=headers,
+                timeout=20,
+            )
+            if response.status_code != 200:
+                continue
+            for feature in (response.json() or {}).get("features") or []:
+                props = feature.get("properties") or {}
+                label = clean_val(props.get("label") or props.get("name")).lower()
+                street_name = clean_val(props.get("street") or props.get("name")).lower()
+                haystack = re.sub(r"[^a-z0-9]+", " ", f"{street_name} {label}").strip()
+                if wanted not in haystack:
+                    continue
+                coords = (feature.get("geometry") or {}).get("coordinates") or []
+                if len(coords) < 2:
+                    continue
+                try:
+                    lon, lat = float(coords[0]), float(coords[1])
+                except Exception:
+                    continue
+                if haversine_km(float(postcode_anchor[0]), float(postcode_anchor[1]), lat, lon) <= 2.5:
+                    return (lat, lon)
+        except Exception:
+            continue
+    return None
+
+
 def nominatim_nearby_street_geocode(street, postcode_anchor, headers):
     """Resolve a real street near the supplied UK postcode anchor.
 
@@ -1514,32 +1564,6 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
         save_persistent_geocode(query, postcode, exact_ors, "ors_exact")
         return exact_ors
 
-    # V27.9.0.1 QUEENSWAY HOTFIX:
-    # If another house on the SAME named street + postcode has already been
-    # verified at street level during this run, reuse that verified street
-    # coordinate. This avoids later houses failing only because a public
-    # geocoder throttles/replies inconsistently. No postcode centroid or fake
-    # house offset is introduced; all houses remain separate customer jobs.
-    street_cache_key = None
-    if expected_street and postcode:
-        street_cache_key = (
-            "__VERIFIED_STREET__|"
-            + expected_street.strip().lower()
-            + "|"
-            + postcode.strip().lower()
-        )
-        cached_street = st.session_state.geocode_cache.get(street_cache_key)
-        cached_street = safe_exact(cached_street)
-        if cached_street is not None:
-            st.session_state.geocode_cache[key] = cached_street
-            approx = st.session_state.setdefault("approximate_geocodes", {})
-            approx[key] = {
-                "query": query,
-                "postcode": postcode,
-                "level": "street",
-            }
-            return cached_street
-
     for candidate in geocode_candidates(query, postcode):
         coords = nominatim_search(
             candidate,
@@ -1616,14 +1640,16 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
         and str(query).strip().casefold() == str(DEPOT_FULL_ADDRESS).strip().casefold()
     )
     if expected_house and expected_street and postcode_anchor is not None and not allow_postcode_fallback and not is_depot:
-        nearby_street = nominatim_nearby_street_geocode(
-            expected_street, postcode_anchor, headers
+        nearby_street = ors_nearby_street_geocode(
+            expected_street, postcode, postcode_anchor
         )
+        if nearby_street is None:
+            nearby_street = nominatim_nearby_street_geocode(
+                expected_street, postcode_anchor, headers
+            )
         nearby_street = safe_exact(nearby_street)
         if nearby_street is not None:
             st.session_state.geocode_cache[key] = nearby_street
-            if street_cache_key:
-                st.session_state.geocode_cache[street_cache_key] = nearby_street
             approx = st.session_state.setdefault("approximate_geocodes", {})
             approx[key] = {
                 "query": query,
