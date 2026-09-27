@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.9.0-CLEANING-PLAN-SMS"
+APP_VERSION = "27.9.0.1-QUEENSWAY-HOTFIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1514,6 +1514,32 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
         save_persistent_geocode(query, postcode, exact_ors, "ors_exact")
         return exact_ors
 
+    # V27.9.0.1 QUEENSWAY HOTFIX:
+    # If another house on the SAME named street + postcode has already been
+    # verified at street level during this run, reuse that verified street
+    # coordinate. This avoids later houses failing only because a public
+    # geocoder throttles/replies inconsistently. No postcode centroid or fake
+    # house offset is introduced; all houses remain separate customer jobs.
+    street_cache_key = None
+    if expected_street and postcode:
+        street_cache_key = (
+            "__VERIFIED_STREET__|"
+            + expected_street.strip().lower()
+            + "|"
+            + postcode.strip().lower()
+        )
+        cached_street = st.session_state.geocode_cache.get(street_cache_key)
+        cached_street = safe_exact(cached_street)
+        if cached_street is not None:
+            st.session_state.geocode_cache[key] = cached_street
+            approx = st.session_state.setdefault("approximate_geocodes", {})
+            approx[key] = {
+                "query": query,
+                "postcode": postcode,
+                "level": "street",
+            }
+            return cached_street
+
     for candidate in geocode_candidates(query, postcode):
         coords = nominatim_search(
             candidate,
@@ -1596,6 +1622,8 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
         nearby_street = safe_exact(nearby_street)
         if nearby_street is not None:
             st.session_state.geocode_cache[key] = nearby_street
+            if street_cache_key:
+                st.session_state.geocode_cache[street_cache_key] = nearby_street
             approx = st.session_state.setdefault("approximate_geocodes", {})
             approx[key] = {
                 "query": query,
