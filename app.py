@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.9.5-DRIVER-PHONE-SIGNOFF"
+APP_VERSION = "27.8.8.4.9.6-DRIVER-PHONE-CLEAN-MESSAGES"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -46,7 +46,9 @@ st.markdown(
         .st-key-open_upcoming_work_planner,
         .st-key-jobs_ready_for_planning_panel,
         .st-key-desktop_input_diagnostic,
-        .st-key-desktop_routing_diagnostics {
+        .st-key-desktop_routing_diagnostics,
+        .st-key-phone_hide_new_day_info,
+        .st-key-phone_hide_street_warning {
             display: none !important;
         }
         section[data-testid="stSidebar"] hr {
@@ -3353,10 +3355,11 @@ if st.sidebar.button(
     st.rerun()
 
 if st.session_state.get("start_new_day_mode", False):
-    st.sidebar.info(
-        "New-day session ready. Saved routes are still protected. "
-        "Choose another route date or upload the next day's file."
-    )
+    with st.sidebar.container(key="phone_hide_new_day_info"):
+        st.info(
+            "New-day session ready. Saved routes are still protected. "
+            "Choose another route date or upload the next day's file."
+        )
 
 
 # ============================================================
@@ -3982,12 +3985,13 @@ if (
 
     approximate_geocodes = st.session_state.get("approximate_geocodes", {})
     if approximate_geocodes:
-        st.warning(
-            f"{len(approximate_geocodes)} customer address(es) were verified to the correct "
-            "street/postcode area, but the public map data did not provide an individual "
-            "house-number point. Road routing will use the verified street location; no "
-            "postcode-centre coordinate or invented house offset was used."
-        )
+        with st.container(key="phone_hide_street_warning"):
+            st.warning(
+                f"{len(approximate_geocodes)} customer address(es) were verified to the correct "
+                "street/postcode area, but the public map data did not provide an individual "
+                "house-number point. Road routing will use the verified street location; no "
+                "postcode-centre coordinate or invented house offset was used."
+            )
 
     if failed_rows:
         # Failed geocodes must never retain an old route position.
