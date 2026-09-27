@@ -24,7 +24,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.9-UPCOMING-WORK-PLANNER"
+APP_VERSION = "27.8.8.4.9.1-ADMIN-PLANNER-VISIBLE"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -3416,8 +3416,31 @@ if driver_mode:
 # ============================================================
 
 if not driver_mode:
-    with st.expander("📅 Upcoming Work / Planner", expanded=False):
-        upcoming_records = load_upcoming_work_records()
+    # Clear office/admin navigation. The planner itself stays in the main area
+    # where there is enough room for customer rows and selection controls.
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("💻 Admin")
+    if st.sidebar.button("📅 Upcoming Work / Planner", use_container_width=True, key="open_upcoming_work_planner"):
+        st.session_state["show_upcoming_work_planner"] = True
+
+    upcoming_records = load_upcoming_work_records()
+    upcoming_due_count = 0
+    if upcoming_records:
+        _planner_today = date.today()
+        _planner_limit = _planner_today + pd.Timedelta(days=7)
+        for _record in upcoming_records:
+            try:
+                _due = pd.to_datetime(_record.get("Next Cleaning Due"), errors="coerce")
+                if pd.notna(_due) and _due.date() <= _planner_limit:
+                    upcoming_due_count += 1
+            except (TypeError, ValueError):
+                pass
+    st.sidebar.caption(f"{upcoming_due_count} job(s) due / overdue in the next 7 days")
+
+    planner_expanded = bool(st.session_state.get("show_upcoming_work_planner", False))
+    with st.expander("💻 ADMIN — 📅 Upcoming Work / Planner", expanded=planner_expanded):
+        if planner_expanded:
+            st.session_state["show_upcoming_work_planner"] = False
         if not upcoming_records:
             st.caption("No recurring work is due yet.")
         else:
