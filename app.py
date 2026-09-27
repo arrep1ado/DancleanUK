@@ -15,7 +15,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
 
 
@@ -4513,7 +4513,6 @@ else:
 
             st.write(
                 f"**Price:** £{price:.2f} "
-                f"| **Status:** {text} "
                 f"| **Payment:** {payment}"
             )
 
@@ -4922,28 +4921,59 @@ else:
     report_ws = workbook.active
     report_ws.title = "Daily Report"
 
-    header_fill = PatternFill(start_color="2F4F4F", end_color="2F4F4F", fill_type="solid")
+    # Clean DanCleanUK business-report styling. Presentation only.
+    header_fill = PatternFill(start_color="244A4A", end_color="244A4A", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
+    summary_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+    summary_title_fill = PatternFill(start_color="244A4A", end_color="244A4A", fill_type="solid")
+    alternate_fill = PatternFill(start_color="F4F8F8", end_color="F4F8F8", fill_type="solid")
+    outstanding_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+    paid_fill = PatternFill(start_color="E2F0D9", end_color="E2F0D9", fill_type="solid")
+    thin_side = Side(style="thin", color="D9E1E1")
+    thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
 
     for values in dataframe_to_rows(report_df, index=False, header=True):
         report_ws.append(values)
+
+    # Table header.
+    report_ws.row_dimensions[1].height = 24
     for cell in report_ws[1]:
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = Alignment(horizontal="center")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = thin_border
 
-    # Business-friendly formatting.
     header_map = {cell.value: cell.column for cell in report_ws[1]}
     price_col = header_map.get("Price")
-    if price_col:
-        for row_no in range(2, report_ws.max_row + 1):
-            report_ws.cell(row=row_no, column=price_col).number_format = '£0.00'
+    payment_status_col = header_map.get("Payment Status")
 
+    # Readable job rows with light alternating shading and subtle borders.
+    for row_no in range(2, report_ws.max_row + 1):
+        report_ws.row_dimensions[row_no].height = 21
+        for col_no in range(1, report_ws.max_column + 1):
+            cell = report_ws.cell(row=row_no, column=col_no)
+            cell.border = thin_border
+            cell.alignment = Alignment(vertical="center")
+            if row_no % 2 == 0:
+                cell.fill = alternate_fill
+        if price_col:
+            report_ws.cell(row=row_no, column=price_col).number_format = '£0.00'
+        if payment_status_col:
+            status_cell = report_ws.cell(row=row_no, column=payment_status_col)
+            status_text = clean_val(status_cell.value)
+            if status_text == "Paid":
+                status_cell.fill = paid_fill
+                status_cell.font = Font(bold=True)
+            elif status_text == "Outstanding":
+                status_cell.fill = outstanding_fill
+                status_cell.font = Font(bold=True)
+
+    # Order is deliberately narrow. Summary no longer uses column A, so it stays narrow.
     widths = {
-        "Order": 7, "Address": 30, "Postcode": 13, "Price": 11,
+        "Order": 6, "Address": 30, "Postcode": 13, "Price": 11,
         "Cleaning Plan": 16, "Phone": 16,
         "Payment Method": 18, "Payment Status": 17, "Payment Time": 14,
-        "Message": 12, "Sent Time": 12, "Service Date": 14,
+        "Message": 11, "Sent Time": 11, "Service Date": 14,
         "Notes": 32, "Next Cleaning Due": 18,
     }
     for heading, width in widths.items():
@@ -4951,33 +4981,63 @@ else:
         if col:
             report_ws.column_dimensions[report_ws.cell(row=1, column=col).column_letter].width = width
 
+    # Helpful alignment without clutter.
+    for heading in ("Order", "Postcode", "Price", "Cleaning Plan", "Payment Status", "Payment Time", "Message", "Sent Time", "Service Date", "Next Cleaning Due"):
+        col = header_map.get(heading)
+        if col:
+            for row_no in range(2, report_ws.max_row + 1):
+                report_ws.cell(row=row_no, column=col).alignment = Alignment(horizontal="center", vertical="center")
+
     completed_revenue = float(report_source["Price"].sum())
     cash_received = float(report_source.loc[report_source["Payment"].astype(str).eq("Cash"), "Price"].sum())
     bank_received = float(report_source.loc[report_source["Payment"].astype(str).eq("Bank Transfer Paid"), "Price"].sum())
     outstanding = max(completed_revenue - cash_received - bank_received, 0.0)
 
+    # Daily Summary starts in B/C so column A can remain a genuinely narrow Order column.
     summary_start = report_ws.max_row + 3
+    summary_label_col = 2
+    summary_value_col = 3
+    report_ws.merge_cells(
+        start_row=summary_start, start_column=summary_label_col,
+        end_row=summary_start, end_column=summary_value_col
+    )
+    title_cell = report_ws.cell(row=summary_start, column=summary_label_col, value="DanCleanUK Daily Summary")
+    title_cell.fill = summary_title_fill
+    title_cell.font = Font(color="FFFFFF", bold=True, size=12)
+    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+    title_cell.border = thin_border
+    report_ws.cell(row=summary_start, column=summary_value_col).fill = summary_title_fill
+    report_ws.cell(row=summary_start, column=summary_value_col).border = thin_border
+    report_ws.row_dimensions[summary_start].height = 24
+
     summary_rows = [
-        ["DanCleanUK Daily Summary", ""],
-        ["Date", report_date(service_date_str)],
-        ["Completed Jobs", len(report_df)],
-        ["Revenue", completed_revenue],
-        ["Cash Received", cash_received],
-        ["Bank Transfer Received", bank_received],
-        ["Outstanding", outstanding],
+        ("Date", report_date(service_date_str), False),
+        ("Completed Jobs", len(report_df), False),
+        ("Revenue", completed_revenue, True),
+        ("Cash Received", cash_received, True),
+        ("Bank Transfer Received", bank_received, True),
+        ("Outstanding", outstanding, True),
     ]
-    for offset, values in enumerate(summary_rows):
+    for offset, (label, value, is_money) in enumerate(summary_rows, start=1):
         row_num = summary_start + offset
-        report_ws.cell(row=row_num, column=1, value=values[0])
-        report_ws.cell(row=row_num, column=2, value=values[1])
-    report_ws.cell(row=summary_start, column=1).fill = header_fill
-    report_ws.cell(row=summary_start, column=1).font = header_font
-    for row_num in range(summary_start + 3, summary_start + 7):
-        report_ws.cell(row=row_num, column=2).number_format = '£0.00'
-    report_ws.column_dimensions["A"].width = max(report_ws.column_dimensions["A"].width or 0, 32)
-    report_ws.column_dimensions["B"].width = max(report_ws.column_dimensions["B"].width or 0, 20)
+        label_cell = report_ws.cell(row=row_num, column=summary_label_col, value=label)
+        value_cell = report_ws.cell(row=row_num, column=summary_value_col, value=value)
+        label_cell.fill = summary_fill
+        label_cell.font = Font(bold=True)
+        label_cell.border = thin_border
+        value_cell.border = thin_border
+        value_cell.alignment = Alignment(horizontal="right", vertical="center")
+        if is_money:
+            value_cell.number_format = '£0.00'
+        if label == "Outstanding" and float(outstanding) > 0:
+            label_cell.fill = outstanding_fill
+            value_cell.fill = outstanding_fill
+            value_cell.font = Font(bold=True)
+
     report_ws.freeze_panes = "A2"
-    report_ws.auto_filter.ref = f"A1:{report_ws.cell(row=report_ws.max_row if summary_start <= 1 else summary_start-3, column=report_ws.max_column).coordinate}"
+    if report_ws.max_row >= 2 and report_ws.max_column >= 1:
+        last_job_row = max(1, summary_start - 3)
+        report_ws.auto_filter.ref = f"A1:{report_ws.cell(row=last_job_row, column=report_ws.max_column).coordinate}"
 
     workbook.save(output)
     report_bytes = output.getvalue()
