@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.0-ADMIN-UPCOMING-WORK"
+APP_VERSION = "27.8.8.5.0.1-SEPARATE-ADMIN-DASHBOARD"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -829,6 +829,94 @@ def calculate_next_cleaning_due(service_date_value, cleaning_plan):
     except Exception:
         return ""
 
+
+# ============================================================
+# ADMIN / OFFICE — SEPARATE FRONT
+# ============================================================
+# The Driver/Route app is a locked front.  When Admin is selected we stop
+# BEFORE route settings, uploads, saved-route controls or driver cards render.
+# Both fronts still share the same permanent Supabase data.
+if "admin_office_view" not in st.session_state:
+    st.session_state["admin_office_view"] = False
+
+if st.session_state.get("admin_office_view", False):
+    st.title("🏢 DanCleanUK — Admin Dashboard")
+    st.caption("Office planning, payments and reports")
+
+    if st.button("🚗 Return to Driver / Route App", type="primary", use_container_width=True):
+        st.session_state["admin_office_view"] = False
+        st.rerun()
+
+    st.markdown("---")
+
+    admin_tab = st.radio(
+        "Admin section",
+        ["📅 Upcoming Work / Planner", "💷 Outstanding Payments", "🚐 Prepare Route", "📊 Daily Reports"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="admin_dashboard_section",
+    )
+
+    if admin_tab == "📅 Upcoming Work / Planner":
+        st.header("📅 Upcoming Work / Planner")
+        upcoming_records = load_upcoming_work_records()
+        if not upcoming_records:
+            st.info("No recurring work has been created yet. Completed recurring customers will appear here automatically.")
+        else:
+            planner_df = pd.DataFrame(upcoming_records)
+            planner_df["_due"] = pd.to_datetime(planner_df["Next Cleaning Due"], errors="coerce").dt.date
+            planner_df = planner_df[planner_df["_due"].notna()].copy()
+            today = date.today()
+            tomorrow = today + pd.Timedelta(days=1)
+            week_end = today + pd.Timedelta(days=7)
+
+            def _admin_due_group(due):
+                if due < today:
+                    return "Overdue"
+                if due == today:
+                    return "Due Today"
+                if due == tomorrow:
+                    return "Due Tomorrow"
+                if due <= week_end:
+                    return "Due This Week"
+                return "Later"
+
+            planner_df["Due"] = planner_df["_due"].map(_admin_due_group)
+            visible = planner_df[planner_df["Due"] != "Later"].copy()
+            counts = visible["Due"].value_counts() if not visible.empty else {}
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Overdue", int(counts.get("Overdue", 0)))
+            c2.metric("Today", int(counts.get("Due Today", 0)))
+            c3.metric("Tomorrow", int(counts.get("Due Tomorrow", 0)))
+            c4.metric("Next 7 Days", int(len(visible)))
+
+            if visible.empty:
+                next_due = planner_df["_due"].min() if not planner_df.empty else None
+                if next_due:
+                    st.info(f"Nothing is due in the next 7 days. Next due: {next_due.strftime('%d/%m/%Y')}")
+                else:
+                    st.info("No recurring work is due yet.")
+            else:
+                st.metric("Due work value", f"£{float(visible['Price'].sum()):.2f}")
+                display = visible[["Due", "Address", "Postcode", "Price", "Cleaning Plan", "Next Cleaning Due", "Phone", "Notes"]].copy()
+                display["Price"] = display["Price"].map(lambda x: f"£{float(x):.2f}")
+                display["Next Cleaning Due"] = pd.to_datetime(display["Next Cleaning Due"], errors="coerce").dt.strftime("%d/%m/%Y")
+                st.dataframe(display, use_container_width=True, hide_index=True)
+
+    elif admin_tab == "💷 Outstanding Payments":
+        st.header("💷 Outstanding Payments")
+        st.info("This is now the dedicated office area for payment reconciliation. We will move the existing reconciliation controls here next.")
+
+    elif admin_tab == "🚐 Prepare Route":
+        st.header("🚐 Prepare Route")
+        st.info("This is the dedicated office area for selecting work and preparing the next route. The locked V26.13 optimiser is not changed.")
+
+    else:
+        st.header("📊 Daily Reports")
+        st.info("This is now the dedicated office area for completed-work reports and downloads.")
+
+    # Critical separation: nothing from the Driver/Route front renders below.
+    st.stop()
 
 # ============================================================
 # SETTINGS
