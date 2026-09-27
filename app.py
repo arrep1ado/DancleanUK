@@ -24,7 +24,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.9.2-ADMIN-OFFICE-SWITCH"
+APP_VERSION = "27.8.8.4.9.3-PHONE-NOTES-TEXT"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -4980,7 +4980,11 @@ else:
 
             current_notes = clean_val(row.get("Notes"))
             st.markdown("**📝 Job notes 🔒**")
-            st.caption(current_notes if current_notes else "No notes for this job.")
+            note_text = current_notes if current_notes else "No notes for this job."
+            st.markdown(
+                f"<div style=\"font-size:1.05rem;font-weight:700;line-height:1.35;\">{html.escape(note_text)}</div>",
+                unsafe_allow_html=True,
+            )
 
 with st.container(border=True):
     st.write("### 🏁 FINISH — GRANTHAM DEPOT")
