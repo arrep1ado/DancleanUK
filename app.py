@@ -1,4 +1,5 @@
 import io
+import html
 import base64
 import json
 import hashlib
@@ -24,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.9.3-PHONE-NOTES-TEXT"
+APP_VERSION = "27.8.8.4.9.4-DRIVER-APP-FINAL-CLEANUP"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -34,6 +35,24 @@ st.set_page_config(
 )
 
 st.title("🚗 DanCleanUK Daily Route Optimizer")
+
+# Phone presentation: keep office/admin and routine planning clutter off the
+# mobile front. The emergency PLAN BEST DAILY ROUTE control remains available.
+st.markdown(
+    """
+    <style>
+    @media (max-width: 640px) {
+        .st-key-open_admin_office,
+        .st-key-open_upcoming_work_planner,
+        .st-key-daily_route_file_uploader,
+        .st-key-jobs_ready_for_planning_panel {
+            display: none !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.markdown(
     """
@@ -3430,6 +3449,16 @@ if driver_mode:
             h2 { font-size: 1.45rem !important; }
             h3 { font-size: 1.25rem !important; }
             div[data-testid="stVerticalBlockBorderWrapper"] { margin-bottom: 0.35rem; }
+
+            /* Phone = Driver front. Office/admin controls and routine file upload
+               stay off the phone. The emergency PLAN BEST DAILY ROUTE button
+               is deliberately NOT hidden. */
+            .st-key-open_admin_office,
+            .st-key-open_upcoming_work_planner,
+            .st-key-daily_route_file_uploader,
+            .st-key-jobs_ready_for_planning_panel {
+                display: none !important;
+            }
         }
         </style>
         """,
@@ -3440,7 +3469,7 @@ if driver_mode:
 # ADMIN — UPCOMING WORK / PLANNER
 # ============================================================
 
-if not driver_mode:
+if st.session_state.get("admin_office_view", False):
     # Clear office/admin navigation. The planner itself stays in the main area
     # where there is enough room for customer rows and selection controls.
     st.sidebar.markdown("---")
@@ -3604,6 +3633,7 @@ if not driver_mode:
     uploaded_file = st.file_uploader(
         "📁 Upload your day's CSV or Excel file",
         type=["csv", "xlsx"],
+        key="daily_route_file_uploader",
     )
 
 if uploaded_file is not None:
@@ -3807,15 +3837,15 @@ df = st.session_state.master_df
 # there is no active planned route. This is a display/workflow aid only and
 # never changes routing inputs or the optimiser.
 if not driver_mode and not df.empty and not df["route_order"].notna().any():
-    st.markdown("### 📋 Jobs Ready for Planning")
-    ready_cols = [c for c in ["Address", "address_text", "Postcode", "Price", "Phone", "Notes"] if c in df.columns]
-    ready_view = df[ready_cols].copy()
-    if "Address" not in ready_view.columns and "address_text" in ready_view.columns:
-        ready_view = ready_view.rename(columns={"address_text": "Address"})
-    elif "Address" in ready_view.columns and "address_text" in ready_view.columns:
-        ready_view = ready_view.drop(columns=["address_text"], errors="ignore")
-    st.dataframe(ready_view, use_container_width=True, hide_index=True)
-
+    with st.container(key="jobs_ready_for_planning_panel"):
+        st.markdown("### 📋 Jobs Ready for Planning")
+        ready_cols = [c for c in ["Address", "address_text", "Postcode", "Price", "Phone", "Notes"] if c in df.columns]
+        ready_view = df[ready_cols].copy()
+        if "Address" not in ready_view.columns and "address_text" in ready_view.columns:
+            ready_view = ready_view.rename(columns={"address_text": "Address"})
+        elif "Address" in ready_view.columns and "address_text" in ready_view.columns:
+            ready_view = ready_view.drop(columns=["address_text"], errors="ignore")
+        st.dataframe(ready_view, use_container_width=True, hide_index=True)
 
 # ============================================================
 # BENCHMARK / PRODUCTION GEO SAFETY
