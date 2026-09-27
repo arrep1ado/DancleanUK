@@ -24,7 +24,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.1-PHONE-REPORT-CLEANUP"
+APP_VERSION = "27.8.8.4.2-REPORT-SAVE-TIME-HOTFIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -4658,6 +4658,21 @@ completed_df = df[
     df["Status"].astype(str).str.lower() == "completed"
 ].copy()
 
+def uk_display_time(value):
+    """Display stored UTC timestamps in Europe/London without changing stored data."""
+    text = clean_val(value)
+    if not text:
+        return ""
+    try:
+        dt = pd.to_datetime(text).to_pydatetime()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt.astimezone(ZoneInfo("Europe/London")).strftime("%H:%M")
+    except Exception:
+        return text
+
 if not completed_df.empty and not driver_mode:
     st.markdown("---")
     st.subheader("✅ Completed Jobs")
@@ -4676,6 +4691,9 @@ if not completed_df.empty and not driver_mode:
             if column in completed_df.columns
         ]
     ].copy()
+    for time_column in ("PaymentTime", "CompletedTime"):
+        if time_column in show_completed.columns:
+            show_completed[time_column] = show_completed[time_column].apply(uk_display_time)
 
     st.dataframe(
         show_completed,
@@ -4685,11 +4703,11 @@ if not completed_df.empty and not driver_mode:
 
 
 def save_report_to_snapshot(service_date, report_bytes, filename):
-    """Attach a generated XLSX report to an existing saved route.
+    """Attach a generated XLSX report to the already-saved route snapshot.
 
-    Use the same Supabase UPSERT path as route saving. This avoids relying on
-    PATCH behaviour and keeps the exact saved route payload untouched apart
-    from the three report fields below.
+    First use the same upsert path as route saving. If PostgREST rejects the
+    full-row upsert, fall back to a narrow PATCH of route_data only. The route
+    order/jobs and routing metrics are preserved exactly.
     """
     snapshot = load_route_snapshot(service_date)
     if not snapshot:
@@ -4699,6 +4717,10 @@ def save_report_to_snapshot(service_date, report_bytes, filename):
     data["report_b64"] = base64.b64encode(report_bytes).decode("ascii")
     data["report_filename"] = str(filename)
     data["report_saved_at"] = now_text()
+
+    url, _ = _supabase_config()
+    if not url:
+        return False
 
     payload = {
         "route_date": str(service_date),
@@ -4712,11 +4734,9 @@ def save_report_to_snapshot(service_date, report_bytes, filename):
         "updated_at": datetime.now().astimezone().isoformat(),
     }
 
-    url, _ = _supabase_config()
     headers = _supabase_headers("resolution=merge-duplicates,return=minimal")
-    if not url or not headers:
+    if not headers:
         return False
-
     try:
         response = requests.post(
             f"{url}/rest/v1/saved_routes?on_conflict=route_date",
@@ -4724,7 +4744,23 @@ def save_report_to_snapshot(service_date, report_bytes, filename):
             json=payload,
             timeout=30,
         )
-        return response.status_code in (200, 201, 204)
+        if response.status_code in (200, 201, 204):
+            return True
+
+        # Safe fallback: update only report-bearing route_data on the existing
+        # date row. Never create/delete a route and never alter optimiser data.
+        patch_headers = _supabase_headers("return=minimal")
+        patch = requests.patch(
+            f"{url}/rest/v1/saved_routes",
+            headers=patch_headers,
+            params={"route_date": f"eq.{service_date}"},
+            json={
+                "route_data": data,
+                "updated_at": datetime.now().astimezone().isoformat(),
+            },
+            timeout=30,
+        )
+        return patch.status_code in (200, 204)
     except requests.RequestException:
         return False
 
@@ -4781,18 +4817,7 @@ if report_source.empty:
     st.sidebar.caption("Complete at least one job to create today's report.")
 else:
     def report_time(value):
-        text = clean_val(value)
-        if not text:
-            return ""
-        try:
-            dt = pd.to_datetime(text).to_pydatetime()
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            else:
-                dt = dt.astimezone(timezone.utc)
-            return dt.astimezone(ZoneInfo("Europe/London")).strftime("%H:%M")
-        except Exception:
-            return text
+        return uk_display_time(value)
 
     def report_date(value):
         text = clean_val(value)
