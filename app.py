@@ -24,7 +24,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.9.1-ADMIN-PLANNER-VISIBLE"
+APP_VERSION = "27.8.8.4.9.2-ADMIN-OFFICE-SWITCH"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -3361,10 +3361,35 @@ if saved_snapshot is not None and not st.session_state.get("start_new_day_mode",
 if st.session_state.pop("saved_route_notice", None):
     st.success("✅ Saved laptop route loaded exactly as stored.")
 
-# Driver Mode is automatic when a locked laptop route has been loaded.
-# It changes presentation only; routing and saved-route data stay untouched.
-driver_mode = bool(
+# A loaded locked route normally opens in Driver Mode.  The office can switch
+# explicitly to Admin without changing, unlocking or recalculating that route.
+_saved_route_loaded = bool(
     st.session_state.get("route_data", {}).get("saved_route")
+)
+if "admin_office_view" not in st.session_state:
+    st.session_state["admin_office_view"] = False
+
+st.sidebar.markdown("---")
+if st.session_state.get("admin_office_view", False):
+    st.sidebar.subheader("💻 Admin / Office")
+    if _saved_route_loaded and st.sidebar.button(
+        "🚐 Return to Driver Mode",
+        use_container_width=True,
+        key="return_to_driver_mode",
+    ):
+        st.session_state["admin_office_view"] = False
+        st.rerun()
+else:
+    if st.sidebar.button(
+        "💻 Admin / Office",
+        use_container_width=True,
+        key="open_admin_office",
+    ):
+        st.session_state["admin_office_view"] = True
+        st.rerun()
+
+driver_mode = bool(
+    _saved_route_loaded and not st.session_state.get("admin_office_view", False)
 )
 
 if driver_mode:
@@ -3419,7 +3444,6 @@ if not driver_mode:
     # Clear office/admin navigation. The planner itself stays in the main area
     # where there is enough room for customer rows and selection controls.
     st.sidebar.markdown("---")
-    st.sidebar.subheader("💻 Admin")
     if st.sidebar.button("📅 Upcoming Work / Planner", use_container_width=True, key="open_upcoming_work_planner"):
         st.session_state["show_upcoming_work_planner"] = True
 
