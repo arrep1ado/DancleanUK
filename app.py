@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.2-PAYMENT-REFERENCE"
+APP_VERSION = "27.8.8.3.2-PERMANENT-STREET-REGISTRY-AUDITED"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -278,6 +278,41 @@ def load_persistent_geocode(query, postcode):
         return (float(row["latitude"]), float(row["longitude"]))
     except (requests.RequestException, ValueError, TypeError, KeyError):
         return None
+
+
+def _street_registry_postcode(postcode):
+    """Canonical postcode used only by the permanent street registry."""
+    compact = re.sub(r"[^A-Z0-9]", "", clean_val(postcode).upper())
+    if 5 <= len(compact) <= 7:
+        return f"{compact[:-3]} {compact[-3:]}"
+    return normalise_postcode(postcode)
+
+
+def _street_registry_query(street, postcode):
+    """Stable synthetic key for a verified street + postcode routing point."""
+    street_norm = re.sub(r"[^a-z0-9]+", " ", clean_val(street).lower()).strip()
+    postcode_norm = _street_registry_postcode(postcode)
+    if not street_norm or not postcode_norm:
+        return ""
+    return f"__street__:{street_norm}|{postcode_norm}"
+
+
+def load_persistent_street_geocode(street, postcode):
+    """Reuse a street-level point that was verified once and saved permanently."""
+    registry_query = _street_registry_query(street, postcode)
+    postcode_norm = _street_registry_postcode(postcode)
+    if not registry_query or not postcode_norm:
+        return None
+    return load_persistent_geocode(registry_query, postcode_norm)
+
+
+def save_persistent_street_geocode(street, postcode, coords, source="verified_street"):
+    """Persist a verified street point without pretending it is a house pin."""
+    registry_query = _street_registry_query(street, postcode)
+    postcode_norm = _street_registry_postcode(postcode)
+    if not registry_query or not postcode_norm:
+        return False
+    return save_persistent_geocode(registry_query, postcode_norm, coords, source)
 
 
 def save_persistent_geocode(query, postcode, coords, source):
@@ -1439,6 +1474,25 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
             st.session_state.geocode_cache[key] = checked_persistent
             return checked_persistent
 
+    # V27.8.8.3 PERMANENT STREET REGISTRY:
+    # After checking for a permanent exact house pin, if this street + postcode was
+    # already verified on an earlier run, reuse that verified STREET point.
+    # This prevents a known customer street from depending on public geocoder
+    # availability every morning. It remains explicitly street-level: no fake
+    # house offset and no postcode-centre substitution.
+    if expected_house and expected_street and postcode_anchor is not None:
+        persistent_street = load_persistent_street_geocode(expected_street, postcode)
+        checked_street = safe_exact(persistent_street)
+        if checked_street is not None:
+            st.session_state.geocode_cache[key] = checked_street
+            approx = st.session_state.setdefault("approximate_geocodes", {})
+            approx[key] = {
+                "query": query,
+                "postcode": postcode,
+                "level": "street",
+            }
+            return checked_street
+
     # Revalidate cached coordinates under the CURRENT safety rules. This is
     # essential because a previously cached wrong match must not bypass fixes.
     cached = st.session_state.geocode_cache.get(key)
@@ -1518,6 +1572,9 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
             if street_coords is not None:
                 st.session_state.geocode_cache[key] = street_coords
                 save_persistent_geocode(query, postcode, street_coords, "nominatim_street")
+                save_persistent_street_geocode(
+                    expected_street, postcode, street_coords, "nominatim_verified_street"
+                )
                 return street_coords
             time.sleep(0.35)
 
@@ -1549,6 +1606,9 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
                 "postcode": postcode,
                 "level": "street",
             }
+            save_persistent_street_geocode(
+                expected_street, postcode, nearby_street, "nominatim_verified_street"
+            )
             return nearby_street
 
     # V27.8.5 STRICT GEO:
