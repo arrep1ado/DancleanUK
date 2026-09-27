@@ -24,7 +24,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.7.1-SAFE-REPORT-SIDEBAR-CLEANUP"
+APP_VERSION = "27.8.8.4.9-UPCOMING-WORK-PLANNER"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -495,6 +495,98 @@ def load_route_snapshot(service_date):
         return row
     except (requests.RequestException, ValueError, TypeError):
         return None
+
+
+def load_upcoming_work_records():
+    """Return the latest completed recurring-service record for each customer.
+
+    Supabase locked routes remain the source of truth. This is read-only planner
+    retrieval; it never geocodes, optimises or changes a saved route.
+    """
+    url, _ = _supabase_config()
+    headers = _supabase_headers()
+    if not url or not headers:
+        return []
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/saved_routes",
+            headers=headers,
+            params={
+                "select": "route_date,route_data",
+                "order": "route_date.asc",
+                "limit": "1000",
+            },
+            timeout=30,
+        )
+        if response.status_code != 200:
+            return []
+        latest = {}
+        for snapshot in response.json() or []:
+            route_date = clean_val(snapshot.get("route_date"))
+            route_data = snapshot.get("route_data") or {}
+            for job in route_data.get("jobs_data", []) or []:
+                if clean_val(job.get("Status")).lower() != "completed":
+                    continue
+                due = clean_val(job.get("Next Cleaning Due"))
+                plan = normalise_cleaning_plan(job.get("Cleaning Plan"))
+                if not due or not plan:
+                    continue
+                address = clean_val(job.get("Address")) or clean_val(job.get("address_text"))
+                postcode = normalise_postcode(job.get("Postcode"))
+                phone = clean_val(job.get("Phone"))
+                identity = "|".join([address.lower(), postcode.lower(), phone.lower()])
+                if not identity.strip("|"):
+                    continue
+                candidate = {
+                    "source_route_date": route_date,
+                    "source_job_id": clean_val(job.get("job_id")),
+                    "Address": address,
+                    "Postcode": postcode,
+                    "Price": float(job.get("Price", 0) or 0),
+                    "Phone": phone,
+                    "Cleaning Plan": plan,
+                    "Notes": clean_val(job.get("Notes")),
+                    "Next Cleaning Due": due,
+                }
+                previous = latest.get(identity)
+                if previous is None or route_date >= previous["source_route_date"]:
+                    latest[identity] = candidate
+        return list(latest.values())
+    except (requests.RequestException, ValueError, TypeError):
+        return []
+
+
+def reschedule_upcoming_job(source_route_date, source_job_id, new_due_date):
+    """Move one customer's next-due date without touching route order/metrics."""
+    snapshot = load_route_snapshot(source_route_date)
+    if not snapshot or not source_job_id:
+        return False
+    route_data = dict(snapshot.get("route_data") or {})
+    jobs_data = [dict(x) for x in (route_data.get("jobs_data") or [])]
+    changed = False
+    for job in jobs_data:
+        if str(job.get("job_id")) == str(source_job_id):
+            job["Next Cleaning Due"] = str(new_due_date)
+            changed = True
+            break
+    if not changed:
+        return False
+    route_data["jobs_data"] = jobs_data
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=representation")
+    if not url or not headers:
+        return False
+    try:
+        response = requests.patch(
+            f"{url}/rest/v1/saved_routes",
+            headers=headers,
+            params={"route_date": f"eq.{source_route_date}", "select": "route_date"},
+            json={"route_data": route_data, "updated_at": datetime.now(timezone.utc).isoformat()},
+            timeout=30,
+        )
+        return response.status_code == 200 and bool(response.json())
+    except (requests.RequestException, ValueError, TypeError):
+        return False
 
 
 def delete_route_snapshot(service_date):
@@ -3318,6 +3410,143 @@ if driver_mode:
         """,
         unsafe_allow_html=True,
     )
+
+# ============================================================
+# ADMIN — UPCOMING WORK / PLANNER
+# ============================================================
+
+if not driver_mode:
+    with st.expander("📅 Upcoming Work / Planner", expanded=False):
+        upcoming_records = load_upcoming_work_records()
+        if not upcoming_records:
+            st.caption("No recurring work is due yet.")
+        else:
+            planner_df = pd.DataFrame(upcoming_records)
+            planner_df["_due"] = pd.to_datetime(planner_df["Next Cleaning Due"], errors="coerce").dt.date
+            planner_df = planner_df[planner_df["_due"].notna()].copy()
+            today = date.today()
+            week_end = today + pd.Timedelta(days=7)
+
+            def due_group(due):
+                if due < today:
+                    return "Overdue"
+                if due == today:
+                    return "Due Today"
+                if due == today + pd.Timedelta(days=1):
+                    return "Due Tomorrow"
+                if due <= week_end:
+                    return "Due This Week"
+                return "Later"
+
+            planner_df["Due"] = planner_df["_due"].map(due_group)
+            visible = planner_df[planner_df["Due"] != "Later"].copy()
+            if visible.empty:
+                next_due = planner_df["_due"].min() if not planner_df.empty else None
+                if next_due:
+                    st.caption(f"Nothing due in the next 7 days. Next due: {next_due.strftime('%d/%m/%Y')}")
+                else:
+                    st.caption("No recurring work is due yet.")
+            else:
+                counts = visible["Due"].value_counts()
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Overdue", int(counts.get("Overdue", 0)))
+                c2.metric("Today", int(counts.get("Due Today", 0)))
+                c3.metric("Tomorrow", int(counts.get("Due Tomorrow", 0)))
+                c4.metric("7 Days", len(visible))
+                st.caption(f"Work due value: £{float(visible['Price'].sum()):.2f}")
+
+                editor = visible[[
+                    "Address", "Postcode", "Price", "Cleaning Plan",
+                    "Next Cleaning Due", "Notes", "Due",
+                    "source_route_date", "source_job_id", "Phone"
+                ]].copy()
+                editor.insert(0, "Select", False)
+                edited = st.data_editor(
+                    editor,
+                    hide_index=True,
+                    use_container_width=True,
+                    disabled=[
+                        "Address", "Postcode", "Price", "Cleaning Plan",
+                        "Next Cleaning Due", "Notes", "Due",
+                        "source_route_date", "source_job_id", "Phone"
+                    ],
+                    column_config={
+                        "Select": st.column_config.CheckboxColumn("Select"),
+                        "Price": st.column_config.NumberColumn("Price", format="£%.2f"),
+                        "source_route_date": None,
+                        "source_job_id": None,
+                        "Phone": None,
+                    },
+                    key="upcoming_work_editor",
+                )
+                selected = edited[edited["Select"] == True].copy()
+                selected_value = float(selected["Price"].sum()) if not selected.empty else 0.0
+                st.caption(f"Selected: {len(selected)} job(s) — £{selected_value:.2f}")
+
+                if not selected.empty:
+                    target_day = st.date_input(
+                        "Prepare selected work for",
+                        value=service_date,
+                        key="planner_target_day",
+                    )
+                    if st.button("🚐 Prepare Route", type="primary", use_container_width=True, key="prepare_upcoming_route"):
+                        target_str = target_day.isoformat()
+                        if load_route_snapshot(target_str) is not None:
+                            st.error("That date already has a permanent saved route. Choose another route date.")
+                        else:
+                            prepared = selected.copy().reset_index(drop=True)
+                            prepared["Dates"] = target_str
+                            prepared["service_date"] = target_str
+                            prepared["Status"] = "pending"
+                            prepared["Payment"] = "Waiting"
+                            prepared["PaymentTime"] = ""
+                            prepared["CompletedTime"] = ""
+                            prepared["Next Cleaning Due"] = ""
+                            prepared["route_order"] = None
+                            prepared["latitude"] = None
+                            prepared["longitude"] = None
+                            prepared["geo_query"] = ""
+                            prepared["created_at"] = now_text()
+                            prepared["address_text"] = prepared["Address"].fillna("").astype(str)
+                            prepared["job_id"] = [
+                                make_job_id(target_str, i + 1, r["Postcode"], r["Phone"])
+                                for i, (_, r) in enumerate(prepared.iterrows())
+                            ]
+                            keep_cols = [
+                                "Dates", "Postcode", "Address", "Price", "Phone",
+                                "Cleaning Plan", "Notes", "job_id", "service_date",
+                                "Status", "Payment", "PaymentTime", "CompletedTime",
+                                "Next Cleaning Due", "route_order", "address_text",
+                                "latitude", "longitude", "geo_query", "created_at"
+                            ]
+                            prepared = prepared[keep_cols]
+                            delete_day(target_str)
+                            save_dataframe(prepared)
+                            st.session_state.master_df = prepared
+                            st.session_state.service_date = target_str
+                            st.session_state.pop("route_data", None)
+                            st.session_state.pop("failed_jobs", None)
+                            st.session_state.start_new_day_mode = True
+                            st.session_state.replace_saved_route_allowed = False
+                            st.success(f"{len(prepared)} job(s) prepared for {target_day.strftime('%d/%m/%Y')}.")
+                            st.rerun()
+
+                    move_row = selected.iloc[0]
+                    move_date = st.date_input(
+                        "Move first selected customer to",
+                        value=pd.to_datetime(move_row["Next Cleaning Due"]).date(),
+                        key="planner_move_date",
+                    )
+                    if st.button("📆 Move to Another Day", use_container_width=True, key="move_upcoming_job"):
+                        if reschedule_upcoming_job(
+                            move_row["source_route_date"],
+                            move_row["source_job_id"],
+                            move_date.isoformat(),
+                        ):
+                            st.success("Customer moved.")
+                            st.rerun()
+                        else:
+                            st.error("The due date could not be updated.")
 
 # ============================================================
 # FILE UPLOAD
