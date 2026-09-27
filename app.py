@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.2-ADMIN-CUSTOMERS-PAYMENTS-REPORTS"
+APP_VERSION = "27.8.8.5.0.3-ADMIN-CUSTOMER-CARDS-ZONES"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -907,6 +907,81 @@ def _admin_mark_job_paid(route_date, job_id):
         return False
 
 
+
+def _admin_auto_zone(postcode):
+    """Stable admin-only geographic bucket from the UK outward postcode."""
+    pc = normalise_postcode(postcode)
+    return pc.split()[0] if pc else "Unzoned"
+
+
+def _admin_load_customer_records():
+    """Load manually maintained permanent customers. Empty list if table is not installed yet."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers()
+    if not url or not headers:
+        return []
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            params={"select": "*", "active": "eq.true", "order": "address.asc"},
+            timeout=20,
+        )
+        if response.status_code != 200:
+            return []
+        return response.json() or []
+    except (requests.RequestException, ValueError, TypeError):
+        return []
+
+
+def _admin_customer_table_ready():
+    url, _ = _supabase_config()
+    headers = _supabase_headers()
+    if not url or not headers:
+        return False
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            params={"select": "id", "limit": "1"},
+            timeout=12,
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _admin_add_customer(address, postcode, phone, price, cleaning_plan, next_due, notes):
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=representation")
+    if not url or not headers:
+        return False, "Supabase is not configured."
+    pc = normalise_postcode(postcode)
+    payload = {
+        "address": clean_val(address),
+        "postcode": pc,
+        "phone": clean_val(phone),
+        "price": float(price or 0),
+        "cleaning_plan": normalise_cleaning_plan(cleaning_plan),
+        "next_cleaning_due": next_due.isoformat() if next_due else None,
+        "notes": clean_val(notes),
+        "zone": _admin_auto_zone(pc),
+        "active": True,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        response = requests.post(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+        if response.status_code in (200, 201):
+            return True, ""
+        return False, "Customer storage is not ready. Run the supplied Supabase setup SQL once."
+    except requests.RequestException:
+        return False, "Could not save the customer. Please try again."
+
 def _admin_customer_rows(routes):
     """Build one latest permanent customer record from saved route history."""
     latest = {}
@@ -1060,18 +1135,105 @@ if st.session_state.get("admin_office_view", False):
 
     else:
         st.header("👥 Customers")
-        customers = _admin_customer_rows(routes)
-        if not customers:
-            st.info("No customers have been recorded yet. Customers will build automatically from permanent saved routes.")
+        st.caption("Permanent customer book · automatically grouped into postcode zones")
+
+        if "admin_add_customer_open" not in st.session_state:
+            st.session_state["admin_add_customer_open"] = False
+
+        top1, top2 = st.columns([3, 1])
+        manual_customers = _admin_load_customer_records()
+        history_customers = _admin_customer_rows(routes)
+        top1.metric("Customers", len(manual_customers) if manual_customers else len(history_customers))
+        if top2.button("➕ Add Customer", type="primary", use_container_width=True, key="admin_add_customer_button"):
+            st.session_state["admin_add_customer_open"] = not st.session_state["admin_add_customer_open"]
+
+        if st.session_state["admin_add_customer_open"]:
+            with st.container(border=True):
+                st.subheader("➕ Add Customer")
+                with st.form("admin_add_customer_form", clear_on_submit=False):
+                    c1, c2 = st.columns([2, 1])
+                    address = c1.text_input("Address *", placeholder="e.g. 10 High Street")
+                    postcode = c2.text_input("Postcode *", placeholder="e.g. NG31 9RA")
+                    c3, c4, c5 = st.columns(3)
+                    phone = c3.text_input("Phone")
+                    price = c4.number_input("Normal price (£)", min_value=0.0, step=1.0, value=20.0)
+                    cleaning_plan = c5.selectbox("Cleaning Plan", ["", "1 Month", "2 Months", "3 Months", "4 Months", "6 Months", "12 Months"])
+                    use_due = st.checkbox("Set Next Cleaning Due now", value=False)
+                    next_due = st.date_input("Next Cleaning Due", value=date.today()) if use_due else None
+                    notes = st.text_area("Notes", height=90)
+                    preview_zone = _admin_auto_zone(postcode) if postcode else "—"
+                    st.caption(f"Automatic zone: {preview_zone}")
+                    submitted = st.form_submit_button("💾 Save Customer", type="primary", use_container_width=True)
+                    if submitted:
+                        if not clean_val(address) or not normalise_postcode(postcode):
+                            st.error("Address and postcode are required.")
+                        else:
+                            ok, message = _admin_add_customer(address, postcode, phone, price, cleaning_plan, next_due, notes)
+                            if ok:
+                                st.session_state["admin_add_customer_open"] = False
+                                st.rerun()
+                            else:
+                                st.error(message)
+
+        if manual_customers:
+            cards = []
+            for row in manual_customers:
+                cards.append({
+                    "Address": clean_val(row.get("address")),
+                    "Postcode": normalise_postcode(row.get("postcode")),
+                    "Phone": clean_val(row.get("phone")),
+                    "Price": float(row.get("price", 0) or 0),
+                    "Cleaning Plan": normalise_cleaning_plan(row.get("cleaning_plan")),
+                    "Next Cleaning Due": clean_val(row.get("next_cleaning_due")),
+                    "Notes": clean_val(row.get("notes")),
+                    "Zone": clean_val(row.get("zone")) or _admin_auto_zone(row.get("postcode")),
+                })
         else:
-            customer_df = pd.DataFrame(customers)
-            customer_df = customer_df.sort_values(["Address", "Postcode"], na_position="last").reset_index(drop=True)
-            st.metric("Customers", len(customer_df))
-            display = customer_df[["Address", "Postcode", "Phone", "Price", "Cleaning Plan", "Next Cleaning Due", "Notes", "Last Service"]].copy()
-            display["Price"] = display["Price"].map(lambda x: f"£{float(x):.2f}")
-            for col in ["Next Cleaning Due", "Last Service"]:
-                display[col] = pd.to_datetime(display[col], errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            cards = []
+            for row in history_customers:
+                item = dict(row)
+                item["Zone"] = _admin_auto_zone(item.get("Postcode"))
+                cards.append(item)
+            if cards and not _admin_customer_table_ready():
+                st.info("These customers are from saved route history. Run the supplied one-time Supabase customer setup before using Add Customer.")
+
+        if not cards:
+            st.info("No customers yet. Use ➕ Add Customer to create the first one.")
+        else:
+            zone_names = sorted({clean_val(x.get("Zone")) or "Unzoned" for x in cards})
+            selected_zone = st.selectbox("Zone", ["All zones"] + zone_names, key="admin_customer_zone_filter")
+            search_customer = st.text_input("Search customers", placeholder="Address, postcode or phone", key="admin_customer_search").strip().casefold()
+            visible_cards = []
+            for item in cards:
+                zone = clean_val(item.get("Zone")) or "Unzoned"
+                haystack = " ".join([clean_val(item.get("Address")), normalise_postcode(item.get("Postcode")), clean_val(item.get("Phone"))]).casefold()
+                if selected_zone != "All zones" and zone != selected_zone:
+                    continue
+                if search_customer and search_customer not in haystack:
+                    continue
+                visible_cards.append(item)
+
+            st.caption(f"Showing {len(visible_cards)} customer(s)")
+            for idx, customer in enumerate(sorted(visible_cards, key=lambda x: (clean_val(x.get("Zone")), clean_val(x.get("Address"))))):
+                with st.container(border=True):
+                    left, middle, right = st.columns([4, 2, 2])
+                    address = clean_val(customer.get("Address")) or "Customer"
+                    pc = normalise_postcode(customer.get("Postcode"))
+                    phone = clean_val(customer.get("Phone")) or "—"
+                    price = float(customer.get("Price", 0) or 0)
+                    plan = normalise_cleaning_plan(customer.get("Cleaning Plan")) or "No plan"
+                    due = clean_val(customer.get("Next Cleaning Due"))
+                    try:
+                        due = pd.to_datetime(due).strftime("%d/%m/%Y") if due else "—"
+                    except Exception:
+                        due = due or "—"
+                    zone = clean_val(customer.get("Zone")) or _admin_auto_zone(pc)
+                    notes = clean_val(customer.get("Notes"))
+                    left.markdown(f"**{address}**  \n{pc} · 📞 {phone}")
+                    middle.markdown(f"**£{price:.2f}**  \n{plan} · Next: {due}")
+                    right.markdown(f"**📍 Zone {zone}**")
+                    if notes:
+                        st.caption(f"Notes: {notes}")
 
     # Critical separation: nothing from the locked Driver/Route front renders below.
     st.stop()
