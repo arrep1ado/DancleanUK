@@ -6,7 +6,8 @@ import math
 import re
 import sqlite3
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timezone
+from zoneinfo import ZoneInfo
 from functools import lru_cache
 from urllib.parse import quote
 
@@ -23,7 +24,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4-STEP1-BUSINESS-WORKFLOW"
+APP_VERSION = "27.8.8.4.1-PHONE-REPORT-CLEANUP"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -4413,6 +4414,13 @@ else:
             "created_at",
             "notes",
             "_route_sort",
+            "whatsappsent",
+            "whatsapptime",
+            "messageopened",
+            "messageconfirmed",
+            "messageconfirmedtime",
+            "messagemethod",
+            "messagetime",
         }
 
         for column in row.index:
@@ -4615,10 +4623,7 @@ else:
                             use_container_width=True,
                         )
 
-                    if message_confirmed:
-                        st.success("✅ Text Message confirmed sent — message button locked. Complete is unlocked.")
-                    elif message_opened:
-                        st.info("Text Message opened. After you press Send, come back here and confirm below.")
+                    if (not message_confirmed) and message_opened:
                         if st.button(
                             "☑️ Message sent",
                             key=f"confirm_message_sent_{row['job_id']}",
@@ -4626,45 +4631,12 @@ else:
                         ):
                             confirm_payment_message_sent(row["job_id"])
                             st.rerun()
-                    else:
-                        st.caption("Open Text Message, press Send there, then return here and confirm Message sent.")
                 else:
                     st.warning("No phone number is stored for this customer, so a payment message cannot be prepared.")
 
             current_notes = clean_val(row.get("Notes"))
-            edit_key = f"edit_notes_{row['job_id']}"
-            if not st.session_state.get(edit_key, False):
-                st.markdown("**📝 Job notes 🔒**")
-                st.caption(current_notes if current_notes else "No notes for this job.")
-                if st.button(
-                    "✏️ Edit Notes",
-                    key=f"open_notes_{row['job_id']}",
-                    use_container_width=True,
-                ):
-                    st.session_state[edit_key] = True
-                    st.rerun()
-            else:
-                notes_value = st.text_area(
-                    "📝 Edit job notes",
-                    value=current_notes,
-                    key=f"notes_{row['job_id']}",
-                    placeholder="e.g. Full house, front + back, gate code, access details…",
-                    height=70,
-                )
-                if st.button(
-                    "💾 Save / Lock Notes 🔒",
-                    key=f"save_notes_{row['job_id']}",
-                    use_container_width=True,
-                ):
-                    master_idx = df.index[df["job_id"].astype(str) == str(row["job_id"])][0]
-                    df.at[master_idx, "Notes"] = notes_value.strip()
-                    save_job(df.loc[master_idx])
-                    st.session_state.master_df = df
-                    current_route_data = st.session_state.get("route_data")
-                    if current_route_data and current_route_data.get("saved_route"):
-                        save_route_snapshot(service_date_str, df, current_route_data)
-                    st.session_state[edit_key] = False
-                    st.rerun()
+            st.markdown("**📝 Job notes 🔒**")
+            st.caption(current_notes if current_notes else "No notes for this job.")
 
 with st.container(border=True):
     st.write("### 🏁 FINISH — GRANTHAM DEPOT")
@@ -4813,8 +4785,12 @@ else:
         if not text:
             return ""
         try:
-            dt = pd.to_datetime(text)
-            return dt.strftime("%H:%M")
+            dt = pd.to_datetime(text).to_pydatetime()
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.astimezone(ZoneInfo("Europe/London")).strftime("%H:%M")
         except Exception:
             return text
 
@@ -4851,7 +4827,7 @@ else:
         address = clean_val(r.get("Address")) or clean_val(r.get("address_text"))
 
         rows.append({
-            "Route Order": report_number,
+            "Order": report_number,
             "Address": address,
             "Postcode": clean_val(r.get("Postcode")),
             "Price": float(r.get("Price", 0) or 0),
@@ -4891,7 +4867,7 @@ else:
             report_ws.cell(row=row_no, column=price_col).number_format = '£0.00'
 
     widths = {
-        "Route Order": 12, "Address": 30, "Postcode": 13, "Price": 11, "Phone": 16,
+        "Order": 9, "Address": 30, "Postcode": 13, "Price": 11, "Phone": 16,
         "Payment Method": 18, "Payment Status": 17, "Payment Time": 14,
         "Completion Status": 18, "Completed Time": 15, "Notes": 32,
         "Message": 12, "Sent Time": 12, "Service Date": 14,
@@ -4909,16 +4885,12 @@ else:
     summary_start = report_ws.max_row + 3
     summary_rows = [
         ["DanCleanUK Daily Summary", ""],
-        ["Service Date", report_date(service_date_str)],
+        ["Date", report_date(service_date_str)],
         ["Completed Jobs", len(report_df)],
-        ["Completed Revenue", completed_revenue],
+        ["Revenue", completed_revenue],
         ["Cash Received", cash_received],
         ["Bank Transfer Received", bank_received],
         ["Outstanding", outstanding],
-        ["Planned Route Miles", route_data["miles"] if route_data else 0],
-        ["Planned Route Driving Time", format_duration(route_data["time"]) if route_data else "0m"],
-        ["Planned Route Fuel Cost", route_data["fuel_cost"] if route_data else 0],
-        ["Planned Route Fuel Used (litres)", route_data["litres"] if route_data else 0],
     ]
     for offset, values in enumerate(summary_rows):
         row_num = summary_start + offset
