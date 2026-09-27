@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.9.8-CLEAN-DRIVER-INTERFACE"
+APP_VERSION = "27.8.8.4.9.9-PHONE-SETTINGS-FIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -834,8 +834,8 @@ def calculate_next_cleaning_due(service_date_value, cleaning_plan):
 # SETTINGS
 # ============================================================
 
-with st.container(key="phone_hide_driver_settings"):
-    st.sidebar.title("⚙️ Settings")
+with st.sidebar.container(key="phone_hide_driver_settings"):
+    st.title("⚙️ Settings")
 
     service_date = st.sidebar.date_input(
         "Route date",
