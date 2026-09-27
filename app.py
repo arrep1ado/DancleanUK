@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.9.7-DRIVER-PHONE-FINAL-CLEAN"
+APP_VERSION = "27.8.8.4.9.8-CLEAN-DRIVER-INTERFACE"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -41,6 +41,7 @@ st.title("🚗 DanCleanUK Daily Route Optimizer")
 st.markdown(
     """
     <style>
+    .danclean-phone-progress { display: none; }
     @media (max-width: 640px) {
         .st-key-open_admin_office,
         .st-key-open_upcoming_work_planner,
@@ -50,9 +51,12 @@ st.markdown(
         .st-key-phone_hide_new_day_info,
         .st-key-phone_hide_street_warning,
         .st-key-phone_hide_unpaid_warning,
-        .st-key-phone_hide_ors_success {
+        .st-key-phone_hide_ors_success,
+        .st-key-phone_hide_driver_settings,
+        .st-key-phone_hide_daily_summary {
             display: none !important;
         }
+        .danclean-phone-progress { display: block !important; }
         section[data-testid="stSidebar"] hr {
             margin-top: 0.35rem !important;
             margin-bottom: 0.35rem !important;
@@ -830,56 +834,57 @@ def calculate_next_cleaning_due(service_date_value, cleaning_plan):
 # SETTINGS
 # ============================================================
 
-st.sidebar.title("⚙️ Settings")
+with st.container(key="phone_hide_driver_settings"):
+    st.sidebar.title("⚙️ Settings")
 
-service_date = st.sidebar.date_input(
-    "Route date",
-    value=date.fromisoformat(st.session_state.service_date),
-)
-service_date_str = service_date.isoformat()
-
-if service_date_str != st.session_state.service_date:
-    st.session_state.service_date = service_date_str
-    st.session_state.pop("master_df", None)
-    st.session_state.pop("route_data", None)
-    st.session_state.pop("failed_jobs", None)
-    # Leaving a reset/new-day screen for another date starts a clean session.
-    st.session_state.pop("start_new_day_mode", None)
-    st.rerun()
-
-DEPOT_POSTCODE = st.sidebar.text_input(
-    "Depot Postcode",
-    value="NG31 9RA",
-)
-
-DEPOT_FULL_ADDRESS = st.sidebar.text_input(
-    "Depot Address",
-    value="192 Queensway, Grantham NG31 9RA",
-)
-
-FUEL_PRICE = st.sidebar.number_input(
-    "Fuel Price (£/litre)",
-    min_value=0.01,
-    value=1.50,
-    step=0.01,
-)
-
-MPG = st.sidebar.number_input(
-    "Vehicle MPG",
-    min_value=1.0,
-    value=30.0,
-    step=0.1,
-)
-
-TAX_RATE = (
-    st.sidebar.slider(
-        "Tax Deduction (%)",
-        0,
-        50,
-        20,
+    service_date = st.sidebar.date_input(
+        "Route date",
+        value=date.fromisoformat(st.session_state.service_date),
     )
-    / 100
-)
+    service_date_str = service_date.isoformat()
+
+    if service_date_str != st.session_state.service_date:
+        st.session_state.service_date = service_date_str
+        st.session_state.pop("master_df", None)
+        st.session_state.pop("route_data", None)
+        st.session_state.pop("failed_jobs", None)
+        # Leaving a reset/new-day screen for another date starts a clean session.
+        st.session_state.pop("start_new_day_mode", None)
+        st.rerun()
+
+    DEPOT_POSTCODE = st.sidebar.text_input(
+        "Depot Postcode",
+        value="NG31 9RA",
+    )
+
+    DEPOT_FULL_ADDRESS = st.sidebar.text_input(
+        "Depot Address",
+        value="192 Queensway, Grantham NG31 9RA",
+    )
+
+    FUEL_PRICE = st.sidebar.number_input(
+        "Fuel Price (£/litre)",
+        min_value=0.01,
+        value=1.50,
+        step=0.01,
+    )
+
+    MPG = st.sidebar.number_input(
+        "Vehicle MPG",
+        min_value=1.0,
+        value=30.0,
+        step=0.1,
+    )
+
+    TAX_RATE = (
+        st.sidebar.slider(
+            "Tax Deduction (%)",
+            0,
+            50,
+            20,
+        )
+        / 100
+    )
 
 # Business identity remains internal; no pointless editable sidebar field.
 BUSINESS_NAME = "DanCleanUK"
@@ -4545,9 +4550,6 @@ if (
 route_data = st.session_state.get("route_data")
 
 if route_data:
-    st.markdown("---")
-    st.subheader("💰 Daily Route Summary")
-
     customer_df = df.copy()
 
     total_jobs = len(customer_df)
@@ -4575,50 +4577,61 @@ if route_data:
         .sum()
     )
 
-    if driver_mode:
-        st.markdown(
-            f"""
-            <div style="border:1px solid rgba(128,128,128,.35);border-radius:12px;
-                        padding:.75rem .9rem;margin:.25rem 0 .65rem 0;">
-              <div style="font-size:1.05rem;font-weight:700;margin-bottom:.45rem;">📱 Driver Mode</div>
-              <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.45rem;text-align:center;">
-                <div><b>{max(total_jobs - completed_jobs, 0)}</b><br><span style="font-size:.78rem;opacity:.75">Remaining</span></div>
-                <div><b>{route_data['miles']:.1f} mi</b><br><span style="font-size:.78rem;opacity:.75">Distance</span></div>
-                <div><b>{format_duration(route_data['time'])}</b><br><span style="font-size:.78rem;opacity:.75">Driving</span></div>
-                <div><b>{completed_jobs}</b><br><span style="font-size:.78rem;opacity:.75">Done</span></div>
-                <div><b>{paid_jobs}</b><br><span style="font-size:.78rem;opacity:.75">Paid</span></div>
-                <div><b>£{route_data['take_home']:.2f}</b><br><span style="font-size:.78rem;opacity:.75">Take-home</span></div>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Take-Home", f"£{route_data['take_home']:.2f}")
-        with c2:
-            st.metric("Revenue", f"£{route_data['revenue']:.2f}")
+    with st.container(key="phone_hide_daily_summary"):
+        st.markdown("---")
+        st.subheader("💰 Daily Route Summary")
+        if driver_mode:
+            st.markdown(
+                f"""
+                <div style="border:1px solid rgba(128,128,128,.35);border-radius:12px;
+                            padding:.75rem .9rem;margin:.25rem 0 .65rem 0;">
+                  <div style="font-size:1.05rem;font-weight:700;margin-bottom:.45rem;">📱 Driver Mode</div>
+                  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.45rem;text-align:center;">
+                    <div><b>{max(total_jobs - completed_jobs, 0)}</b><br><span style="font-size:.78rem;opacity:.75">Remaining</span></div>
+                    <div><b>{route_data['miles']:.1f} mi</b><br><span style="font-size:.78rem;opacity:.75">Distance</span></div>
+                    <div><b>{format_duration(route_data['time'])}</b><br><span style="font-size:.78rem;opacity:.75">Driving</span></div>
+                    <div><b>{completed_jobs}</b><br><span style="font-size:.78rem;opacity:.75">Done</span></div>
+                    <div><b>{paid_jobs}</b><br><span style="font-size:.78rem;opacity:.75">Paid</span></div>
+                    <div><b>£{route_data['take_home']:.2f}</b><br><span style="font-size:.78rem;opacity:.75">Take-home</span></div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("Take-Home", f"£{route_data['take_home']:.2f}")
+            with c2:
+                st.metric("Revenue", f"£{route_data['revenue']:.2f}")
 
-        c3, c4 = st.columns(2)
-        with c3:
-            st.metric("Driving Distance", f"{route_data['miles']:.1f} miles")
-        with c4:
-            st.metric("Driving Time", format_duration(route_data["time"]))
+            c3, c4 = st.columns(2)
+            with c3:
+                st.metric("Driving Distance", f"{route_data['miles']:.1f} miles")
+            with c4:
+                st.metric("Driving Time", format_duration(route_data["time"]))
 
-        c5, c6 = st.columns(2)
-        with c5:
-            st.metric("Fuel Cost", f"£{route_data['fuel_cost']:.2f}")
-        with c6:
-            st.metric("Fuel Used", f"{route_data['litres']:.1f} litres")
+            c5, c6 = st.columns(2)
+            with c5:
+                st.metric("Fuel Cost", f"£{route_data['fuel_cost']:.2f}")
+            with c6:
+                st.metric("Fuel Used", f"{route_data['litres']:.1f} litres")
 
-        c7, c8, c9 = st.columns(3)
-        with c7:
-            st.metric("Jobs Routed", route_data.get("jobs", 0))
-        with c8:
-            st.metric("Completed", completed_jobs)
-        with c9:
-            st.metric("Paid", paid_jobs)
+            c7, c8, c9 = st.columns(3)
+            with c7:
+                st.metric("Jobs Routed", route_data.get("jobs", 0))
+            with c8:
+                st.metric("Completed", completed_jobs)
+            with c9:
+                st.metric("Paid", paid_jobs)
+
+
+    st.markdown(
+        f"""<div class="danclean-phone-progress" style="font-size:1.05rem;font-weight:700;margin:.35rem 0 .65rem 0;">
+        ✅ Completed {completed_jobs} / {total_jobs}
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
     if unpaid_jobs:
         with st.container(key="phone_hide_unpaid_warning"):
