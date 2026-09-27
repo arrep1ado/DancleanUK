@@ -23,7 +23,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.3.2-PERMANENT-STREET-REGISTRY-AUDITED"
+APP_VERSION = "27.8.8.3.3-DEPOT-STREET-REGISTRY-HOTFIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1400,6 +1400,14 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
         tail = query[house_match.end():]
         expected_street = tail.split(",")[0].strip()
 
+    # The depot has its own protected start/finish geocoding path. Never let
+    # a customer street-registry point replace the depot coordinate after a
+    # reboot, even when the depot shares the same street and postcode.
+    is_depot = (
+        normalise_postcode(postcode) == normalise_postcode(DEPOT_POSTCODE)
+        and str(query).strip().casefold() == str(DEPOT_FULL_ADDRESS).strip().casefold()
+    )
+
     postcode_anchor = get_postcode_coords(postcode)
     terminated_postcode_anchor = (
         None if postcode_anchor is not None
@@ -1480,7 +1488,7 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
     # This prevents a known customer street from depending on public geocoder
     # availability every morning. It remains explicitly street-level: no fake
     # house offset and no postcode-centre substitution.
-    if expected_house and expected_street and postcode_anchor is not None:
+    if expected_house and expected_street and postcode_anchor is not None and not is_depot:
         persistent_street = load_persistent_street_geocode(expected_street, postcode)
         checked_street = safe_exact(persistent_street)
         if checked_street is not None:
@@ -1589,10 +1597,6 @@ def get_coords(query_string, postcode, allow_postcode_fallback=False):
     # individual building point is unavailable. Customer houses on the same
     # street may legitimately share one verified street-level routing point;
     # we do NOT invent house-number offsets.
-    is_depot = (
-        normalise_postcode(postcode) == normalise_postcode(DEPOT_POSTCODE)
-        and str(query).strip().casefold() == str(DEPOT_FULL_ADDRESS).strip().casefold()
-    )
     if expected_house and expected_street and postcode_anchor is not None and not allow_postcode_fallback and not is_depot:
         nearby_street = nominatim_nearby_street_geocode(
             expected_street, postcode_anchor, headers
