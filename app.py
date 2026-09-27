@@ -24,7 +24,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.4.3-LIVE-CROSS-DEVICE-PROGRESS"
+APP_VERSION = "27.8.8.4.4-CLEANING-PLAN-NEXT-DUE"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -76,6 +76,8 @@ def init_db():
             longitude REAL,
             geo_query TEXT,
             notes TEXT NOT NULL DEFAULT '',
+            cleaning_plan TEXT NOT NULL DEFAULT '',
+            next_cleaning_due TEXT,
             created_at TEXT NOT NULL
         )
         """
@@ -83,6 +85,10 @@ def init_db():
     columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
     if "notes" not in columns:
         conn.execute("ALTER TABLE jobs ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
+    if "cleaning_plan" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN cleaning_plan TEXT NOT NULL DEFAULT ''")
+    if "next_cleaning_due" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN next_cleaning_due TEXT")
     conn.commit()
     conn.close()
 
@@ -95,9 +101,9 @@ def save_job(row):
             job_id, service_date, postcode, price, phone,
             status, payment, payment_time, completed_time,
             route_order, address_text, latitude, longitude,
-            geo_query, notes, created_at
+            geo_query, notes, cleaning_plan, next_cleaning_due, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(job_id) DO UPDATE SET
             service_date=excluded.service_date,
             postcode=excluded.postcode,
@@ -112,7 +118,9 @@ def save_job(row):
             latitude=excluded.latitude,
             longitude=excluded.longitude,
             geo_query=excluded.geo_query,
-            notes=excluded.notes
+            notes=excluded.notes,
+            cleaning_plan=excluded.cleaning_plan,
+            next_cleaning_due=excluded.next_cleaning_due
         """,
         (
             str(row["job_id"]),
@@ -130,6 +138,8 @@ def save_job(row):
             safe_float(row.get("longitude")),
             str(row.get("geo_query", "")),
             str(row.get("Notes", row.get("notes", "")) or ""),
+            str(row.get("Cleaning Plan", row.get("cleaning_plan", "")) or ""),
+            clean_optional(row.get("Next Cleaning Due", row.get("next_cleaning_due"))),
             str(row.get("created_at", datetime.now().isoformat())),
         ),
     )
@@ -179,6 +189,8 @@ def load_day(service_date):
             "payment_time": "PaymentTime",
             "completed_time": "CompletedTime",
             "notes": "Notes",
+            "cleaning_plan": "Cleaning Plan",
+            "next_cleaning_due": "Next Cleaning Due",
         }
     )
 
@@ -195,6 +207,8 @@ def load_day(service_date):
         "longitude": None,
         "geo_query": "",
         "Notes": "",
+        "Cleaning Plan": "",
+        "Next Cleaning Due": "",
     }
     for column, default in defaults.items():
         if column not in loaded.columns:
@@ -207,6 +221,8 @@ def load_day(service_date):
     loaded["address_text"] = loaded["address_text"].fillna("")
     loaded["geo_query"] = loaded["geo_query"].fillna("")
     loaded["Notes"] = loaded["Notes"].fillna("")
+    loaded["Cleaning Plan"] = loaded["Cleaning Plan"].fillna("")
+    loaded["Next Cleaning Due"] = loaded["Next Cleaning Due"].fillna("")
 
     return loaded
 
@@ -523,6 +539,7 @@ def apply_saved_route_snapshot(service_date):
     for column, default in {
         "Status": "pending", "Payment": "Waiting", "PaymentTime": "",
         "CompletedTime": "", "address_text": "", "geo_query": "", "Notes": "",
+        "Cleaning Plan": "", "Next Cleaning Due": "",
         "WhatsAppSent": False, "WhatsAppTime": "",
         "MessageOpened": False, "MessageConfirmed": False, "MessageConfirmedTime": "",
     }.items():
@@ -656,6 +673,33 @@ def make_job_id(service_date, row_number, postcode, phone):
 
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def normalise_cleaning_plan(value):
+    """Return a clean calendar-month plan such as '1 Month' or '3 Months'."""
+    text = clean_val(value).strip()
+    if not text:
+        return ""
+    match = re.fullmatch(r"(\d+)\s*(?:month|months|m)", text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    months = int(match.group(1))
+    if months < 1 or months > 24:
+        return ""
+    return f"{months} Month" if months == 1 else f"{months} Months"
+
+
+def calculate_next_cleaning_due(service_date_value, cleaning_plan):
+    """Calculate the next due date using calendar months, never fixed 30-day blocks."""
+    plan = normalise_cleaning_plan(cleaning_plan)
+    if not plan:
+        return ""
+    try:
+        months = int(plan.split()[0])
+        service = pd.Timestamp(str(service_date_value)).normalize()
+        return (service + pd.DateOffset(months=months)).date().isoformat()
+    except Exception:
+        return ""
 
 
 # ============================================================
@@ -3385,6 +3429,12 @@ if uploaded_file is not None:
             df["Payment"] = "Waiting"
             df["PaymentTime"] = ""
             df["CompletedTime"] = ""
+            # Optional recurring-service metadata. Unknown/blank plans stay blank; never guess.
+            if "Cleaning Plan" not in df.columns:
+                df["Cleaning Plan"] = ""
+            else:
+                df["Cleaning Plan"] = df["Cleaning Plan"].map(normalise_cleaning_plan)
+            df["Next Cleaning Due"] = ""
             # Notes may be supplied in the daily route spreadsheet. Keep them
             # with the customer from import -> locked route -> phone -> report.
             if "Notes" not in df.columns:
@@ -3410,6 +3460,8 @@ if uploaded_file is not None:
                         "Payment",
                         "PaymentTime",
                         "CompletedTime",
+                        "Cleaning Plan",
+                        "Next Cleaning Due",
                         "Notes",
                         "route_order",
                         "latitude",
@@ -3425,6 +3477,8 @@ if uploaded_file is not None:
                         "Payment",
                         "PaymentTime",
                         "CompletedTime",
+                        "Cleaning Plan",
+                        "Next Cleaning Due",
                         "Notes",
                         "route_order",
                         "latitude",
@@ -3443,6 +3497,8 @@ if uploaded_file is not None:
                 df["Payment"] = df["Payment"].fillna("Waiting")
                 df["PaymentTime"] = df["PaymentTime"].fillna("")
                 df["CompletedTime"] = df["CompletedTime"].fillna("")
+                df["Cleaning Plan"] = df["Cleaning Plan"].fillna("").map(normalise_cleaning_plan)
+                df["Next Cleaning Due"] = df["Next Cleaning Due"].fillna("")
                 df["Notes"] = df["Notes"].fillna("")
                 df["address_text"] = df["address_text"].fillna("")
                 df["geo_query"] = df["geo_query"].fillna("")
@@ -4493,6 +4549,12 @@ else:
                             master_idx,
                             "CompletedTime",
                         ] = now_text()
+                        plan = normalise_cleaning_plan(df.at[master_idx, "Cleaning Plan"] if "Cleaning Plan" in df.columns else "")
+                        df.at[master_idx, "Cleaning Plan"] = plan
+                        df.at[master_idx, "Next Cleaning Due"] = calculate_next_cleaning_due(
+                            df.at[master_idx, "service_date"] if "service_date" in df.columns else service_date_str,
+                            plan,
+                        )
 
                         save_job(df.loc[master_idx])
                         st.session_state.master_df = df
@@ -4870,6 +4932,8 @@ else:
             "Payment Time": report_time(r.get("PaymentTime")) if payment_status == "Paid" else "",
             "Completion Status": "Completed",
             "Completed Time": report_time(r.get("CompletedTime")),
+            "Cleaning Plan": normalise_cleaning_plan(r.get("Cleaning Plan")),
+            "Next Cleaning Due": report_date(r.get("Next Cleaning Due")),
             "Notes": clean_val(r.get("Notes")),
             "Message": message_value,
             "Sent Time": sent_time,
@@ -4902,7 +4966,8 @@ else:
     widths = {
         "Order": 9, "Address": 30, "Postcode": 13, "Price": 11, "Phone": 16,
         "Payment Method": 18, "Payment Status": 17, "Payment Time": 14,
-        "Completion Status": 18, "Completed Time": 15, "Notes": 32,
+        "Completion Status": 18, "Completed Time": 15, "Cleaning Plan": 16,
+        "Next Cleaning Due": 18, "Notes": 32,
         "Message": 12, "Sent Time": 12, "Service Date": 14,
     }
     for heading, width in widths.items():
