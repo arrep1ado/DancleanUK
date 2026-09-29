@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.4-ADMIN-REMINDER-MESSAGES"
+APP_VERSION = "27.8.8.5.0.5-CUSTOMER-PERSISTENCE-DELETE"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -914,17 +914,20 @@ def _admin_auto_zone(postcode):
     return pc.split()[0] if pc else "Unzoned"
 
 
-def _admin_load_customer_records():
-    """Load manually maintained permanent customers. Empty list if table is not installed yet."""
+def _admin_load_customer_records(active_only=True):
+    """Load permanent customers from Supabase, optionally including soft-deleted rows."""
     url, _ = _supabase_config()
     headers = _supabase_headers()
     if not url or not headers:
         return []
+    params = {"select": "*", "order": "address.asc"}
+    if active_only:
+        params["active"] = "eq.true"
     try:
         response = requests.get(
             f"{url}/rest/v1/customer_records",
             headers=headers,
-            params={"select": "*", "active": "eq.true", "order": "address.asc"},
+            params=params,
             timeout=20,
         )
         if response.status_code != 200:
@@ -948,6 +951,92 @@ def _admin_customer_table_ready():
         )
         return response.status_code == 200
     except requests.RequestException:
+        return False
+
+
+def _admin_customer_identity(address, postcode):
+    """Stable identity used only by the Admin customer book."""
+    return "|".join([
+        " ".join(clean_val(address).casefold().split()),
+        normalise_postcode(postcode).casefold(),
+    ])
+
+
+def _admin_sync_history_customers(history_customers):
+    """Seed saved-route customers into the permanent customer book exactly once.
+
+    Inactive rows are included in the identity set so a deliberately deleted
+    customer is never recreated just because they still exist in route history.
+    """
+    if not history_customers or not _admin_customer_table_ready():
+        return 0
+    existing = _admin_load_customer_records(active_only=False)
+    known = {
+        _admin_customer_identity(row.get("address"), row.get("postcode"))
+        for row in existing
+    }
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=minimal")
+    if not url or not headers:
+        return 0
+    payloads = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for row in history_customers:
+        address = clean_val(row.get("Address"))
+        postcode = normalise_postcode(row.get("Postcode"))
+        ident = _admin_customer_identity(address, postcode)
+        if not address or not postcode or ident in known:
+            continue
+        due_raw = clean_val(row.get("Next Cleaning Due"))
+        due_iso = None
+        if due_raw:
+            try:
+                due_iso = pd.to_datetime(due_raw).date().isoformat()
+            except Exception:
+                due_iso = None
+        payloads.append({
+            "address": address,
+            "postcode": postcode,
+            "phone": clean_val(row.get("Phone")),
+            "price": float(row.get("Price", 0) or 0),
+            "cleaning_plan": normalise_cleaning_plan(row.get("Cleaning Plan")),
+            "next_cleaning_due": due_iso,
+            "notes": clean_val(row.get("Notes")),
+            "zone": _admin_auto_zone(postcode),
+            "active": True,
+            "updated_at": now_iso,
+        })
+        known.add(ident)
+    if not payloads:
+        return 0
+    try:
+        response = requests.post(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            json=payloads,
+            timeout=30,
+        )
+        return len(payloads) if response.status_code in (200, 201) else 0
+    except requests.RequestException:
+        return 0
+
+
+def _admin_delete_customer(customer_id):
+    """Soft-delete a customer so old route history cannot bring them back."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=representation")
+    if not url or not headers or customer_id in (None, ""):
+        return False
+    try:
+        response = requests.patch(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            params={"id": f"eq.{customer_id}", "select": "id"},
+            json={"active": False, "updated_at": datetime.now(timezone.utc).isoformat()},
+            timeout=20,
+        )
+        return response.status_code == 200 and bool(response.json())
+    except (requests.RequestException, ValueError, TypeError):
         return False
 
 
@@ -1228,9 +1317,14 @@ if st.session_state.get("admin_office_view", False):
             st.session_state["admin_add_customer_open"] = False
 
         top1, top2 = st.columns([3, 1])
-        manual_customers = _admin_load_customer_records()
         history_customers = _admin_customer_rows(routes)
-        top1.metric("Customers", len(manual_customers) if manual_customers else len(history_customers))
+        table_ready = _admin_customer_table_ready()
+        if table_ready:
+            _admin_sync_history_customers(history_customers)
+            manual_customers = _admin_load_customer_records(active_only=True)
+        else:
+            manual_customers = []
+        top1.metric("Customers", len(manual_customers) if table_ready else len(history_customers))
         if top2.button("➕ Add Customer", type="primary", use_container_width=True, key="admin_add_customer_button"):
             st.session_state["admin_add_customer_open"] = not st.session_state["admin_add_customer_open"]
 
@@ -1262,10 +1356,11 @@ if st.session_state.get("admin_office_view", False):
                             else:
                                 st.error(message)
 
-        if manual_customers:
+        if table_ready:
             cards = []
             for row in manual_customers:
                 cards.append({
+                    "Customer ID": row.get("id"),
                     "Address": clean_val(row.get("address")),
                     "Postcode": normalise_postcode(row.get("postcode")),
                     "Phone": clean_val(row.get("phone")),
@@ -1279,9 +1374,10 @@ if st.session_state.get("admin_office_view", False):
             cards = []
             for row in history_customers:
                 item = dict(row)
+                item["Customer ID"] = None
                 item["Zone"] = _admin_auto_zone(item.get("Postcode"))
                 cards.append(item)
-            if cards and not _admin_customer_table_ready():
+            if cards:
                 st.info("These customers are from saved route history. Run the supplied one-time Supabase customer setup before using Add Customer.")
 
         if not cards:
@@ -1319,6 +1415,24 @@ if st.session_state.get("admin_office_view", False):
                     left.markdown(f"**{address}**  \n{pc} · 📞 {phone}")
                     middle.markdown(f"**£{price:.2f}**  \n{plan} · Next: {due}")
                     right.markdown(f"**📍 Zone {zone}**")
+                    customer_id = customer.get("Customer ID")
+                    if customer_id is not None:
+                        delete_key = f"admin_delete_customer_{customer_id}"
+                        confirm_key = f"admin_delete_confirm_{customer_id}"
+                        if st.session_state.get(confirm_key):
+                            d1, d2 = st.columns([1, 1])
+                            if d1.button("Yes, delete", type="primary", key=f"{delete_key}_yes", use_container_width=True):
+                                if _admin_delete_customer(customer_id):
+                                    st.session_state.pop(confirm_key, None)
+                                    st.rerun()
+                                else:
+                                    st.error("Could not delete this customer. Please try again.")
+                            if d2.button("Cancel", key=f"{delete_key}_cancel", use_container_width=True):
+                                st.session_state.pop(confirm_key, None)
+                                st.rerun()
+                        elif st.button("🗑️ Delete", key=delete_key):
+                            st.session_state[confirm_key] = True
+                            st.rerun()
                     if notes:
                         st.caption(f"Notes: {notes}")
 
