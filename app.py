@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.5-CUSTOMER-PERSISTENCE-DELETE"
+APP_VERSION = "27.8.8.5.0.6-CUSTOMER-DUE-DATE-FIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1339,8 +1339,9 @@ if st.session_state.get("admin_office_view", False):
                     phone = c3.text_input("Phone")
                     price = c4.number_input("Normal price (£)", min_value=0.0, step=1.0, value=20.0)
                     cleaning_plan = c5.selectbox("Cleaning Plan", ["", "1 Month", "2 Months", "3 Months", "4 Months", "6 Months", "12 Months"])
-                    use_due = st.checkbox("Set Next Cleaning Due now", value=False)
-                    next_due = st.date_input("Next Cleaning Due", value=date.today()) if use_due else None
+                    use_due = st.checkbox("Set Next Cleaning Due", value=False)
+                    next_due_selected = st.date_input("Next Cleaning Due", value=date.today())
+                    next_due = next_due_selected if use_due else None
                     notes = st.text_area("Notes", height=90)
                     preview_zone = _admin_auto_zone(postcode) if postcode else "—"
                     st.caption(f"Automatic zone: {preview_zone}")
