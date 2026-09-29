@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.3-ADMIN-CUSTOMER-CARDS-ZONES"
+APP_VERSION = "27.8.8.5.0.4-ADMIN-REMINDER-MESSAGES"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1009,6 +1009,23 @@ def _admin_customer_rows(routes):
     return list(latest.values())
 
 
+def _admin_reminder_message():
+    """Standard DanCleanUK next-day reminder. No price or payment details."""
+    return (
+        "Hi, this is DanCleanUK 👋 Just a quick reminder that we'll be cleaning "
+        "your windows tomorrow. Please make sure we have access to the property. "
+        "Thank you!"
+    )
+
+
+def _admin_reminder_sms_url(phone):
+    """Create an SMS link suitable for a laptop with an SMS/Phone Link handler."""
+    number = normalise_phone(phone)
+    if number and not number.startswith("+"):
+        number = "+" + number
+    return "sms:" + quote(number, safe="+") + "?body=" + quote(_admin_reminder_message())
+
+
 if st.session_state.get("admin_office_view", False):
     st.title("🏢 DanCleanUK — Admin Dashboard")
     st.caption("Office management")
@@ -1029,6 +1046,8 @@ if st.session_state.get("admin_office_view", False):
 
     if admin_tab == "📅 Upcoming Work / Planner":
         st.header("📅 Upcoming Work / Planner")
+        st.caption("Upcoming cleans and next-day customer reminders")
+
         upcoming_records = load_upcoming_work_records()
         if not upcoming_records:
             st.info("No recurring work has been created yet. Completed recurring customers will appear here automatically.")
@@ -1039,29 +1058,97 @@ if st.session_state.get("admin_office_view", False):
             today = date.today()
             tomorrow = today + pd.Timedelta(days=1)
             week_end = today + pd.Timedelta(days=7)
+
             def _admin_due_group(due):
-                if due < today: return "Overdue"
-                if due == today: return "Due Today"
-                if due == tomorrow: return "Due Tomorrow"
-                if due <= week_end: return "Due This Week"
+                if due < today:
+                    return "Overdue"
+                if due == today:
+                    return "Due Today"
+                if due == tomorrow:
+                    return "Due Tomorrow"
+                if due <= week_end:
+                    return "Due This Week"
                 return "Later"
+
             planner_df["Due"] = planner_df["_due"].map(_admin_due_group)
             visible = planner_df[planner_df["Due"] != "Later"].copy()
             counts = visible["Due"].value_counts() if not visible.empty else {}
+
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Overdue", int(counts.get("Overdue", 0)))
             c2.metric("Today", int(counts.get("Due Today", 0)))
             c3.metric("Tomorrow", int(counts.get("Due Tomorrow", 0)))
             c4.metric("Next 7 Days", int(len(visible)))
+
             if visible.empty:
                 next_due = planner_df["_due"].min() if not planner_df.empty else None
-                st.info(f"Nothing is due in the next 7 days. Next due: {next_due.strftime('%d/%m/%Y')}" if next_due else "No recurring work is due yet.")
+                st.info(
+                    f"Nothing is due in the next 7 days. Next due: {next_due.strftime('%d/%m/%Y')}"
+                    if next_due else "No recurring work is due yet."
+                )
             else:
                 st.metric("Due work value", f"£{float(visible['Price'].sum()):.2f}")
-                display = visible[["Due", "Address", "Postcode", "Price", "Cleaning Plan", "Next Cleaning Due", "Phone", "Notes"]].copy()
-                display["Price"] = display["Price"].map(lambda x: f"£{float(x):.2f}")
-                display["Next Cleaning Due"] = pd.to_datetime(display["Next Cleaning Due"], errors="coerce").dt.strftime("%d/%m/%Y")
-                st.dataframe(display, use_container_width=True, hide_index=True)
+
+                tomorrow_rows = visible[visible["Due"] == "Due Tomorrow"].copy()
+                if not tomorrow_rows.empty:
+                    st.subheader("🔔 Tomorrow — reminders")
+                    st.caption("Click Send Reminder from the computer. The message contains no price or payment details.")
+                    with st.expander("Preview standard reminder message", expanded=False):
+                        st.write(_admin_reminder_message())
+
+                    for reminder_idx, (_, row) in enumerate(
+                        tomorrow_rows.sort_values(["Postcode", "Address"], na_position="last").iterrows()
+                    ):
+                        address = clean_val(row.get("Address")) or "Customer"
+                        postcode = normalise_postcode(row.get("Postcode"))
+                        phone = clean_val(row.get("Phone"))
+                        try:
+                            due_label = pd.to_datetime(row.get("Next Cleaning Due")).strftime("%d/%m/%Y")
+                        except Exception:
+                            due_label = clean_val(row.get("Next Cleaning Due"))
+
+                        with st.container(border=True):
+                            left, middle, right = st.columns([4, 2, 2])
+                            left.markdown(f"**{address}**  \n{postcode}")
+                            middle.markdown(f"**Due tomorrow**  \n{due_label}")
+                            if phone:
+                                right.link_button(
+                                    "💬 Send Reminder",
+                                    _admin_reminder_sms_url(phone),
+                                    use_container_width=True,
+                                )
+                                right.caption(f"📞 {phone}")
+                            else:
+                                right.button(
+                                    "💬 No phone number",
+                                    disabled=True,
+                                    use_container_width=True,
+                                    key=f"admin_no_phone_{reminder_idx}_{postcode}",
+                                )
+
+                st.subheader("📅 Work due in the next 7 days")
+                for work_idx, (_, row) in enumerate(
+                    visible.sort_values(["_due", "Postcode", "Address"], na_position="last").iterrows()
+                ):
+                    address = clean_val(row.get("Address")) or "Customer"
+                    postcode = normalise_postcode(row.get("Postcode"))
+                    phone = clean_val(row.get("Phone")) or "—"
+                    due_group = clean_val(row.get("Due"))
+                    price = float(row.get("Price", 0) or 0)
+                    plan = normalise_cleaning_plan(row.get("Cleaning Plan")) or "No plan"
+                    notes = clean_val(row.get("Notes"))
+                    try:
+                        due_label = pd.to_datetime(row.get("Next Cleaning Due")).strftime("%d/%m/%Y")
+                    except Exception:
+                        due_label = clean_val(row.get("Next Cleaning Due")) or "—"
+
+                    with st.container(border=True):
+                        left, middle, right = st.columns([4, 2, 2])
+                        left.markdown(f"**{address}**  \n{postcode} · 📞 {phone}")
+                        middle.markdown(f"**{due_group}**  \n{due_label} · {plan}")
+                        right.markdown(f"**£{price:.2f}**")
+                        if notes:
+                            st.caption(f"Notes: {notes}")
 
     elif admin_tab == "💷 Outstanding Payments":
         st.header("💷 Outstanding Payments")
