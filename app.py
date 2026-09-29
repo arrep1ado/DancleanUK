@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.6-CUSTOMER-DUE-DATE-FIX"
+APP_VERSION = "27.8.8.5.0.7-ADMIN-PLANNER-CUSTOMER-RECORDS"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -937,6 +937,32 @@ def _admin_load_customer_records(active_only=True):
         return []
 
 
+def _admin_planner_customer_records():
+    """Read active permanent customers for the separate Admin planner only.
+
+    This deliberately uses customer_records as the Admin source of truth. It does
+    not touch saved Driver routes, geocoding, ORS or the locked route optimiser.
+    """
+    rows = _admin_load_customer_records(active_only=True)
+    records = []
+    for row in rows:
+        due = clean_val(row.get("next_cleaning_due"))
+        if not due:
+            continue
+        records.append({
+            "customer_id": row.get("id"),
+            "Address": clean_val(row.get("address")),
+            "Postcode": normalise_postcode(row.get("postcode")),
+            "Price": float(row.get("price", 0) or 0),
+            "Phone": clean_val(row.get("phone")),
+            "Cleaning Plan": normalise_cleaning_plan(row.get("cleaning_plan")),
+            "Notes": clean_val(row.get("notes")),
+            "Next Cleaning Due": due,
+            "Zone": clean_val(row.get("zone")) or _admin_auto_zone(row.get("postcode")),
+        })
+    return records
+
+
 def _admin_customer_table_ready():
     url, _ = _supabase_config()
     headers = _supabase_headers()
@@ -1137,14 +1163,16 @@ if st.session_state.get("admin_office_view", False):
         st.header("📅 Upcoming Work / Planner")
         st.caption("Upcoming cleans and next-day customer reminders")
 
-        upcoming_records = load_upcoming_work_records()
+        # Separate Admin planner reads directly from the permanent customer book.
+        # A customer due tomorrow therefore appears here today for its reminder.
+        upcoming_records = _admin_planner_customer_records()
         if not upcoming_records:
-            st.info("No recurring work has been created yet. Completed recurring customers will appear here automatically.")
+            st.info("No customers with a Next Cleaning Due date have been added yet.")
         else:
             planner_df = pd.DataFrame(upcoming_records)
             planner_df["_due"] = pd.to_datetime(planner_df["Next Cleaning Due"], errors="coerce").dt.date
             planner_df = planner_df[planner_df["_due"].notna()].copy()
-            today = date.today()
+            today = datetime.now(ZoneInfo("Europe/London")).date()
             tomorrow = today + pd.Timedelta(days=1)
             week_end = today + pd.Timedelta(days=7)
 
