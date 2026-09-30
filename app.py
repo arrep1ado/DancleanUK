@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.8-ADMIN-CUSTOMER-EDIT-POLISH"
+APP_VERSION = "27.8.8.5.0.9-ADMIN-TO-OPTIMIZER"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1342,7 +1342,231 @@ if st.session_state.get("admin_office_view", False):
 
     elif admin_tab == "🚐 Prepare Route":
         st.header("🚐 Prepare Route")
-        st.info("We’ll build this section next. The locked V26.13 optimiser is not changed.")
+        st.caption("Select permanent customers here, then send them into the existing locked route optimiser. No spreadsheet is needed for the normal daily workflow.")
+
+        if not _admin_customer_table_ready():
+            st.error("Customer storage is not ready yet.")
+        else:
+            route_customers = _admin_load_customer_records(active_only=True)
+            if not route_customers:
+                st.info("No active customers are available. Add customers in 👥 Customers first.")
+            else:
+                london_today = datetime.now(ZoneInfo("Europe/London")).date()
+                default_route_date = london_today + pd.Timedelta(days=1)
+                target_route_date = st.date_input(
+                    "Route date",
+                    value=default_route_date,
+                    key="admin_prepare_route_date",
+                )
+                target_route_str = target_route_date.isoformat()
+
+                if load_route_snapshot(target_route_str) is not None:
+                    st.warning(
+                        "A permanent saved route already exists for this date. "
+                        "It is protected and will not be overwritten from Admin."
+                    )
+
+                route_rows = []
+                for row in route_customers:
+                    due_raw = clean_val(row.get("next_cleaning_due"))
+                    due_date = None
+                    if due_raw:
+                        try:
+                            due_date = pd.to_datetime(due_raw).date()
+                        except Exception:
+                            due_date = None
+                    route_rows.append({
+                        "Customer ID": row.get("id"),
+                        "Address": clean_val(row.get("address")),
+                        "Postcode": normalise_postcode(row.get("postcode")),
+                        "Price": float(row.get("price", 0) or 0),
+                        "Phone": clean_val(row.get("phone")),
+                        "Cleaning Plan": normalise_cleaning_plan(row.get("cleaning_plan")),
+                        "Next Cleaning Due": due_raw,
+                        "Notes": clean_val(row.get("notes")),
+                        "Zone": clean_val(row.get("zone")) or _admin_auto_zone(row.get("postcode")),
+                        "_due_date": due_date,
+                    })
+
+                route_customer_df = pd.DataFrame(route_rows)
+                zones = sorted({clean_val(x) or "Unzoned" for x in route_customer_df["Zone"].tolist()})
+
+                f1, f2 = st.columns([1, 2])
+                selected_route_zone = f1.selectbox(
+                    "Zone",
+                    ["All zones"] + zones,
+                    key="admin_prepare_route_zone",
+                )
+                route_search = f2.text_input(
+                    "Search customers",
+                    placeholder="Address, postcode or phone",
+                    key="admin_prepare_route_search",
+                ).strip().casefold()
+
+                filter_mode = st.radio(
+                    "Show",
+                    ["Due / overdue by route date", "All active customers"],
+                    horizontal=True,
+                    key="admin_prepare_route_filter",
+                )
+
+                visible_route_df = route_customer_df.copy()
+                if selected_route_zone != "All zones":
+                    visible_route_df = visible_route_df[
+                        visible_route_df["Zone"].fillna("Unzoned") == selected_route_zone
+                    ].copy()
+                if route_search:
+                    route_haystack = (
+                        visible_route_df["Address"].fillna("").astype(str) + " " +
+                        visible_route_df["Postcode"].fillna("").astype(str) + " " +
+                        visible_route_df["Phone"].fillna("").astype(str)
+                    ).str.casefold()
+                    visible_route_df = visible_route_df[route_haystack.str.contains(route_search, regex=False)].copy()
+                if filter_mode == "Due / overdue by route date":
+                    visible_route_df = visible_route_df[
+                        visible_route_df["_due_date"].notna()
+                        & visible_route_df["_due_date"].map(lambda d: d <= target_route_date)
+                    ].copy()
+
+                due_mask = route_customer_df["_due_date"].map(
+                    lambda d: isinstance(d, date) and d <= target_route_date
+                )
+                due_count = int(due_mask.sum()) if not route_customer_df.empty else 0
+                # Keep the summary business-friendly and independent from the route engine.
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Active customers", len(route_customer_df))
+                m2.metric("Due / overdue", due_count)
+                m3.metric("Showing", len(visible_route_df))
+
+                if visible_route_df.empty:
+                    st.info("No customers match these route filters.")
+                else:
+                    visible_route_df = visible_route_df.sort_values(
+                        ["Zone", "_due_date", "Postcode", "Address"],
+                        na_position="last",
+                    ).reset_index(drop=True)
+                    editor = visible_route_df[[
+                        "Customer ID", "Address", "Postcode", "Zone", "Price", "Phone",
+                        "Cleaning Plan", "Next Cleaning Due", "Notes"
+                    ]].copy()
+                    select_all_shown = st.checkbox(
+                        "Select all customers currently shown",
+                        value=False,
+                        key=f"admin_prepare_select_all_{target_route_str}_{selected_route_zone}_{filter_mode}",
+                    )
+                    editor.insert(0, "Select", bool(select_all_shown))
+
+                    edited_route = st.data_editor(
+                        editor,
+                        hide_index=True,
+                        use_container_width=True,
+                        disabled=[
+                            "Customer ID", "Address", "Postcode", "Zone", "Price", "Phone",
+                            "Cleaning Plan", "Next Cleaning Due", "Notes"
+                        ],
+                        column_config={
+                            "Select": st.column_config.CheckboxColumn("Select"),
+                            "Customer ID": None,
+                            "Price": st.column_config.NumberColumn("Price", format="£%.2f"),
+                        },
+                        key=f"admin_prepare_route_editor_{target_route_str}_{selected_route_zone}_{filter_mode}",
+                    )
+
+                    selected_route_rows = edited_route[edited_route["Select"] == True].copy()
+                    selected_route_value = float(selected_route_rows["Price"].sum()) if not selected_route_rows.empty else 0.0
+                    st.caption(
+                        f"Selected: {len(selected_route_rows)} job(s) · £{selected_route_value:.2f} · "
+                        f"Route date {target_route_date.strftime('%d/%m/%Y')}"
+                    )
+
+                    route_locked = load_route_snapshot(target_route_str) is not None
+                    prepare_disabled = selected_route_rows.empty or route_locked
+                    if st.button(
+                        "🚀 SEND SELECTED JOBS TO ROUTE OPTIMIZER",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=prepare_disabled,
+                        key="admin_send_to_route_optimizer",
+                    ):
+                        invalid = []
+                        for _, selected_row in selected_route_rows.iterrows():
+                            if not clean_val(selected_row.get("Address")):
+                                invalid.append("missing address")
+                            if not normalise_postcode(selected_row.get("Postcode")):
+                                invalid.append("missing postcode")
+                            try:
+                                if float(selected_row.get("Price", 0) or 0) <= 0:
+                                    invalid.append("price must be above £0")
+                            except Exception:
+                                invalid.append("invalid price")
+
+                        if invalid:
+                            st.error(
+                                "Selected customers cannot be prepared: "
+                                + ", ".join(sorted(set(invalid)))
+                            )
+                        elif load_route_snapshot(target_route_str) is not None:
+                            st.error("That date already has a permanent saved route. Nothing was changed.")
+                        else:
+                            prepared = selected_route_rows.copy().reset_index(drop=True)
+                            prepared["Dates"] = target_route_str
+                            prepared["service_date"] = target_route_str
+                            prepared["Postcode"] = prepared["Postcode"].map(normalise_postcode)
+                            prepared["Phone"] = prepared["Phone"].fillna("").astype(str).map(normalise_phone)
+                            prepared["Price"] = pd.to_numeric(prepared["Price"], errors="coerce").fillna(0.0)
+                            prepared["Cleaning Plan"] = prepared["Cleaning Plan"].fillna("").map(normalise_cleaning_plan)
+                            prepared["Notes"] = prepared["Notes"].fillna("").astype(str).str.strip()
+                            prepared["Status"] = "pending"
+                            prepared["Payment"] = "Waiting"
+                            prepared["PaymentTime"] = ""
+                            prepared["CompletedTime"] = ""
+                            # Match the existing spreadsheet-to-optimiser contract: the next
+                            # due date is calculated after completion from the cleaning plan.
+                            prepared["Next Cleaning Due"] = ""
+                            prepared["route_order"] = None
+                            prepared["latitude"] = None
+                            prepared["longitude"] = None
+                            prepared["geo_query"] = ""
+                            prepared["created_at"] = now_text()
+                            prepared["address_text"] = prepared["Address"].fillna("").astype(str)
+                            prepared["job_id"] = [
+                                make_job_id(
+                                    target_route_str,
+                                    row_number,
+                                    row.get("Postcode"),
+                                    row.get("Phone"),
+                                )
+                                for row_number, (_, row) in enumerate(prepared.iterrows(), start=1)
+                            ]
+
+                            keep_cols = [
+                                "Dates", "Postcode", "Address", "Price", "Phone",
+                                "Cleaning Plan", "Notes", "job_id", "service_date",
+                                "Status", "Payment", "PaymentTime", "CompletedTime",
+                                "Next Cleaning Due", "route_order", "address_text",
+                                "latitude", "longitude", "geo_query", "created_at"
+                            ]
+                            prepared = prepared[keep_cols]
+
+                            # This replaces only the unsaved local working copy for that day.
+                            # A permanent Supabase route is checked above and is never deleted.
+                            delete_day(target_route_str)
+                            save_dataframe(prepared)
+                            st.session_state["master_df"] = prepared.reset_index(drop=True)
+                            st.session_state["service_date"] = target_route_str
+                            st.session_state.pop("route_data", None)
+                            st.session_state.pop("failed_jobs", None)
+                            st.session_state.pop("uploaded_filename", None)
+                            st.session_state["start_new_day_mode"] = True
+                            st.session_state["replace_saved_route_allowed"] = False
+                            st.session_state["admin_office_view"] = False
+                            st.rerun()
+
+                st.markdown("---")
+                st.caption(
+                    "Normal workflow: Admin customers → Route Optimizer → SAVE / LOCK THIS ROUTE FOR PHONE. "
+                    "Excel remains available only as a fallback/import tool; it is not required here."
+                )
 
     elif admin_tab == "📊 Daily Reports":
         st.header("📊 Daily Reports")
