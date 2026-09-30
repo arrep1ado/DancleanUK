@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.10-ADMIN-DUE-DATE-FIX"
+APP_VERSION = "27.8.8.5.0.11-ADMIN-SAVED-ROUTE-BRING-FORWARD"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1115,6 +1115,93 @@ def _admin_due_date_value(value, fallback=None):
     except Exception:
         return fallback
 
+
+def _admin_move_job_date(customer_id, new_service_date):
+    """Admin-only one-off service-date override; the recurring due date is unchanged."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=representation")
+    if not url or not headers or customer_id in (None, ""):
+        return False, "Customer storage is not available."
+    payload = {
+        "planned_service_date": new_service_date.isoformat() if new_service_date else None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        response = requests.patch(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            params={"id": f"eq.{customer_id}", "select": "id,planned_service_date"},
+            json=payload,
+            timeout=20,
+        )
+        if response.status_code == 200 and bool(response.json()):
+            return True, ""
+        if response.status_code in (400, 404):
+            return False, "Bring Forward storage is not ready. Run the supplied one-time Supabase planning setup SQL."
+        return False, "Could not move this job. Please try again."
+    except (requests.RequestException, ValueError, TypeError):
+        return False, "Could not move this job. Please try again."
+
+
+def _admin_render_bring_forward(customer_id, original_due, planned_service_date, key_prefix):
+    """Render manual Admin controls for a one-off earlier service date."""
+    if customer_id in (None, "") or not original_due:
+        return
+    try:
+        due_date = pd.to_datetime(original_due).date()
+    except Exception:
+        return
+    today = datetime.now(ZoneInfo("Europe/London")).date()
+    try:
+        planned_date = pd.to_datetime(planned_service_date).date() if clean_val(planned_service_date) else None
+    except Exception:
+        planned_date = None
+
+    open_key = f"admin_bring_forward_open_{customer_id}"
+    b1, b2 = st.columns([1, 1])
+    label = "✏️ Change Move" if planned_date else "⏩ Bring Forward"
+    if b1.button(label, key=f"{key_prefix}_bring_{customer_id}", use_container_width=True):
+        st.session_state[open_key] = not st.session_state.get(open_key, False)
+        st.rerun()
+    if planned_date:
+        if b2.button("↩️ Undo Move", key=f"{key_prefix}_undo_{customer_id}", use_container_width=True):
+            ok, message = _admin_move_job_date(customer_id, None)
+            if ok:
+                st.session_state.pop(open_key, None)
+                st.rerun()
+            else:
+                st.error(message)
+
+    if st.session_state.get(open_key, False):
+        latest_allowed = due_date - pd.Timedelta(days=1)
+        if latest_allowed < today:
+            st.info("This job cannot be brought forward because its due date is today or already overdue.")
+            return
+        default_date = planned_date or latest_allowed
+        if default_date < today:
+            default_date = today
+        with st.form(f"admin_bring_forward_form_{customer_id}", clear_on_submit=False):
+            new_date = st.date_input(
+                "Move this clean to",
+                value=default_date,
+                min_value=today,
+                max_value=latest_allowed,
+                key=f"admin_bring_forward_date_{customer_id}",
+                help="You choose the earlier date. The customer's recurring Next Cleaning Due date is not changed.",
+            )
+            st.caption(
+                f"Original due date stays {due_date.strftime('%d/%m/%Y')}. "
+                "This only changes the working date for this clean."
+            )
+            save_move = st.form_submit_button("💾 Save New Working Date", type="primary", use_container_width=True)
+            if save_move:
+                ok, message = _admin_move_job_date(customer_id, new_date)
+                if ok:
+                    st.session_state.pop(open_key, None)
+                    st.rerun()
+                else:
+                    st.error(message)
+
 def _admin_customer_rows(routes):
     """Build one latest permanent customer record from saved route history."""
     latest = {}
@@ -1167,6 +1254,48 @@ if st.session_state.get("admin_office_view", False):
         st.session_state["admin_office_view"] = False
         st.rerun()
 
+    routes = _admin_load_saved_routes()
+
+    # Admin-only saved-route picker. The locked Driver sidebar below is untouched.
+    with st.sidebar:
+        st.header("📂 Saved Routes")
+        latest_saved_date = datetime.now(ZoneInfo("Europe/London")).date()
+        if routes:
+            try:
+                latest_saved_date = pd.to_datetime(routes[0].get("route_date")).date()
+            except Exception:
+                pass
+        admin_saved_route_date = st.date_input(
+            "Saved route date",
+            value=latest_saved_date,
+            key="admin_saved_route_date",
+        )
+        admin_saved_route_str = admin_saved_route_date.isoformat()
+        admin_saved_snapshot = load_route_snapshot(admin_saved_route_str)
+        if admin_saved_snapshot is not None:
+            st.caption(
+                f"{int(admin_saved_snapshot.get('jobs') or 0)} job(s) · "
+                f"{float(admin_saved_snapshot.get('miles') or 0):.1f} miles · "
+                f"{format_duration(float(admin_saved_snapshot.get('time_s') or 0))}"
+            )
+        else:
+            st.caption("No saved route for this date.")
+        if st.button(
+            "📂 Load Saved Route",
+            type="primary",
+            use_container_width=True,
+            disabled=admin_saved_snapshot is None,
+            key="admin_load_saved_route_laptop",
+        ):
+            st.session_state.service_date = admin_saved_route_str
+            ok, message = apply_saved_route_snapshot(admin_saved_route_str)
+            if ok:
+                st.session_state["admin_office_view"] = False
+                st.session_state.pop("start_new_day_mode", None)
+                st.rerun()
+            else:
+                st.error(message)
+
     st.markdown("---")
     admin_tab = st.radio(
         "Admin section",
@@ -1175,7 +1304,6 @@ if st.session_state.get("admin_office_view", False):
         label_visibility="collapsed",
         key="admin_dashboard_section",
     )
-    routes = _admin_load_saved_routes()
 
     if admin_tab == "📅 Upcoming Work / Planner":
         st.header("📅 Upcoming Work / Planner")
@@ -1199,13 +1327,16 @@ if st.session_state.get("admin_office_view", False):
                     "Cleaning Plan": normalise_cleaning_plan(row.get("cleaning_plan")),
                     "Notes": clean_val(row.get("notes")),
                     "Next Cleaning Due": due,
+                    "Planned Service Date": clean_val(row.get("planned_service_date")),
                 })
 
             if not upcoming_records:
                 st.info("No customers currently have a Next Cleaning Due date.")
             else:
                 planner_df = pd.DataFrame(upcoming_records)
-                planner_df["_due"] = pd.to_datetime(planner_df["Next Cleaning Due"], errors="coerce").dt.date
+                planner_df["_original_due"] = pd.to_datetime(planner_df["Next Cleaning Due"], errors="coerce").dt.date
+                planner_df["_planned_date"] = pd.to_datetime(planner_df["Planned Service Date"], errors="coerce").dt.date
+                planner_df["_due"] = planner_df["_planned_date"].combine_first(planner_df["_original_due"])
                 planner_df = planner_df[planner_df["_due"].notna()].copy()
                 today = datetime.now(ZoneInfo("Europe/London")).date()
                 tomorrow = today + pd.Timedelta(days=1)
@@ -1262,7 +1393,15 @@ if st.session_state.get("admin_office_view", False):
                             with st.container(border=True):
                                 left, middle, right = st.columns([4, 2, 2])
                                 left.markdown(f"**{address}**  \n{postcode}")
-                                middle.markdown(f"**Due tomorrow**  \n{due_label}")
+                                planned_raw = clean_val(row.get("Planned Service Date"))
+                                if planned_raw:
+                                    try:
+                                        original_label = pd.to_datetime(row.get("Next Cleaning Due")).strftime("%d/%m/%Y")
+                                    except Exception:
+                                        original_label = clean_val(row.get("Next Cleaning Due"))
+                                    middle.markdown(f"**Moved to tomorrow**  \nOriginally due {original_label}")
+                                else:
+                                    middle.markdown(f"**Due tomorrow**  \n{due_label}")
                                 if phone:
                                     right.link_button(
                                         "💬 Send Reminder",
@@ -1277,6 +1416,12 @@ if st.session_state.get("admin_office_view", False):
                                         use_container_width=True,
                                         key=f"admin_no_phone_{reminder_idx}_{postcode}",
                                     )
+                                _admin_render_bring_forward(
+                                    row.get("Customer ID"),
+                                    row.get("Next Cleaning Due"),
+                                    row.get("Planned Service Date"),
+                                    f"admin_tomorrow_{reminder_idx}",
+                                )
 
                     # Tomorrow is already shown above, so do not repeat it here.
                     other_rows = visible[visible["Due"] != "Due Tomorrow"].copy()
@@ -1301,10 +1446,26 @@ if st.session_state.get("admin_office_view", False):
                             with st.container(border=True):
                                 left, middle, right = st.columns([4, 2, 2])
                                 left.markdown(f"**{address}**  \n{postcode} · 📞 {phone}")
-                                middle.markdown(f"**{due_group}**  \n{due_label} · {plan}")
+                                planned_raw = clean_val(row.get("Planned Service Date"))
+                                if planned_raw:
+                                    try:
+                                        moved_label = pd.to_datetime(planned_raw).strftime("%d/%m/%Y")
+                                        original_label = pd.to_datetime(row.get("Next Cleaning Due")).strftime("%d/%m/%Y")
+                                    except Exception:
+                                        moved_label = planned_raw
+                                        original_label = clean_val(row.get("Next Cleaning Due"))
+                                    middle.markdown(f"**Moved to {moved_label}**  \nOriginally due {original_label} · {plan}")
+                                else:
+                                    middle.markdown(f"**{due_group}**  \n{due_label} · {plan}")
                                 right.markdown(f"**£{price:.2f}**")
                                 if notes:
                                     st.caption(f"Notes: {notes}")
+                                _admin_render_bring_forward(
+                                    row.get("Customer ID"),
+                                    row.get("Next Cleaning Due"),
+                                    row.get("Planned Service Date"),
+                                    f"admin_other_{work_idx}",
+                                )
 
     elif admin_tab == "💷 Outstanding Payments":
         st.header("💷 Outstanding Payments")
@@ -1375,6 +1536,13 @@ if st.session_state.get("admin_office_view", False):
                             due_date = pd.to_datetime(due_raw).date()
                         except Exception:
                             due_date = None
+                    planned_raw = clean_val(row.get("planned_service_date"))
+                    planned_date = None
+                    if planned_raw:
+                        try:
+                            planned_date = pd.to_datetime(planned_raw).date()
+                        except Exception:
+                            planned_date = None
                     route_rows.append({
                         "Customer ID": row.get("id"),
                         "Address": clean_val(row.get("address")),
@@ -1383,9 +1551,11 @@ if st.session_state.get("admin_office_view", False):
                         "Phone": clean_val(row.get("phone")),
                         "Cleaning Plan": normalise_cleaning_plan(row.get("cleaning_plan")),
                         "Next Cleaning Due": due_raw,
+                        "Planned Service Date": planned_raw,
                         "Notes": clean_val(row.get("notes")),
                         "Zone": clean_val(row.get("zone")) or _admin_auto_zone(row.get("postcode")),
                         "_due_date": due_date,
+                        "_scheduled_date": planned_date or due_date,
                     })
 
                 route_customer_df = pd.DataFrame(route_rows)
@@ -1425,14 +1595,14 @@ if st.session_state.get("admin_office_view", False):
                 target_route_ts = pd.Timestamp(target_route_date).normalize()
                 if filter_mode == "Due / overdue by route date":
                     visible_due_series = pd.to_datetime(
-                        visible_route_df["_due_date"], errors="coerce"
+                        visible_route_df["_scheduled_date"], errors="coerce"
                     ).dt.normalize()
                     visible_route_df = visible_route_df[
                         visible_due_series.notna() & (visible_due_series <= target_route_ts)
                     ].copy()
 
                 due_series = pd.to_datetime(
-                    route_customer_df["_due_date"], errors="coerce"
+                    route_customer_df["_scheduled_date"], errors="coerce"
                 ).dt.normalize()
                 due_count = int((due_series.notna() & (due_series <= target_route_ts)).sum())
                 # Keep the summary business-friendly and independent from the route engine.
@@ -1445,12 +1615,12 @@ if st.session_state.get("admin_office_view", False):
                     st.info("No customers match these route filters.")
                 else:
                     visible_route_df = visible_route_df.sort_values(
-                        ["Zone", "_due_date", "Postcode", "Address"],
+                        ["Zone", "_scheduled_date", "Postcode", "Address"],
                         na_position="last",
                     ).reset_index(drop=True)
                     editor = visible_route_df[[
                         "Customer ID", "Address", "Postcode", "Zone", "Price", "Phone",
-                        "Cleaning Plan", "Next Cleaning Due", "Notes"
+                        "Cleaning Plan", "Next Cleaning Due", "Planned Service Date", "Notes"
                     ]].copy()
                     select_all_shown = st.checkbox(
                         "Select all customers currently shown",
@@ -1465,7 +1635,7 @@ if st.session_state.get("admin_office_view", False):
                         use_container_width=True,
                         disabled=[
                             "Customer ID", "Address", "Postcode", "Zone", "Price", "Phone",
-                            "Cleaning Plan", "Next Cleaning Due", "Notes"
+                            "Cleaning Plan", "Next Cleaning Due", "Planned Service Date", "Notes"
                         ],
                         column_config={
                             "Select": st.column_config.CheckboxColumn("Select"),
