@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.15-ADMIN-ADJUST-PROGRESS-OVERRIDE"
+APP_VERSION = "27.8.8.5.0.17-ADMIN-PHONE-REMINDER-QUEUE"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -34,7 +34,9 @@ st.set_page_config(
     layout="centered",
 )
 
-if not st.session_state.get("admin_office_view", False):
+PHONE_REMINDER_MODE = str(st.query_params.get("phone_reminders", "")).strip().lower() in {"1", "true", "yes"}
+
+if not st.session_state.get("admin_office_view", False) and not PHONE_REMINDER_MODE:
     st.title("🚗 DanCleanUK Daily Route Optimizer")
 
 # Phone presentation: keep office/admin and routine planning clutter off the
@@ -1263,18 +1265,395 @@ def _admin_customer_rows(routes):
 def _admin_reminder_message():
     """Standard DanCleanUK next-day reminder. No price or payment details."""
     return (
-        "Hi, this is DanCleanUK 👋 Just a quick reminder that we'll be cleaning "
-        "your windows tomorrow. Please make sure we have access to the property. "
-        "Thank you!"
+        "Hi, this is DanCleanUK 👋 Just a reminder that we’re due to clean your "
+        "windows tomorrow. Please make sure we have access to the property. "
+        "If tomorrow is not suitable, please reply to this message. "
+        "Thank you, DanCleanUK."
     )
 
 
 def _admin_reminder_sms_url(phone):
-    """Create an SMS link suitable for a laptop with an SMS/Phone Link handler."""
+    """Fallback SMS link when direct server-side SMS is not configured."""
     number = normalise_phone(phone)
     if number and not number.startswith("+"):
         number = "+" + number
     return "sms:" + quote(number, safe="+") + "?body=" + quote(_admin_reminder_message())
+
+
+def _admin_sms_config():
+    """Return private Twilio settings from Streamlit Secrets, or None if incomplete."""
+    account_sid = clean_val(st.secrets.get("TWILIO_ACCOUNT_SID", ""))
+    auth_token = clean_val(st.secrets.get("TWILIO_AUTH_TOKEN", ""))
+    from_number = clean_val(st.secrets.get("TWILIO_FROM_NUMBER", ""))
+    messaging_service_sid = clean_val(st.secrets.get("TWILIO_MESSAGING_SERVICE_SID", ""))
+    if not account_sid or not auth_token or not (from_number or messaging_service_sid):
+        return None
+    return {
+        "account_sid": account_sid,
+        "auth_token": auth_token,
+        "from_number": from_number,
+        "messaging_service_sid": messaging_service_sid,
+    }
+
+
+def _admin_send_sms(phone, message):
+    """Send one SMS directly from Admin through Twilio. Returns (ok, detail)."""
+    config = _admin_sms_config()
+    if not config:
+        return False, "Direct SMS is not configured in Streamlit Secrets."
+
+    number = normalise_phone(phone)
+    if number and not number.startswith("+"):
+        number = "+" + number
+    if not number or not re.fullmatch(r"\+\d{8,15}", number):
+        return False, "Invalid or missing mobile number."
+
+    payload = {
+        "To": number,
+        "Body": str(message or "").strip(),
+    }
+    if config["messaging_service_sid"]:
+        payload["MessagingServiceSid"] = config["messaging_service_sid"]
+    else:
+        sender = config["from_number"]
+        if sender and not sender.startswith("+") and sender.upper().startswith("MG") is False:
+            # Alphanumeric sender IDs are also accepted by Twilio where supported.
+            if sender.isdigit():
+                sender = "+" + sender
+        payload["From"] = sender
+
+    try:
+        response = requests.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{config['account_sid']}/Messages.json",
+            auth=(config["account_sid"], config["auth_token"]),
+            data=payload,
+            timeout=25,
+        )
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if 200 <= response.status_code < 300:
+            return True, clean_val(body.get("sid")) or "sent"
+        return False, clean_val(body.get("message")) or f"SMS provider error {response.status_code}."
+    except requests.RequestException:
+        return False, "Could not contact the SMS provider. Please try again."
+
+
+def _admin_reminder_columns_ready():
+    """Check whether customer_records has persistent reminder status columns."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers()
+    if not url or not headers:
+        return False
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            params={"select": "id,reminder_sent_for,reminder_sent_at", "limit": "1"},
+            timeout=12,
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _admin_mark_reminder_sent(customer_id, scheduled_date):
+    """Persist the last reminder date/time for one customer."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=representation")
+    if not url or not headers or customer_id in (None, ""):
+        return False
+    try:
+        response = requests.patch(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            params={"id": f"eq.{customer_id}", "select": "id"},
+            json={
+                "reminder_sent_for": str(scheduled_date),
+                "reminder_sent_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            timeout=20,
+        )
+        return response.status_code == 200 and bool(response.json())
+    except (requests.RequestException, ValueError, TypeError):
+        return False
+
+
+PHONE_REMINDER_URL = "https://dancleanuk-optimizer.streamlit.app/?phone_reminders=1"
+
+
+def _admin_reminder_queue_columns_ready():
+    """Check whether the optional phone reminder queue columns exist."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers()
+    if not url or not headers:
+        return False
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            params={"select": "id,reminder_queued_for,reminder_queued_at", "limit": "1"},
+            timeout=12,
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _admin_prepare_phone_reminder_queue(customer_ids, scheduled_date):
+    """Replace tomorrow's phone queue with exactly the selected Admin customers."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=minimal")
+    if not url or not headers or not _admin_reminder_queue_columns_ready():
+        return False, "Phone reminder queue storage is not ready."
+
+    target = str(scheduled_date)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        # Clear only this target day's old queue. Other dates and reminder history stay untouched.
+        clear_response = requests.patch(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            params={"reminder_queued_for": f"eq.{target}"},
+            json={
+                "reminder_queued_for": None,
+                "reminder_queued_at": None,
+                "updated_at": now_iso,
+            },
+            timeout=20,
+        )
+        if clear_response.status_code not in (200, 204):
+            return False, "Could not clear the previous phone reminder queue."
+
+        saved = 0
+        for customer_id in customer_ids:
+            if customer_id in (None, ""):
+                continue
+            response = requests.patch(
+                f"{url}/rest/v1/customer_records",
+                headers=headers,
+                params={"id": f"eq.{customer_id}"},
+                json={
+                    "reminder_queued_for": target,
+                    "reminder_queued_at": now_iso,
+                    "updated_at": now_iso,
+                },
+                timeout=20,
+            )
+            if response.status_code not in (200, 204):
+                return False, f"Could not add all selected customers to the phone queue ({saved} saved)."
+            saved += 1
+        return True, saved
+    except requests.RequestException:
+        return False, "Could not update the phone reminder queue. Please try again."
+
+
+def _admin_load_phone_reminder_queue(scheduled_date):
+    """Load the exact customer set prepared in Admin for the phone sender."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers()
+    if not url or not headers or not _admin_reminder_queue_columns_ready():
+        return []
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            params={
+                "active": "eq.true",
+                "reminder_queued_for": f"eq.{scheduled_date}",
+                "select": "id,address,postcode,phone,next_cleaning_due,planned_service_date,reminder_sent_for,reminder_sent_at,reminder_queued_for,reminder_queued_at",
+                "order": "postcode.asc,address.asc",
+            },
+            timeout=20,
+        )
+        if response.status_code != 200:
+            return []
+        return response.json() or []
+    except (requests.RequestException, ValueError, TypeError):
+        return []
+
+
+def _admin_clear_phone_reminder_queue_customer(customer_id):
+    """Remove one customer from the prepared phone queue after confirmed send."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=minimal")
+    if not url or not headers or customer_id in (None, ""):
+        return False
+    try:
+        response = requests.patch(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            params={"id": f"eq.{customer_id}"},
+            json={
+                "reminder_queued_for": None,
+                "reminder_queued_at": None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            timeout=20,
+        )
+        return response.status_code in (200, 204)
+    except requests.RequestException:
+        return False
+
+
+def _phone_reminder_reset_session():
+    for key in (
+        "phone_reminder_active_queue",
+        "phone_reminder_queue_date",
+        "phone_reminder_index",
+        "phone_reminder_sent_count",
+    ):
+        st.session_state.pop(key, None)
+
+
+# ============================================================
+# ADMIN PHONE REMINDER SEND MODE
+# ============================================================
+# This is a separate Admin utility reached only with ?phone_reminders=1.
+# It stops before the normal Driver front, so Driver and the route engine remain unchanged.
+if PHONE_REMINDER_MODE:
+    st.title("📱 DanCleanUK — Reminder Sender")
+    st.caption("Send tomorrow's prepared reminders through this phone's normal Messages app")
+
+    if not _admin_customer_table_ready():
+        st.error("Customer storage is not available.")
+        st.stop()
+    if not _admin_reminder_columns_ready():
+        st.error("Reminder history storage is not ready yet.")
+        st.stop()
+    if not _admin_reminder_queue_columns_ready():
+        st.error("Phone reminder queue storage is not ready yet. Run the supplied one-time Supabase SQL.")
+        st.stop()
+
+    london_today = datetime.now(ZoneInfo("Europe/London")).date()
+    phone_tomorrow = (pd.Timestamp(london_today) + pd.Timedelta(days=1)).date()
+    phone_date_str = phone_tomorrow.isoformat()
+
+    # A queue is intentionally local to the phone session after Start Sending.
+    # This keeps the sequence stable while each sent customer is removed from Supabase.
+    active_queue = st.session_state.get("phone_reminder_active_queue")
+    if st.session_state.get("phone_reminder_queue_date") != phone_date_str:
+        _phone_reminder_reset_session()
+        active_queue = None
+
+    if not active_queue:
+        queued = _admin_load_phone_reminder_queue(phone_date_str)
+        valid_queue = []
+        for row in queued:
+            due = clean_val(row.get("next_cleaning_due"))
+            planned = clean_val(row.get("planned_service_date"))
+            scheduled = planned or due
+            if scheduled != phone_date_str:
+                continue
+            phone = clean_val(row.get("phone"))
+            if not phone:
+                continue
+            valid_queue.append({
+                "Customer ID": row.get("id"),
+                "Address": clean_val(row.get("address")) or "Customer",
+                "Postcode": normalise_postcode(row.get("postcode")),
+                "Phone": phone,
+                "Reminder Sent For": clean_val(row.get("reminder_sent_for")),
+                "Reminder Sent At": clean_val(row.get("reminder_sent_at")),
+            })
+
+        st.subheader(f"Tomorrow · {phone_tomorrow.strftime('%d/%m/%Y')}")
+        if not valid_queue:
+            st.info("No reminders are prepared for tomorrow. Prepare the selected customers in Admin on the laptop first.")
+            st.markdown("You can keep this page bookmarked on your phone and refresh it after preparing the queue.")
+            if st.button("🔄 Refresh", use_container_width=True):
+                st.rerun()
+            st.stop()
+
+        st.success(f"{len(valid_queue)} customer reminder(s) ready on this phone.")
+        with st.expander("Preview message", expanded=False):
+            st.write(_admin_reminder_message())
+
+        for row in valid_queue:
+            already_sent = row["Reminder Sent For"] == phone_date_str
+            with st.container(border=True):
+                st.markdown(f"**{row['Address']}**")
+                st.caption(f"{row['Postcode']} · 📞 {row['Phone']}")
+                if already_sent:
+                    st.warning("This customer already has a reminder recorded for tomorrow. They are still in the queue because Admin deliberately selected them again.")
+
+        if st.button(
+            f"▶️ START SENDING {len(valid_queue)} REMINDER(S)",
+            type="primary",
+            use_container_width=True,
+            key="phone_reminder_start",
+        ):
+            st.session_state["phone_reminder_active_queue"] = valid_queue
+            st.session_state["phone_reminder_queue_date"] = phone_date_str
+            st.session_state["phone_reminder_index"] = 0
+            st.session_state["phone_reminder_sent_count"] = 0
+            st.rerun()
+        st.stop()
+
+    queue = st.session_state.get("phone_reminder_active_queue", [])
+    index = int(st.session_state.get("phone_reminder_index", 0))
+    sent_count = int(st.session_state.get("phone_reminder_sent_count", 0))
+
+    if index >= len(queue):
+        st.success(f"✅ Reminder session finished. {sent_count} marked as sent.")
+        remaining = _admin_load_phone_reminder_queue(phone_date_str)
+        if remaining:
+            st.info(f"{len(remaining)} customer(s) are still in the prepared queue — for example jobs you skipped.")
+        else:
+            st.info("No customers remain in tomorrow's prepared reminder queue.")
+        if st.button("🔄 RELOAD REMAINING QUEUE", type="primary", use_container_width=True):
+            _phone_reminder_reset_session()
+            st.rerun()
+        st.stop()
+
+    current = queue[index]
+    st.progress((index + 1) / max(1, len(queue)))
+    st.caption(f"Customer {index + 1} of {len(queue)} · {sent_count} marked sent")
+    st.markdown(f"### {current['Address']}")
+    st.write(current["Postcode"])
+    st.write(f"📞 {current['Phone']}")
+
+    with st.expander("Message", expanded=True):
+        st.write(_admin_reminder_message())
+
+    st.link_button(
+        "💬 OPEN SMS — MESSAGE READY",
+        _admin_reminder_sms_url(current["Phone"]),
+        type="primary",
+        use_container_width=True,
+    )
+    st.caption("Send it in your normal Messages app, then come back here and press SENT — NEXT.")
+
+    sent_col, skip_col = st.columns(2)
+    if sent_col.button(
+        "✅ SENT — NEXT",
+        type="primary",
+        use_container_width=True,
+        key=f"phone_reminder_sent_{index}",
+    ):
+        if _admin_mark_reminder_sent(current["Customer ID"], phone_date_str):
+            _admin_clear_phone_reminder_queue_customer(current["Customer ID"])
+            st.session_state["phone_reminder_sent_count"] = sent_count + 1
+            st.session_state["phone_reminder_index"] = index + 1
+            st.rerun()
+        else:
+            st.error("The reminder status could not be saved. Do not move on yet; please try again.")
+
+    if skip_col.button(
+        "⏭️ SKIP",
+        use_container_width=True,
+        key=f"phone_reminder_skip_{index}",
+    ):
+        st.session_state["phone_reminder_index"] = index + 1
+        st.rerun()
+
+    if st.button("↩️ End / reload queue", use_container_width=True, key="phone_reminder_end"):
+        _phone_reminder_reset_session()
+        st.rerun()
+
+    st.stop()
 
 
 if st.session_state.get("admin_office_view", False):
@@ -1335,16 +1714,31 @@ if st.session_state.get("admin_office_view", False):
 
     if admin_tab == "📅 Upcoming Work / Planner":
         st.header("📅 Upcoming Work / Planner")
-        st.caption("Upcoming cleans, manual bring-forward dates and next-day customer reminders")
+        st.caption("Plan upcoming cleans, move one-off jobs earlier or later, and send tomorrow reminders")
 
         if not _admin_customer_table_ready():
             st.info("Customer storage is not ready yet.")
         else:
             move_ready = _admin_planned_service_column_ready()
+            reminder_status_ready = _admin_reminder_columns_ready()
+            reminder_queue_ready = _admin_reminder_queue_columns_ready()
+
             if not move_ready:
                 st.warning(
-                    "Manual Bring Forward is not enabled yet. Run the supplied one-time Supabase "
+                    "Manual job moves are not enabled yet. Run the supplied one-time Supabase "
                     "planned-service-date setup SQL, then refresh this page."
+                )
+
+            if not reminder_status_ready:
+                st.warning(
+                    "Reminder history is not enabled yet. Run the supplied one-time reminder-status "
+                    "Supabase SQL before using direct or bulk SMS."
+                )
+
+            if not reminder_queue_ready:
+                st.warning(
+                    "Phone reminder queue is not enabled yet. Run the supplied one-time phone-queue "
+                    "Supabase SQL, then refresh this page."
                 )
 
             customer_records = _admin_load_customer_records(active_only=True)
@@ -1366,6 +1760,8 @@ if st.session_state.get("admin_office_view", False):
                     "Next Cleaning Due": due,
                     "Planned Service Date": planned,
                     "Scheduled Date": scheduled,
+                    "Reminder Sent For": clean_val(row.get("reminder_sent_for")),
+                    "Reminder Sent At": clean_val(row.get("reminder_sent_at")),
                 })
 
             if not upcoming_records:
@@ -1401,15 +1797,19 @@ if st.session_state.get("admin_office_view", False):
                         return
 
                     editor_key = f"admin_move_editor_{customer_id}"
+                    planned_date = None
                     if planned_raw:
                         try:
                             planned_date = pd.to_datetime(planned_raw).date()
-                            st.caption(
-                                f"⏩ Moved forward to {planned_date.strftime('%d/%m/%Y')} "
-                                f"· original due {original_due.strftime('%d/%m/%Y')}"
-                            )
                         except Exception:
                             planned_date = None
+
+                    if planned_date:
+                        direction = "forward" if planned_date < original_due else "back"
+                        st.caption(
+                            f"📆 One-off move {direction}: {planned_date.strftime('%d/%m/%Y')} "
+                            f"· regular due {original_due.strftime('%d/%m/%Y')}"
+                        )
                         b1, b2 = st.columns(2)
                         if b1.button(
                             "✏️ Change Move",
@@ -1430,42 +1830,36 @@ if st.session_state.get("admin_office_view", False):
                                 st.rerun()
                             else:
                                 st.error("Could not cancel this move. Please try again.")
-                    elif original_due > today:
+                    else:
                         if st.button(
-                            "⏩ Bring Forward",
+                            "📆 Move Job",
                             key=f"{key_prefix}_open_{customer_id}",
                             use_container_width=True,
                             disabled=not move_ready,
+                            help="Move this one clean earlier or later without changing the customer's regular cleaning plan.",
                         ):
                             st.session_state[editor_key] = True
                             st.rerun()
 
                     if st.session_state.get(editor_key):
-                        latest_allowed = (pd.Timestamp(original_due) - pd.Timedelta(days=1)).date()
-                        if latest_allowed < today:
-                            st.info("This job cannot be brought forward because its regular due date is today or earlier.")
-                            if st.button("Close", key=f"{key_prefix}_close_{customer_id}"):
-                                st.session_state.pop(editor_key, None)
-                                st.rerun()
-                            return
-                        current_planned = None
-                        if planned_raw:
-                            try:
-                                current_planned = pd.to_datetime(planned_raw).date()
-                            except Exception:
-                                current_planned = None
-                        default_date = current_planned or latest_allowed
+                        current_planned = planned_date
+                        default_date = current_planned or original_due
                         if default_date < today:
                             default_date = today
+                        latest_allowed = (pd.Timestamp(today) + pd.DateOffset(years=1)).date()
                         if default_date > latest_allowed:
                             default_date = latest_allowed
+
                         new_date = st.date_input(
-                            "Bring this job forward to",
+                            "Move this job to",
                             value=default_date,
                             min_value=today,
                             max_value=latest_allowed,
                             key=f"{key_prefix}_date_{customer_id}",
-                            help="This changes only this one clean. The customer's regular Next Cleaning Due date stays unchanged.",
+                            help=(
+                                "This changes only this one clean. The customer's regular Next Cleaning Due "
+                                "date and cleaning plan stay unchanged."
+                            ),
                         )
                         c1, c2 = st.columns(2)
                         if c1.button(
@@ -1474,7 +1868,11 @@ if st.session_state.get("admin_office_view", False):
                             key=f"{key_prefix}_save_{customer_id}",
                             use_container_width=True,
                         ):
-                            if _admin_set_planned_service_date(customer_id, new_date):
+                            if new_date == original_due:
+                                ok = _admin_clear_planned_service_date(customer_id)
+                            else:
+                                ok = _admin_set_planned_service_date(customer_id, new_date)
+                            if ok:
                                 st.session_state.pop(editor_key, None)
                                 st.rerun()
                             else:
@@ -1508,49 +1906,180 @@ if st.session_state.get("admin_office_view", False):
 
                     tomorrow_rows = visible[visible["Due"] == "Due Tomorrow"].copy()
                     if not tomorrow_rows.empty:
+                        tomorrow_rows = tomorrow_rows.sort_values(
+                            ["Postcode", "Address"], na_position="last"
+                        ).reset_index(drop=True)
+
                         st.subheader("🔔 Tomorrow — reminders")
-                        st.caption("Send these today. The message contains no price or payment details.")
+                        st.caption(
+                            f"Tomorrow: {len(tomorrow_rows)} customer(s). Tick only the customers you want to message. "
+                            "Unticking a customer does not remove them from tomorrow's work."
+                        )
+
                         with st.expander("Preview standard reminder message", expanded=False):
                             st.write(_admin_reminder_message())
 
-                        for reminder_idx, (_, row) in enumerate(
-                            tomorrow_rows.sort_values(["Postcode", "Address"], na_position="last").iterrows()
+                        if st.session_state.pop("admin_reminder_send_notice", None):
+                            notice = st.session_state.pop("admin_reminder_send_notice_text", "")
+                            if notice:
+                                st.success(notice)
+                        if st.session_state.pop("admin_reminder_send_error", None):
+                            error_text = st.session_state.pop("admin_reminder_send_error_text", "")
+                            if error_text:
+                                st.error(error_text)
+
+                        eligible_keys = []
+                        for _, row in tomorrow_rows.iterrows():
+                            customer_id = clean_val(row.get("Customer ID"))
+                            phone = clean_val(row.get("Phone"))
+                            if customer_id and phone:
+                                eligible_keys.append(
+                                    f"admin_reminder_select_{customer_id}_{tomorrow.isoformat()}"
+                                )
+
+                        sel1, sel2 = st.columns(2)
+                        if sel1.button(
+                            "✅ Select Unsent",
+                            use_container_width=True,
+                            key="admin_reminder_select_unsent",
                         ):
+                            for _, row in tomorrow_rows.iterrows():
+                                customer_id = clean_val(row.get("Customer ID"))
+                                phone = clean_val(row.get("Phone"))
+                                if not customer_id or not phone:
+                                    continue
+                                sent_for = clean_val(row.get("Reminder Sent For"))
+                                key = f"admin_reminder_select_{customer_id}_{tomorrow.isoformat()}"
+                                st.session_state[key] = sent_for != tomorrow.isoformat()
+                            st.rerun()
+
+                        if sel2.button(
+                            "⬜ Clear All",
+                            use_container_width=True,
+                            key="admin_reminder_clear_all",
+                        ):
+                            for key in eligible_keys:
+                                st.session_state[key] = False
+                            st.rerun()
+
+                        selected_customers = []
+                        for reminder_idx, (_, row) in enumerate(tomorrow_rows.iterrows()):
+                            customer_id = clean_val(row.get("Customer ID"))
                             address = clean_val(row.get("Address")) or "Customer"
                             postcode = normalise_postcode(row.get("Postcode"))
                             phone = clean_val(row.get("Phone"))
-                            try:
-                                due_label = pd.to_datetime(row.get("Scheduled Date")).strftime("%d/%m/%Y")
-                            except Exception:
-                                due_label = clean_val(row.get("Scheduled Date"))
+                            sent_for = clean_val(row.get("Reminder Sent For"))
+                            sent_at = clean_val(row.get("Reminder Sent At"))
+                            already_sent = sent_for == tomorrow.isoformat()
+                            select_key = f"admin_reminder_select_{customer_id}_{tomorrow.isoformat()}"
+
+                            if select_key not in st.session_state:
+                                st.session_state[select_key] = bool(phone) and not already_sent
 
                             with st.container(border=True):
-                                left, middle, right = st.columns([4, 2, 2])
-                                left.markdown(f"**{address}**  \n{postcode}")
-                                middle.markdown(f"**Due tomorrow**  \n{due_label}")
+                                tick_col, detail_col, action_col = st.columns([1, 5, 2])
+                                selected_now = tick_col.checkbox(
+                                    "Send",
+                                    key=select_key,
+                                    disabled=not bool(phone),
+                                    label_visibility="collapsed",
+                                )
+                                detail_col.markdown(f"**{address}**  \n{postcode}")
                                 if phone:
-                                    right.link_button(
-                                        "💬 Send Reminder",
+                                    detail_col.caption(f"📞 {phone}")
+                                else:
+                                    detail_col.caption("⚠️ No phone number")
+
+                                if already_sent:
+                                    sent_label = "Reminder sent"
+                                    if sent_at:
+                                        try:
+                                            sent_dt = pd.to_datetime(sent_at, utc=True).tz_convert("Europe/London")
+                                            sent_label += f" · {sent_dt.strftime('%d/%m/%Y %H:%M')}"
+                                        except Exception:
+                                            pass
+                                    action_col.success("✅ " + sent_label)
+                                elif phone:
+                                    action_col.caption("Not sent yet")
+
+                                if phone:
+                                    action_col.link_button(
+                                        "💬 Open SMS",
                                         _admin_reminder_sms_url(phone),
                                         use_container_width=True,
                                     )
-                                    right.caption(f"📞 {phone}")
-                                else:
-                                    right.button(
-                                        "💬 No phone number",
-                                        disabled=True,
-                                        use_container_width=True,
-                                        key=f"admin_no_phone_{reminder_idx}_{postcode}",
-                                    )
+
                                 _render_move_controls(row, f"tomorrow_{reminder_idx}")
+
+                            if selected_now and phone:
+                                selected_customers.append({
+                                    "Customer ID": customer_id,
+                                    "Address": address,
+                                    "Phone": phone,
+                                })
+
+                        selected_count = len(selected_customers)
+                        st.markdown("---")
+
+                        prepare_disabled = (
+                            selected_count == 0
+                            or not reminder_status_ready
+                            or not reminder_queue_ready
+                        )
+                        if st.button(
+                            f"📱 PREPARE {selected_count} REMINDER(S) FOR PHONE",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=prepare_disabled,
+                            key="admin_prepare_phone_reminders",
+                        ):
+                            selected_ids = [x["Customer ID"] for x in selected_customers]
+                            ok, detail = _admin_prepare_phone_reminder_queue(
+                                selected_ids, tomorrow.isoformat()
+                            )
+                            if ok:
+                                st.session_state["admin_phone_queue_notice"] = (
+                                    f"✅ Phone reminder queue ready for {detail} customer(s)."
+                                )
+                            else:
+                                st.session_state["admin_phone_queue_error"] = str(detail)
+                            st.rerun()
+
+                        if selected_count == 0:
+                            st.caption("Tick at least one customer to prepare the phone reminder queue.")
+                        elif not reminder_status_ready:
+                            st.caption("Reminder history storage must be enabled first.")
+                        elif not reminder_queue_ready:
+                            st.caption("Run the one-time phone reminder queue SQL first.")
+                        else:
+                            st.caption(
+                                "This saves exactly the customers currently ticked. Unticked customers will not appear in Phone Reminder Mode."
+                            )
+
+                        phone_queue_notice = st.session_state.pop("admin_phone_queue_notice", "")
+                        if phone_queue_notice:
+                            st.success(phone_queue_notice)
+                            st.markdown(
+                                f"**On your phone open:** [{PHONE_REMINDER_URL}]({PHONE_REMINDER_URL})"
+                            )
+                            st.caption("Bookmark that page on your phone — the same link can be reused every day.")
+
+                        phone_queue_error = st.session_state.pop("admin_phone_queue_error", "")
+                        if phone_queue_error:
+                            st.error(phone_queue_error)
 
                     # Tomorrow is already shown above, so do not repeat it here.
                     other_rows = visible[visible["Due"] != "Due Tomorrow"].copy()
                     if not other_rows.empty:
                         st.subheader("📅 Other work due in the next 7 days")
-                        st.caption("Tomorrow's reminder jobs are shown above and are not repeated here.")
+                        st.caption(
+                            "Use Move Job to bring work forward or push a one-off clean back. "
+                            "The customer's regular cleaning plan is not changed."
+                        )
                         for work_idx, (_, row) in enumerate(
-                            other_rows.sort_values(["_scheduled", "Postcode", "Address"], na_position="last").iterrows()
+                            other_rows.sort_values(
+                                ["_scheduled", "Postcode", "Address"], na_position="last"
+                            ).iterrows()
                         ):
                             address = clean_val(row.get("Address")) or "Customer"
                             postcode = normalise_postcode(row.get("Postcode"))
