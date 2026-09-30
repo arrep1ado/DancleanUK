@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.9-ADMIN-TO-OPTIMIZER"
+APP_VERSION = "27.8.8.5.0.10-ADMIN-DUE-DATE-FIX"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1422,16 +1422,19 @@ if st.session_state.get("admin_office_view", False):
                         visible_route_df["Phone"].fillna("").astype(str)
                     ).str.casefold()
                     visible_route_df = visible_route_df[route_haystack.str.contains(route_search, regex=False)].copy()
+                target_route_ts = pd.Timestamp(target_route_date).normalize()
                 if filter_mode == "Due / overdue by route date":
+                    visible_due_series = pd.to_datetime(
+                        visible_route_df["_due_date"], errors="coerce"
+                    ).dt.normalize()
                     visible_route_df = visible_route_df[
-                        visible_route_df["_due_date"].notna()
-                        & visible_route_df["_due_date"].map(lambda d: d <= target_route_date)
+                        visible_due_series.notna() & (visible_due_series <= target_route_ts)
                     ].copy()
 
-                due_mask = route_customer_df["_due_date"].map(
-                    lambda d: isinstance(d, date) and d <= target_route_date
-                )
-                due_count = int(due_mask.sum()) if not route_customer_df.empty else 0
+                due_series = pd.to_datetime(
+                    route_customer_df["_due_date"], errors="coerce"
+                ).dt.normalize()
+                due_count = int((due_series.notna() & (due_series <= target_route_ts)).sum())
                 # Keep the summary business-friendly and independent from the route engine.
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Active customers", len(route_customer_df))
