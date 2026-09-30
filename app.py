@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.7-ADMIN-PLANNER-CUSTOMER-RECORDS"
+APP_VERSION = "27.8.8.5.0.8-ADMIN-CUSTOMER-EDIT-POLISH"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -937,32 +937,6 @@ def _admin_load_customer_records(active_only=True):
         return []
 
 
-def _admin_planner_customer_records():
-    """Read active permanent customers for the separate Admin planner only.
-
-    This deliberately uses customer_records as the Admin source of truth. It does
-    not touch saved Driver routes, geocoding, ORS or the locked route optimiser.
-    """
-    rows = _admin_load_customer_records(active_only=True)
-    records = []
-    for row in rows:
-        due = clean_val(row.get("next_cleaning_due"))
-        if not due:
-            continue
-        records.append({
-            "customer_id": row.get("id"),
-            "Address": clean_val(row.get("address")),
-            "Postcode": normalise_postcode(row.get("postcode")),
-            "Price": float(row.get("price", 0) or 0),
-            "Phone": clean_val(row.get("phone")),
-            "Cleaning Plan": normalise_cleaning_plan(row.get("cleaning_plan")),
-            "Notes": clean_val(row.get("notes")),
-            "Next Cleaning Due": due,
-            "Zone": clean_val(row.get("zone")) or _admin_auto_zone(row.get("postcode")),
-        })
-    return records
-
-
 def _admin_customer_table_ready():
     url, _ = _supabase_config()
     headers = _supabase_headers()
@@ -1097,6 +1071,50 @@ def _admin_add_customer(address, postcode, phone, price, cleaning_plan, next_due
     except requests.RequestException:
         return False, "Could not save the customer. Please try again."
 
+
+def _admin_update_customer(customer_id, address, postcode, phone, price, cleaning_plan, next_due, notes):
+    """Update one permanent Admin customer. Never touches Driver routes or route order."""
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=representation")
+    if not url or not headers or customer_id in (None, ""):
+        return False, "Customer storage is not available."
+    pc = normalise_postcode(postcode)
+    payload = {
+        "address": clean_val(address),
+        "postcode": pc,
+        "phone": clean_val(phone),
+        "price": float(price or 0),
+        "cleaning_plan": normalise_cleaning_plan(cleaning_plan),
+        "next_cleaning_due": next_due.isoformat() if next_due else None,
+        "notes": clean_val(notes),
+        "zone": _admin_auto_zone(pc),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        response = requests.patch(
+            f"{url}/rest/v1/customer_records",
+            headers=headers,
+            params={"id": f"eq.{customer_id}", "select": "id"},
+            json=payload,
+            timeout=20,
+        )
+        if response.status_code == 200 and bool(response.json()):
+            return True, ""
+        return False, "Could not update this customer. Please try again."
+    except (requests.RequestException, ValueError, TypeError):
+        return False, "Could not update this customer. Please try again."
+
+
+def _admin_due_date_value(value, fallback=None):
+    """Return a safe Python date for Admin date inputs."""
+    fallback = fallback or datetime.now(ZoneInfo("Europe/London")).date()
+    if not clean_val(value):
+        return fallback
+    try:
+        return pd.to_datetime(value).date()
+    except Exception:
+        return fallback
+
 def _admin_customer_rows(routes):
     """Build one latest permanent customer record from saved route history."""
     latest = {}
@@ -1163,109 +1181,130 @@ if st.session_state.get("admin_office_view", False):
         st.header("📅 Upcoming Work / Planner")
         st.caption("Upcoming cleans and next-day customer reminders")
 
-        # Separate Admin planner reads directly from the permanent customer book.
-        # A customer due tomorrow therefore appears here today for its reminder.
-        upcoming_records = _admin_planner_customer_records()
-        if not upcoming_records:
-            st.info("No customers with a Next Cleaning Due date have been added yet.")
+        if not _admin_customer_table_ready():
+            st.info("Customer storage is not ready yet.")
         else:
-            planner_df = pd.DataFrame(upcoming_records)
-            planner_df["_due"] = pd.to_datetime(planner_df["Next Cleaning Due"], errors="coerce").dt.date
-            planner_df = planner_df[planner_df["_due"].notna()].copy()
-            today = datetime.now(ZoneInfo("Europe/London")).date()
-            tomorrow = today + pd.Timedelta(days=1)
-            week_end = today + pd.Timedelta(days=7)
+            customer_records = _admin_load_customer_records(active_only=True)
+            upcoming_records = []
+            for row in customer_records:
+                due = clean_val(row.get("next_cleaning_due"))
+                if not due:
+                    continue
+                upcoming_records.append({
+                    "Customer ID": row.get("id"),
+                    "Address": clean_val(row.get("address")),
+                    "Postcode": normalise_postcode(row.get("postcode")),
+                    "Price": float(row.get("price", 0) or 0),
+                    "Phone": clean_val(row.get("phone")),
+                    "Cleaning Plan": normalise_cleaning_plan(row.get("cleaning_plan")),
+                    "Notes": clean_val(row.get("notes")),
+                    "Next Cleaning Due": due,
+                })
 
-            def _admin_due_group(due):
-                if due < today:
-                    return "Overdue"
-                if due == today:
-                    return "Due Today"
-                if due == tomorrow:
-                    return "Due Tomorrow"
-                if due <= week_end:
-                    return "Due This Week"
-                return "Later"
-
-            planner_df["Due"] = planner_df["_due"].map(_admin_due_group)
-            visible = planner_df[planner_df["Due"] != "Later"].copy()
-            counts = visible["Due"].value_counts() if not visible.empty else {}
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Overdue", int(counts.get("Overdue", 0)))
-            c2.metric("Today", int(counts.get("Due Today", 0)))
-            c3.metric("Tomorrow", int(counts.get("Due Tomorrow", 0)))
-            c4.metric("Next 7 Days", int(len(visible)))
-
-            if visible.empty:
-                next_due = planner_df["_due"].min() if not planner_df.empty else None
-                st.info(
-                    f"Nothing is due in the next 7 days. Next due: {next_due.strftime('%d/%m/%Y')}"
-                    if next_due else "No recurring work is due yet."
-                )
+            if not upcoming_records:
+                st.info("No customers currently have a Next Cleaning Due date.")
             else:
-                st.metric("Due work value", f"£{float(visible['Price'].sum()):.2f}")
+                planner_df = pd.DataFrame(upcoming_records)
+                planner_df["_due"] = pd.to_datetime(planner_df["Next Cleaning Due"], errors="coerce").dt.date
+                planner_df = planner_df[planner_df["_due"].notna()].copy()
+                today = datetime.now(ZoneInfo("Europe/London")).date()
+                tomorrow = today + pd.Timedelta(days=1)
+                week_end = today + pd.Timedelta(days=7)
 
-                tomorrow_rows = visible[visible["Due"] == "Due Tomorrow"].copy()
-                if not tomorrow_rows.empty:
-                    st.subheader("🔔 Tomorrow — reminders")
-                    st.caption("Click Send Reminder from the computer. The message contains no price or payment details.")
-                    with st.expander("Preview standard reminder message", expanded=False):
-                        st.write(_admin_reminder_message())
+                def _admin_due_group(due):
+                    if due < today:
+                        return "Overdue"
+                    if due == today:
+                        return "Due Today"
+                    if due == tomorrow:
+                        return "Due Tomorrow"
+                    if due <= week_end:
+                        return "Due This Week"
+                    return "Later"
 
-                    for reminder_idx, (_, row) in enumerate(
-                        tomorrow_rows.sort_values(["Postcode", "Address"], na_position="last").iterrows()
-                    ):
-                        address = clean_val(row.get("Address")) or "Customer"
-                        postcode = normalise_postcode(row.get("Postcode"))
-                        phone = clean_val(row.get("Phone"))
-                        try:
-                            due_label = pd.to_datetime(row.get("Next Cleaning Due")).strftime("%d/%m/%Y")
-                        except Exception:
-                            due_label = clean_val(row.get("Next Cleaning Due"))
+                planner_df["Due"] = planner_df["_due"].map(_admin_due_group)
+                visible = planner_df[planner_df["Due"] != "Later"].copy()
+                counts = visible["Due"].value_counts() if not visible.empty else {}
 
-                        with st.container(border=True):
-                            left, middle, right = st.columns([4, 2, 2])
-                            left.markdown(f"**{address}**  \n{postcode}")
-                            middle.markdown(f"**Due tomorrow**  \n{due_label}")
-                            if phone:
-                                right.link_button(
-                                    "💬 Send Reminder",
-                                    _admin_reminder_sms_url(phone),
-                                    use_container_width=True,
-                                )
-                                right.caption(f"📞 {phone}")
-                            else:
-                                right.button(
-                                    "💬 No phone number",
-                                    disabled=True,
-                                    use_container_width=True,
-                                    key=f"admin_no_phone_{reminder_idx}_{postcode}",
-                                )
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Overdue", int(counts.get("Overdue", 0)))
+                c2.metric("Today", int(counts.get("Due Today", 0)))
+                c3.metric("Tomorrow", int(counts.get("Due Tomorrow", 0)))
+                c4.metric("Next 7 Days", int(len(visible)))
 
-                st.subheader("📅 Work due in the next 7 days")
-                for work_idx, (_, row) in enumerate(
-                    visible.sort_values(["_due", "Postcode", "Address"], na_position="last").iterrows()
-                ):
-                    address = clean_val(row.get("Address")) or "Customer"
-                    postcode = normalise_postcode(row.get("Postcode"))
-                    phone = clean_val(row.get("Phone")) or "—"
-                    due_group = clean_val(row.get("Due"))
-                    price = float(row.get("Price", 0) or 0)
-                    plan = normalise_cleaning_plan(row.get("Cleaning Plan")) or "No plan"
-                    notes = clean_val(row.get("Notes"))
-                    try:
-                        due_label = pd.to_datetime(row.get("Next Cleaning Due")).strftime("%d/%m/%Y")
-                    except Exception:
-                        due_label = clean_val(row.get("Next Cleaning Due")) or "—"
+                if visible.empty:
+                    next_due = planner_df["_due"].min() if not planner_df.empty else None
+                    st.info(
+                        f"Nothing is due in the next 7 days. Next due: {next_due.strftime('%d/%m/%Y')}"
+                        if next_due else "No work is due yet."
+                    )
+                else:
+                    st.metric("Due work value", f"£{float(visible['Price'].sum()):.2f}")
 
-                    with st.container(border=True):
-                        left, middle, right = st.columns([4, 2, 2])
-                        left.markdown(f"**{address}**  \n{postcode} · 📞 {phone}")
-                        middle.markdown(f"**{due_group}**  \n{due_label} · {plan}")
-                        right.markdown(f"**£{price:.2f}**")
-                        if notes:
-                            st.caption(f"Notes: {notes}")
+                    tomorrow_rows = visible[visible["Due"] == "Due Tomorrow"].copy()
+                    if not tomorrow_rows.empty:
+                        st.subheader("🔔 Tomorrow — reminders")
+                        st.caption("Send these today. The message contains no price or payment details.")
+                        with st.expander("Preview standard reminder message", expanded=False):
+                            st.write(_admin_reminder_message())
+
+                        for reminder_idx, (_, row) in enumerate(
+                            tomorrow_rows.sort_values(["Postcode", "Address"], na_position="last").iterrows()
+                        ):
+                            address = clean_val(row.get("Address")) or "Customer"
+                            postcode = normalise_postcode(row.get("Postcode"))
+                            phone = clean_val(row.get("Phone"))
+                            try:
+                                due_label = pd.to_datetime(row.get("Next Cleaning Due")).strftime("%d/%m/%Y")
+                            except Exception:
+                                due_label = clean_val(row.get("Next Cleaning Due"))
+
+                            with st.container(border=True):
+                                left, middle, right = st.columns([4, 2, 2])
+                                left.markdown(f"**{address}**  \n{postcode}")
+                                middle.markdown(f"**Due tomorrow**  \n{due_label}")
+                                if phone:
+                                    right.link_button(
+                                        "💬 Send Reminder",
+                                        _admin_reminder_sms_url(phone),
+                                        use_container_width=True,
+                                    )
+                                    right.caption(f"📞 {phone}")
+                                else:
+                                    right.button(
+                                        "💬 No phone number",
+                                        disabled=True,
+                                        use_container_width=True,
+                                        key=f"admin_no_phone_{reminder_idx}_{postcode}",
+                                    )
+
+                    # Tomorrow is already shown above, so do not repeat it here.
+                    other_rows = visible[visible["Due"] != "Due Tomorrow"].copy()
+                    if not other_rows.empty:
+                        st.subheader("📅 Other work due in the next 7 days")
+                        st.caption("Tomorrow's reminder jobs are shown above and are not repeated here.")
+                        for work_idx, (_, row) in enumerate(
+                            other_rows.sort_values(["_due", "Postcode", "Address"], na_position="last").iterrows()
+                        ):
+                            address = clean_val(row.get("Address")) or "Customer"
+                            postcode = normalise_postcode(row.get("Postcode"))
+                            phone = clean_val(row.get("Phone")) or "—"
+                            due_group = clean_val(row.get("Due"))
+                            price = float(row.get("Price", 0) or 0)
+                            plan = normalise_cleaning_plan(row.get("Cleaning Plan")) or "No plan"
+                            notes = clean_val(row.get("Notes"))
+                            try:
+                                due_label = pd.to_datetime(row.get("Next Cleaning Due")).strftime("%d/%m/%Y")
+                            except Exception:
+                                due_label = clean_val(row.get("Next Cleaning Due")) or "—"
+
+                            with st.container(border=True):
+                                left, middle, right = st.columns([4, 2, 2])
+                                left.markdown(f"**{address}**  \n{postcode} · 📞 {phone}")
+                                middle.markdown(f"**{due_group}**  \n{due_label} · {plan}")
+                                right.markdown(f"**£{price:.2f}**")
+                                if notes:
+                                    st.caption(f"Notes: {notes}")
 
     elif admin_tab == "💷 Outstanding Payments":
         st.header("💷 Outstanding Payments")
@@ -1348,7 +1387,11 @@ if st.session_state.get("admin_office_view", False):
         history_customers = _admin_customer_rows(routes)
         table_ready = _admin_customer_table_ready()
         if table_ready:
-            _admin_sync_history_customers(history_customers)
+            # Route history is only a one-time seed. Once the permanent customer
+            # book exists, edits/deletes must remain the source of truth.
+            all_customer_records = _admin_load_customer_records(active_only=False)
+            if not all_customer_records:
+                _admin_sync_history_customers(history_customers)
             manual_customers = _admin_load_customer_records(active_only=True)
         else:
             manual_customers = []
@@ -1367,9 +1410,13 @@ if st.session_state.get("admin_office_view", False):
                     phone = c3.text_input("Phone")
                     price = c4.number_input("Normal price (£)", min_value=0.0, step=1.0, value=20.0)
                     cleaning_plan = c5.selectbox("Cleaning Plan", ["", "1 Month", "2 Months", "3 Months", "4 Months", "6 Months", "12 Months"])
-                    use_due = st.checkbox("Set Next Cleaning Due", value=False)
-                    next_due_selected = st.date_input("Next Cleaning Due", value=date.today())
-                    next_due = next_due_selected if use_due else None
+                    use_due = st.checkbox("Set Next Cleaning Due now", value=False)
+                    next_due_input = st.date_input(
+                        "Next Cleaning Due",
+                        value=datetime.now(ZoneInfo("Europe/London")).date(),
+                        help="The date is only saved when 'Set Next Cleaning Due now' is ticked.",
+                    )
+                    next_due = next_due_input if use_due else None
                     notes = st.text_area("Notes", height=90)
                     preview_zone = _admin_auto_zone(postcode) if postcode else "—"
                     st.caption(f"Automatic zone: {preview_zone}")
@@ -1446,9 +1493,24 @@ if st.session_state.get("admin_office_view", False):
                     right.markdown(f"**📍 Zone {zone}**")
                     customer_id = customer.get("Customer ID")
                     if customer_id is not None:
+                        edit_state_key = "admin_edit_customer_id"
                         delete_key = f"admin_delete_customer_{customer_id}"
                         confirm_key = f"admin_delete_confirm_{customer_id}"
+                        action1, action2 = st.columns([1, 1])
+                        if action1.button("✏️ Edit Customer", key=f"admin_edit_customer_{customer_id}", use_container_width=True):
+                            if st.session_state.get(edit_state_key) == customer_id:
+                                st.session_state.pop(edit_state_key, None)
+                            else:
+                                st.session_state[edit_state_key] = customer_id
+                            st.session_state.pop(confirm_key, None)
+                            st.rerun()
+                        if action2.button("🗑️ Delete", key=delete_key, use_container_width=True):
+                            st.session_state[confirm_key] = True
+                            st.session_state.pop(edit_state_key, None)
+                            st.rerun()
+
                         if st.session_state.get(confirm_key):
+                            st.warning(f"Delete {address}? This removes the customer from the active customer list.")
                             d1, d2 = st.columns([1, 1])
                             if d1.button("Yes, delete", type="primary", key=f"{delete_key}_yes", use_container_width=True):
                                 if _admin_delete_customer(customer_id):
@@ -1459,9 +1521,67 @@ if st.session_state.get("admin_office_view", False):
                             if d2.button("Cancel", key=f"{delete_key}_cancel", use_container_width=True):
                                 st.session_state.pop(confirm_key, None)
                                 st.rerun()
-                        elif st.button("🗑️ Delete", key=delete_key):
-                            st.session_state[confirm_key] = True
-                            st.rerun()
+
+                        if st.session_state.get(edit_state_key) == customer_id:
+                            st.markdown("#### ✏️ Edit Customer")
+                            current_due_raw = clean_val(customer.get("Next Cleaning Due"))
+                            current_has_due = bool(current_due_raw)
+                            current_due_value = _admin_due_date_value(current_due_raw)
+                            plan_options = ["", "1 Month", "2 Months", "3 Months", "4 Months", "6 Months", "12 Months"]
+                            current_plan = normalise_cleaning_plan(customer.get("Cleaning Plan"))
+                            if current_plan and current_plan not in plan_options:
+                                plan_options.append(current_plan)
+                            plan_index = plan_options.index(current_plan) if current_plan in plan_options else 0
+
+                            with st.form(f"admin_edit_customer_form_{customer_id}", clear_on_submit=False):
+                                e1, e2 = st.columns([2, 1])
+                                edit_address = e1.text_input("Address *", value=address)
+                                edit_postcode = e2.text_input("Postcode *", value=pc)
+                                e3, e4, e5 = st.columns(3)
+                                edit_phone = e3.text_input("Phone", value=clean_val(customer.get("Phone")))
+                                edit_price = e4.number_input(
+                                    "Normal price (£)",
+                                    min_value=0.0,
+                                    step=1.0,
+                                    value=float(price),
+                                )
+                                edit_plan = e5.selectbox(
+                                    "Cleaning Plan",
+                                    plan_options,
+                                    index=plan_index,
+                                )
+                                edit_has_due = st.checkbox(
+                                    "Keep / set Next Cleaning Due",
+                                    value=current_has_due,
+                                )
+                                edit_due_input = st.date_input(
+                                    "Next Cleaning Due",
+                                    value=current_due_value,
+                                    help="Untick 'Keep / set Next Cleaning Due' to clear this date.",
+                                )
+                                edit_notes = st.text_area("Notes", value=notes, height=90)
+                                st.caption(f"Automatic zone after save: {_admin_auto_zone(edit_postcode) if edit_postcode else '—'}")
+                                save_edit = st.form_submit_button("💾 Save Changes", type="primary", use_container_width=True)
+                                if save_edit:
+                                    if not clean_val(edit_address) or not normalise_postcode(edit_postcode):
+                                        st.error("Address and postcode are required.")
+                                    else:
+                                        edit_due = edit_due_input if edit_has_due else None
+                                        ok, message = _admin_update_customer(
+                                            customer_id,
+                                            edit_address,
+                                            edit_postcode,
+                                            edit_phone,
+                                            edit_price,
+                                            edit_plan,
+                                            edit_due,
+                                            edit_notes,
+                                        )
+                                        if ok:
+                                            st.session_state.pop(edit_state_key, None)
+                                            st.rerun()
+                                        else:
+                                            st.error(message)
                     if notes:
                         st.caption(f"Notes: {notes}")
 
