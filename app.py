@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.11-ADMIN-SAVED-ROUTE-MANUAL-MOVE"
+APP_VERSION = "27.8.8.5.0.12-DRIVER-ROUTE-DATE-RESTORED"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -2089,23 +2089,26 @@ if st.session_state.get("admin_office_view", False):
 # SETTINGS
 # ============================================================
 
+# The route-date selector must remain available on both laptop and phone.
+# Only the routine vehicle/business settings below are hidden on mobile.
+st.sidebar.subheader("📅 Route")
+service_date = st.sidebar.date_input(
+    "Route date",
+    value=date.fromisoformat(st.session_state.service_date),
+)
+service_date_str = service_date.isoformat()
+
+if service_date_str != st.session_state.service_date:
+    st.session_state.service_date = service_date_str
+    st.session_state.pop("master_df", None)
+    st.session_state.pop("route_data", None)
+    st.session_state.pop("failed_jobs", None)
+    # Leaving a reset/new-day screen for another date starts a clean session.
+    st.session_state.pop("start_new_day_mode", None)
+    st.rerun()
+
 with st.sidebar.container(key="phone_hide_driver_settings"):
     st.title("⚙️ Settings")
-
-    service_date = st.date_input(
-        "Route date",
-        value=date.fromisoformat(st.session_state.service_date),
-    )
-    service_date_str = service_date.isoformat()
-
-    if service_date_str != st.session_state.service_date:
-        st.session_state.service_date = service_date_str
-        st.session_state.pop("master_df", None)
-        st.session_state.pop("route_data", None)
-        st.session_state.pop("failed_jobs", None)
-        # Leaving a reset/new-day screen for another date starts a clean session.
-        st.session_state.pop("start_new_day_mode", None)
-        st.rerun()
 
     DEPOT_POSTCODE = st.text_input(
         "Depot Postcode",
