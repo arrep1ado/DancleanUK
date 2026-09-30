@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.14-ADMIN-ADJUST-BUTTON-VISIBLE"
+APP_VERSION = "27.8.8.5.0.15-ADMIN-ADJUST-PROGRESS-OVERRIDE"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -464,9 +464,17 @@ def save_route_snapshot(service_date, df, route_data):
     }
     if existing_snapshot:
         existing_data = existing_snapshot.get("route_data") or {}
-        for key in ("report_b64", "report_filename", "report_saved_at"):
-            if existing_data.get(key):
-                route_payload[key] = existing_data[key]
+        # ADMIN replacement safety only: when Admin deliberately rebuilds a saved
+        # route, do not carry an old Daily Report into the replacement. Normal
+        # Driver progress/payment saves behave exactly as before.
+        admin_replacement = bool(
+            st.session_state.get("replace_saved_route_allowed", False)
+            and st.session_state.get("admin_replacement_clear_report", False)
+        )
+        if not admin_replacement:
+            for key in ("report_b64", "report_filename", "report_saved_at"):
+                if existing_data.get(key):
+                    route_payload[key] = existing_data[key]
     total_minutes = int(round(float(route_data.get("time", 0.0)) / 60.0))
     payload = {
         "route_date": str(service_date),
@@ -1658,19 +1666,18 @@ if st.session_state.get("admin_office_view", False):
                     s2.metric("Saved miles", f"{float(existing_saved_route.get('miles') or 0):.1f}")
                     s3.metric("Saved driving", f"{saved_minutes // 60}h {saved_minutes % 60:02d}m")
 
-                    # ADMIN ONLY: a saved-by-mistake route must always have an obvious correction path.
-                    # Payment choice alone does not block correction; only completed work or a permanently
-                    # saved Daily Report counts as working-day progress.
+                    # ADMIN ONLY: a saved route can always be corrected, but routes that already
+                    # contain working-day progress require a second explicit confirmation. The old
+                    # permanent route remains untouched until the replacement is optimised and saved.
                     route_has_work_progress = bool(
                         saved_completed > 0
                         or saved_report_exists
                     )
-
-                    if route_has_work_progress and adjustment_active:
-                        # Do not leave replacement permission open if the route has since been worked.
-                        st.session_state.pop("admin_adjust_saved_route_date", None)
-                        st.session_state["replace_saved_route_allowed"] = False
-                        adjustment_active = False
+                    progress_confirm_pending = bool(
+                        route_locked
+                        and st.session_state.get("admin_adjust_confirm_progress_date") == target_route_str
+                        and not adjustment_active
+                    )
 
                     if adjustment_active:
                         st.warning(
@@ -1678,12 +1685,20 @@ if st.session_state.get("admin_office_view", False):
                             "Tick or untick customers below, then send the corrected jobs to the existing optimiser. "
                             "Nothing replaces the old route until you deliberately SAVE / LOCK the new one."
                         )
+                        if st.session_state.get("admin_adjust_progress_override_date") == target_route_str:
+                            st.error(
+                                "⚠️ ADMIN OVERRIDE ACTIVE — saving the replacement will reset the old route's "
+                                "completion/payment progress and discard its saved Daily Report for this date."
+                            )
                         if st.button(
                             "↩️ CANCEL ADJUSTMENT — KEEP SAVED ROUTE",
                             use_container_width=True,
                             key="admin_cancel_saved_route_adjustment",
                         ):
                             st.session_state.pop("admin_adjust_saved_route_date", None)
+                            st.session_state.pop("admin_adjust_confirm_progress_date", None)
+                            st.session_state.pop("admin_adjust_progress_override_date", None)
+                            st.session_state.pop("admin_replacement_clear_report", None)
                             st.session_state["replace_saved_route_allowed"] = False
                             st.rerun()
                     else:
@@ -1695,23 +1710,65 @@ if st.session_state.get("admin_office_view", False):
                             "Saved by mistake or need to add/remove a customer? Use the button below. "
                             "The current saved route stays safe while you make the correction."
                         )
-                        if st.button(
-                            "✏️ ADJUST SAVED ROUTE",
-                            type="primary",
-                            use_container_width=True,
-                            disabled=route_has_work_progress,
-                            key=f"admin_begin_saved_route_adjustment_{target_route_str}",
-                        ):
-                            st.session_state["admin_adjust_saved_route_date"] = target_route_str
-                            st.session_state["replace_saved_route_allowed"] = False
-                            # Adjustment needs the whole active customer book, not only jobs currently due.
-                            st.session_state["admin_prepare_route_filter"] = "All active customers"
-                            st.rerun()
 
-                        if route_has_work_progress:
+                        if progress_confirm_pending:
+                            progress_bits = []
+                            if saved_completed:
+                                progress_bits.append(f"{saved_completed} completed job(s)")
+                            if saved_report_exists:
+                                progress_bits.append("a saved Daily Report")
+                            progress_text = " and ".join(progress_bits) or "working-day progress"
+                            st.error(
+                                f"⚠️ This route contains {progress_text}. You can still adjust it, but if you later "
+                                "SAVE / LOCK the replacement, that old progress/report will be treated as superseded. "
+                                "The current saved route remains safe until that final save."
+                            )
+                            c_confirm, c_cancel = st.columns(2)
+                            if c_confirm.button(
+                                "⚠️ YES — RESET & ADJUST",
+                                type="primary",
+                                use_container_width=True,
+                                key=f"admin_confirm_saved_route_adjustment_{target_route_str}",
+                            ):
+                                st.session_state["admin_adjust_saved_route_date"] = target_route_str
+                                st.session_state["admin_adjust_progress_override_date"] = target_route_str
+                                st.session_state.pop("admin_adjust_confirm_progress_date", None)
+                                st.session_state["replace_saved_route_allowed"] = False
+                                st.session_state["admin_prepare_route_filter"] = "All active customers"
+                                st.rerun()
+                            if c_cancel.button(
+                                "Cancel",
+                                use_container_width=True,
+                                key=f"admin_cancel_progress_adjustment_{target_route_str}",
+                            ):
+                                st.session_state.pop("admin_adjust_confirm_progress_date", None)
+                                st.session_state.pop("admin_adjust_progress_override_date", None)
+                                st.rerun()
+                        else:
+                            if st.button(
+                                "✏️ ADJUST SAVED ROUTE",
+                                type="primary",
+                                use_container_width=True,
+                                key=f"admin_begin_saved_route_adjustment_{target_route_str}",
+                            ):
+                                if route_has_work_progress:
+                                    st.session_state["admin_adjust_confirm_progress_date"] = target_route_str
+                                else:
+                                    st.session_state["admin_adjust_saved_route_date"] = target_route_str
+                                    st.session_state.pop("admin_adjust_progress_override_date", None)
+                                    st.session_state["admin_prepare_route_filter"] = "All active customers"
+                                st.session_state["replace_saved_route_allowed"] = False
+                                st.rerun()
+
+                        if route_has_work_progress and not progress_confirm_pending:
+                            reason_bits = []
+                            if saved_completed:
+                                reason_bits.append(f"{saved_completed} completed job(s)")
+                            if saved_report_exists:
+                                reason_bits.append("saved Daily Report")
                             st.info(
-                                "Adjustment is disabled because this saved route already has completed work or a "
-                                "saved Daily Report. This prevents live working-day history from being replaced."
+                                "This route already contains " + " and ".join(reason_bits) +
+                                ". Adjustment is still available, but Admin will ask for confirmation first."
                             )
 
                 route_rows = []
@@ -1915,6 +1972,10 @@ if st.session_state.get("admin_office_view", False):
                                         current_has_progress = True
                                         break
 
+                        progress_override_confirmed = bool(
+                            st.session_state.get("admin_adjust_progress_override_date") == target_route_str
+                        )
+
                         if invalid:
                             st.error(
                                 "Selected customers cannot be prepared: "
@@ -1924,9 +1985,10 @@ if st.session_state.get("admin_office_view", False):
                             st.error(
                                 "That date has a protected saved route. Click ADJUST SAVED ROUTE first. Nothing was changed."
                             )
-                        elif current_route_locked and current_has_progress:
+                        elif current_route_locked and current_has_progress and not progress_override_confirmed:
                             st.error(
-                                "This saved route now contains working-day progress, so the adjustment was stopped. "
+                                "This saved route gained completed/report progress after adjustment started. "
+                                "Return to Admin → Prepare Route and confirm the progress reset before replacing it. "
                                 "The permanent route was not changed."
                             )
                         else:
@@ -1984,7 +2046,12 @@ if st.session_state.get("admin_office_view", False):
                             # only after the explicit Admin adjustment confirmation above, so the
                             # normal Driver app and the V26.13 optimiser remain unchanged.
                             st.session_state["replace_saved_route_allowed"] = bool(current_route_locked)
+                            # ADMIN replacement only: ensure an old report is not silently attached
+                            # to a newly selected/re-optimised route. The normal Driver save path is unchanged.
+                            st.session_state["admin_replacement_clear_report"] = bool(current_route_locked)
                             st.session_state.pop("admin_adjust_saved_route_date", None)
+                            st.session_state.pop("admin_adjust_confirm_progress_date", None)
+                            st.session_state.pop("admin_adjust_progress_override_date", None)
                             st.session_state["admin_office_view"] = False
                             st.rerun()
 
