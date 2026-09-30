@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.12-DRIVER-ROUTE-DATE-RESTORED"
+APP_VERSION = "27.8.8.5.0.13-ADMIN-ADJUST-SAVED-ROUTE"
 DB_FILE = "dancleanuk.db"
 
 st.set_page_config(
@@ -1619,11 +1619,104 @@ if st.session_state.get("admin_office_view", False):
                 )
                 target_route_str = target_route_date.isoformat()
 
-                if load_route_snapshot(target_route_str) is not None:
-                    st.warning(
-                        "A permanent saved route already exists for this date. "
-                        "It is protected and will not be overwritten from Admin."
+                # ADMIN ONLY — safe correction workflow for a route that was locked by mistake.
+                # The existing permanent Supabase route is NEVER deleted here. It remains the
+                # fallback until an adjusted route has gone through the normal optimiser and the
+                # user deliberately presses SAVE / LOCK THIS ROUTE FOR PHONE again.
+                existing_saved_route = load_route_snapshot(target_route_str)
+                route_locked = existing_saved_route is not None
+                adjustment_active = bool(
+                    route_locked
+                    and st.session_state.get("admin_adjust_saved_route_date") == target_route_str
+                )
+
+                saved_route_jobs = []
+                saved_route_identities = set()
+                saved_completed = 0
+                saved_payment_started = 0
+                saved_report_exists = False
+
+                if route_locked:
+                    saved_route_jobs = list(existing_saved_route.get("jobs_data") or [])
+                    for saved_job in saved_route_jobs:
+                        saved_address = clean_val(saved_job.get("Address")) or clean_val(saved_job.get("address_text"))
+                        saved_postcode = normalise_postcode(saved_job.get("Postcode"))
+                        if saved_address or saved_postcode:
+                            saved_route_identities.add(
+                                _admin_customer_identity(saved_address, saved_postcode)
+                            )
+                        if clean_val(saved_job.get("Status")).lower() == "completed":
+                            saved_completed += 1
+                        saved_payment = clean_val(saved_job.get("Payment"))
+                        if saved_payment and saved_payment.lower() != "waiting":
+                            saved_payment_started += 1
+                    saved_report_exists = bool(existing_saved_route.get("report_b64"))
+
+                    saved_minutes = int(round(float(existing_saved_route.get("time_s") or 0) / 60.0))
+                    s1, s2, s3 = st.columns(3)
+                    s1.metric("Saved jobs", int(existing_saved_route.get("jobs") or len(saved_route_jobs)))
+                    s2.metric("Saved miles", f"{float(existing_saved_route.get('miles') or 0):.1f}")
+                    s3.metric("Saved driving", f"{saved_minutes // 60}h {saved_minutes % 60:02d}m")
+
+                    route_has_work_progress = bool(
+                        saved_completed > 0
+                        or saved_payment_started > 0
+                        or saved_report_exists
                     )
+
+                    if route_has_work_progress:
+                        st.warning(
+                            "🔒 This saved route already contains working-day progress or a saved report. "
+                            "For safety it cannot be rebuilt from Prepare Route. The permanent route remains unchanged."
+                        )
+                        # If a different state survived from an earlier visit, do not leave an
+                        # adjustment authorisation active against a route that has since progressed.
+                        if adjustment_active:
+                            st.session_state.pop("admin_adjust_saved_route_date", None)
+                            st.session_state["replace_saved_route_allowed"] = False
+                            adjustment_active = False
+                    elif adjustment_active:
+                        st.warning(
+                            "✏️ ADJUSTMENT MODE — the current saved route is still protected in Supabase. "
+                            "Select the corrected customer list below and send it to the optimiser. "
+                            "The old route is replaced only after the new route is successfully optimised "
+                            "and you deliberately SAVE / LOCK it."
+                        )
+                        if st.button(
+                            "↩️ CANCEL ADJUSTMENT — KEEP SAVED ROUTE",
+                            use_container_width=True,
+                            key="admin_cancel_saved_route_adjustment",
+                        ):
+                            st.session_state.pop("admin_adjust_saved_route_date", None)
+                            st.session_state["replace_saved_route_allowed"] = False
+                            st.rerun()
+                    else:
+                        st.warning(
+                            "A permanent saved route already exists for this date. It is protected. "
+                            "If it was saved by mistake, you can open a controlled adjustment without deleting it."
+                        )
+                        with st.container(border=True):
+                            st.markdown("**Need to correct this saved route?**")
+                            st.caption(
+                                "The existing route stays safe until a replacement has been optimised, reviewed and locked."
+                            )
+                            confirm_adjust = st.checkbox(
+                                "I understand the current saved route will remain protected until I save a replacement.",
+                                key=f"admin_confirm_adjust_{target_route_str}",
+                            )
+                            if st.button(
+                                "✏️ ADJUST SAVED ROUTE",
+                                type="primary",
+                                use_container_width=True,
+                                disabled=not confirm_adjust,
+                                key="admin_begin_saved_route_adjustment",
+                            ):
+                                st.session_state["admin_adjust_saved_route_date"] = target_route_str
+                                st.session_state["replace_saved_route_allowed"] = False
+                                # Show the full customer book when correcting a saved route so
+                                # forgotten customers can be added even if they are not currently due.
+                                st.session_state["admin_prepare_route_filter"] = "All active customers"
+                                st.rerun()
 
                 route_rows = []
                 for row in route_customers:
@@ -1652,6 +1745,21 @@ if st.session_state.get("admin_office_view", False):
 
                 route_customer_df = pd.DataFrame(route_rows)
                 zones = sorted({clean_val(x) or "Unzoned" for x in route_customer_df["Zone"].tolist()})
+
+                # In adjustment mode tell the user if a job from the old route is no longer
+                # present in the active customer book. The old route remains untouched if they cancel.
+                if adjustment_active and saved_route_identities:
+                    active_identities = {
+                        _admin_customer_identity(row.get("Address"), row.get("Postcode"))
+                        for _, row in route_customer_df.iterrows()
+                    }
+                    missing_saved_customers = saved_route_identities - active_identities
+                    if missing_saved_customers:
+                        st.warning(
+                            f"{len(missing_saved_customers)} customer(s) from the saved route are no longer in the active "
+                            "customer book, so they cannot be pre-selected here. Cancel adjustment if you need to keep "
+                            "the original route exactly as saved."
+                        )
 
                 f1, f2 = st.columns([1, 2])
                 selected_route_zone = f1.selectbox(
@@ -1714,12 +1822,28 @@ if st.session_state.get("admin_office_view", False):
                         "Customer ID", "Address", "Postcode", "Zone", "Price", "Phone",
                         "Cleaning Plan", "Next Cleaning Due", "Planned Service Date", "Notes"
                     ]].copy()
+
                     select_all_shown = st.checkbox(
                         "Select all customers currently shown",
                         value=False,
-                        key=f"admin_prepare_select_all_{target_route_str}_{selected_route_zone}_{filter_mode}",
+                        key=f"admin_prepare_select_all_{target_route_str}_{selected_route_zone}_{filter_mode}_{'adjust' if adjustment_active else 'new'}",
                     )
-                    editor.insert(0, "Select", bool(select_all_shown))
+
+                    if adjustment_active:
+                        # Start from the currently saved route. This makes correction practical:
+                        # remove an unwanted job or tick an extra customer, rather than rebuilding
+                        # the selection from zero.
+                        selected_flags = []
+                        for _, editor_row in editor.iterrows():
+                            identity = _admin_customer_identity(
+                                editor_row.get("Address"), editor_row.get("Postcode")
+                            )
+                            selected_flags.append(identity in saved_route_identities)
+                        if select_all_shown:
+                            selected_flags = [True] * len(editor)
+                        editor.insert(0, "Select", selected_flags)
+                    else:
+                        editor.insert(0, "Select", bool(select_all_shown))
 
                     edited_route = st.data_editor(
                         editor,
@@ -1734,7 +1858,12 @@ if st.session_state.get("admin_office_view", False):
                             "Customer ID": None,
                             "Price": st.column_config.NumberColumn("Price", format="£%.2f"),
                         },
-                        key=f"admin_prepare_route_editor_{target_route_str}_{selected_route_zone}_{filter_mode}",
+                        # A separate editor state for normal preparation vs saved-route correction
+                        # avoids stale checkbox selections leaking between the two workflows.
+                        key=(
+                            f"admin_prepare_route_editor_{target_route_str}_{selected_route_zone}_{filter_mode}_"
+                            f"{'adjust' if adjustment_active else 'new'}_{int(bool(select_all_shown))}"
+                        ),
                     )
 
                     selected_route_rows = edited_route[edited_route["Select"] == True].copy()
@@ -1744,10 +1873,16 @@ if st.session_state.get("admin_office_view", False):
                         f"Route date {target_route_date.strftime('%d/%m/%Y')}"
                     )
 
-                    route_locked = load_route_snapshot(target_route_str) is not None
-                    prepare_disabled = selected_route_rows.empty or route_locked
+                    adjustment_allowed = bool(route_locked and adjustment_active)
+                    prepare_disabled = selected_route_rows.empty or (route_locked and not adjustment_allowed)
+                    send_label = (
+                        "🚀 SEND ADJUSTED JOBS TO ROUTE OPTIMIZER"
+                        if adjustment_allowed
+                        else "🚀 SEND SELECTED JOBS TO ROUTE OPTIMIZER"
+                    )
+
                     if st.button(
-                        "🚀 SEND SELECTED JOBS TO ROUTE OPTIMIZER",
+                        send_label,
                         type="primary",
                         use_container_width=True,
                         disabled=prepare_disabled,
@@ -1765,13 +1900,43 @@ if st.session_state.get("admin_office_view", False):
                             except Exception:
                                 invalid.append("invalid price")
 
+                        # Re-read the permanent route immediately before staging the local working
+                        # copy. This closes the gap between opening the Admin screen and clicking Send.
+                        current_saved_route = load_route_snapshot(target_route_str)
+                        current_route_locked = current_saved_route is not None
+                        current_adjustment_allowed = bool(
+                            current_route_locked
+                            and st.session_state.get("admin_adjust_saved_route_date") == target_route_str
+                        )
+
+                        current_has_progress = False
+                        if current_saved_route is not None:
+                            current_jobs = list(current_saved_route.get("jobs_data") or [])
+                            current_has_progress = bool(current_saved_route.get("report_b64"))
+                            if not current_has_progress:
+                                for current_job in current_jobs:
+                                    if clean_val(current_job.get("Status")).lower() == "completed":
+                                        current_has_progress = True
+                                        break
+                                    current_payment = clean_val(current_job.get("Payment"))
+                                    if current_payment and current_payment.lower() != "waiting":
+                                        current_has_progress = True
+                                        break
+
                         if invalid:
                             st.error(
                                 "Selected customers cannot be prepared: "
                                 + ", ".join(sorted(set(invalid)))
                             )
-                        elif load_route_snapshot(target_route_str) is not None:
-                            st.error("That date already has a permanent saved route. Nothing was changed.")
+                        elif current_route_locked and not current_adjustment_allowed:
+                            st.error(
+                                "That date has a protected saved route. Click ADJUST SAVED ROUTE first. Nothing was changed."
+                            )
+                        elif current_route_locked and current_has_progress:
+                            st.error(
+                                "This saved route now contains working-day progress, so the adjustment was stopped. "
+                                "The permanent route was not changed."
+                            )
                         else:
                             prepared = selected_route_rows.copy().reset_index(drop=True)
                             prepared["Dates"] = target_route_str
@@ -1813,8 +1978,8 @@ if st.session_state.get("admin_office_view", False):
                             ]
                             prepared = prepared[keep_cols]
 
-                            # This replaces only the unsaved local working copy for that day.
-                            # A permanent Supabase route is checked above and is never deleted.
+                            # ADMIN adjustment stages only the local working copy. The original
+                            # permanent Supabase route is deliberately left untouched here.
                             delete_day(target_route_str)
                             save_dataframe(prepared)
                             st.session_state["master_df"] = prepared.reset_index(drop=True)
@@ -1823,7 +1988,11 @@ if st.session_state.get("admin_office_view", False):
                             st.session_state.pop("failed_jobs", None)
                             st.session_state.pop("uploaded_filename", None)
                             st.session_state["start_new_day_mode"] = True
-                            st.session_state["replace_saved_route_allowed"] = False
+                            # Existing save protection already understands this flag. It is set
+                            # only after the explicit Admin adjustment confirmation above, so the
+                            # normal Driver app and the V26.13 optimiser remain unchanged.
+                            st.session_state["replace_saved_route_allowed"] = bool(current_route_locked)
+                            st.session_state.pop("admin_adjust_saved_route_date", None)
                             st.session_state["admin_office_view"] = False
                             st.rerun()
 
