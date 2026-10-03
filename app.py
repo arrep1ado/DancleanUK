@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.24-EXCEL-ADD-QUICK-ADD"
+APP_VERSION = "27.8.8.5.0.25-QUICK-ADD-NAME"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -1692,7 +1692,7 @@ def _admin_apply_customer_excel_updates(changes, additions=None):
 
 
 def _driver_quick_customer_action(
-    master_df, service_date, route_data, address, postcode, phone, price,
+    master_df, service_date, route_data, customer_name, address, postcode, phone, price,
     cleaning_plan, notes, action="today", placement="Do Next", tax_rate=0.20,
 ):
     """Save a street enquiry as a customer and optionally append it to today's locked route.
@@ -1701,11 +1701,22 @@ def _driver_quick_customer_action(
     into the already-saved order and leaves ORS mileage/time exactly as originally
     calculated.
     """
+    customer_name = clean_val(customer_name)
     address = clean_val(address)
     postcode = normalise_postcode(postcode)
     phone = clean_val(phone)
     cleaning_plan = normalise_cleaning_plan(cleaning_plan)
     notes = clean_val(notes)
+    # Keep the customer's name without changing the existing Supabase schema.
+    # The customer book currently has no dedicated name column, so store a
+    # clearly-labelled name in Notes and also carry it on today's route row.
+    if customer_name:
+        name_line = f"Customer: {customer_name}"
+        if notes:
+            if name_line.casefold() not in notes.casefold():
+                notes = f"{name_line}\n{notes}"
+        else:
+            notes = name_line
     try:
         price = float(price or 0)
     except Exception:
@@ -1797,6 +1808,7 @@ def _driver_quick_customer_action(
         "Phone": normalise_phone(phone) if phone else "",
         "Cleaning Plan": cleaning_plan,
         "Notes": notes,
+        "Customer Name": customer_name,
         "job_id": job_id,
         "service_date": str(service_date),
         "Status": "pending",
@@ -7893,6 +7905,7 @@ if driver_mode:
             st.write("### ➕ New customer while you are out")
             st.caption("Save them for later, or add them to today's locked route without re-optimising.")
             with st.form("driver_quick_add_customer_form", clear_on_submit=False):
+                qa_name = st.text_input("Customer Name", placeholder="e.g. John Smith")
                 qa1, qa2 = st.columns([2, 1])
                 qa_address = qa1.text_input("Address *", placeholder="e.g. 200 Queensway")
                 qa_postcode = qa2.text_input("Postcode *", placeholder="e.g. NG31 9RA")
@@ -7920,6 +7933,7 @@ if driver_mode:
                         df,
                         service_date_str,
                         st.session_state.get("route_data", {}),
+                        qa_name,
                         qa_address,
                         qa_postcode,
                         qa_phone,
