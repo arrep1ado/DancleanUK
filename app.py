@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.19-OUTSTANDING-PAYMENTS"
+APP_VERSION = "27.8.8.5.0.23-ADMIN-EXCEL-BACKUP"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -1324,6 +1324,307 @@ def _admin_customer_rows(routes):
         if previous is None or candidate["_route_date"] >= previous["_route_date"]:
             latest[key] = candidate
     return list(latest.values())
+
+
+
+def _admin_payment_display(job):
+    """Return business-readable payment status/method for Admin exports."""
+    payment = clean_val(job.get("Payment")) or "Waiting"
+    if payment == "Cash":
+        return "Paid", "Cash"
+    if payment == "Bank Transfer Paid":
+        return "Paid", "Bank Transfer"
+    if payment == "Bank Transfer":
+        return "Outstanding", "Bank Transfer"
+    return "Outstanding", "Not Paid"
+
+
+def _admin_excel_date(value):
+    """Convert Excel/date-like input to an ISO date string, or None when blank."""
+    text = clean_val(value)
+    if not text:
+        return None
+    try:
+        return pd.to_datetime(value).date().isoformat()
+    except Exception:
+        return None
+
+
+def _admin_build_customer_backup_xlsx(customer_records, routes):
+    """Build a clean, business-readable Excel backup entirely in memory."""
+    records = [dict(x) for x in (customer_records or [])]
+    jobs = _admin_jobs_from_routes(routes)
+    completed = [x for x in jobs if clean_val(x.get("Status")).lower() == "completed"]
+
+    wb = Workbook()
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    section_fill = PatternFill("solid", fgColor="D9EAF7")
+    header_font = Font(color="FFFFFF", bold=True)
+    title_font = Font(bold=True, size=16)
+    bold_font = Font(bold=True)
+    thin = Side(style="thin", color="D9E1F2")
+    border = Border(bottom=thin)
+
+    def style_table(ws, widths=None):
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(vertical="center")
+        ws.row_dimensions[1].height = 24
+        if widths:
+            for col, width in widths.items():
+                ws.column_dimensions[col].width = width
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = border
+
+    active = [x for x in records if x.get("active") is not False]
+    archived = [x for x in records if x.get("active") is False]
+    paid_total = 0.0
+    outstanding_total = 0.0
+    paid_jobs = 0
+    outstanding_jobs = 0
+    for job in completed:
+        status, _ = _admin_payment_display(job)
+        amount = float(job.get("Price", 0) or 0)
+        if status == "Paid":
+            paid_total += amount
+            paid_jobs += 1
+        else:
+            outstanding_total += amount
+            outstanding_jobs += 1
+
+    ws_summary["A1"] = "DanCleanUK Customer Data Backup"
+    ws_summary["A1"].font = title_font
+    ws_summary["A3"] = "Generated"
+    ws_summary["B3"] = datetime.now(ZoneInfo("Europe/London")).strftime("%d/%m/%Y %H:%M")
+    summary_rows = [
+        ("Active customers", len(active)),
+        ("Archived customers", len(archived)),
+        ("Completed cleans in saved history", len(completed)),
+        ("Paid jobs", paid_jobs),
+        ("Collected", paid_total),
+        ("Outstanding jobs", outstanding_jobs),
+        ("Outstanding", outstanding_total),
+    ]
+    for r, (label, value) in enumerate(summary_rows, start=5):
+        ws_summary.cell(r, 1, label).font = bold_font
+        ws_summary.cell(r, 2, value)
+    ws_summary["A14"] = "How to use this backup"
+    ws_summary["A14"].font = bold_font
+    ws_summary["A15"] = (
+        "The Customers sheet is designed for simple customer-detail updates. "
+        "Keep Address and Postcode unchanged when using the workbook to update the app; "
+        "edit phone, price, cleaning plan, next cleaning due and notes, then upload it in Admin → Customers."
+    )
+    ws_summary["A15"].alignment = Alignment(wrap_text=True, vertical="top")
+    ws_summary.column_dimensions["A"].width = 34
+    ws_summary.column_dimensions["B"].width = 22
+    ws_summary.row_dimensions[15].height = 58
+    for cell in ("B9", "B11"):
+        ws_summary[cell].number_format = '£#,##0.00'
+
+    customer_headers = [
+        "Address", "Postcode", "Phone", "Price", "Cleaning Plan",
+        "Next Cleaning Due", "Zone", "Notes"
+    ]
+    ws_customers = wb.create_sheet("Customers")
+    ws_customers.append(customer_headers)
+    for row in sorted(active, key=lambda x: (clean_val(x.get("zone")), clean_val(x.get("address")))):
+        ws_customers.append([
+            clean_val(row.get("address")),
+            normalise_postcode(row.get("postcode")),
+            clean_val(row.get("phone")),
+            float(row.get("price", 0) or 0),
+            normalise_cleaning_plan(row.get("cleaning_plan")),
+            _admin_excel_date(row.get("next_cleaning_due")) or "",
+            clean_val(row.get("zone")) or _admin_auto_zone(row.get("postcode")),
+            clean_val(row.get("notes")),
+        ])
+    style_table(ws_customers, {"A": 30, "B": 14, "C": 16, "D": 11, "E": 16, "F": 18, "G": 12, "H": 42})
+    for cell in ws_customers["D"][1:]:
+        cell.number_format = '£#,##0.00'
+    for cell in ws_customers["B"][1:] + ws_customers["C"][1:]:
+        cell.number_format = "@"
+
+    ws_archived = wb.create_sheet("Archived Customers")
+    ws_archived.append(customer_headers)
+    for row in sorted(archived, key=lambda x: clean_val(x.get("address"))):
+        ws_archived.append([
+            clean_val(row.get("address")), normalise_postcode(row.get("postcode")),
+            clean_val(row.get("phone")), float(row.get("price", 0) or 0),
+            normalise_cleaning_plan(row.get("cleaning_plan")),
+            _admin_excel_date(row.get("next_cleaning_due")) or "",
+            clean_val(row.get("zone")) or _admin_auto_zone(row.get("postcode")),
+            clean_val(row.get("notes")),
+        ])
+    style_table(ws_archived, {"A": 30, "B": 14, "C": 16, "D": 11, "E": 16, "F": 18, "G": 12, "H": 42})
+    for cell in ws_archived["D"][1:]:
+        cell.number_format = '£#,##0.00'
+
+    ws_history = wb.create_sheet("Cleaning History")
+    history_headers = [
+        "Clean Date", "Address", "Postcode", "Phone", "Price", "Cleaning Plan",
+        "Payment Status", "Payment Method", "Payment Date", "Completed Time", "Notes"
+    ]
+    ws_history.append(history_headers)
+    completed_sorted = sorted(completed, key=lambda x: clean_val(x.get("_route_date")), reverse=True)
+    for job in completed_sorted:
+        pay_status, pay_method = _admin_payment_display(job)
+        ws_history.append([
+            clean_val(job.get("_route_date")),
+            clean_val(job.get("Address")) or clean_val(job.get("address_text")),
+            normalise_postcode(job.get("Postcode")),
+            clean_val(job.get("Phone")),
+            float(job.get("Price", 0) or 0),
+            normalise_cleaning_plan(job.get("Cleaning Plan")),
+            pay_status,
+            pay_method,
+            clean_val(job.get("PaymentTime")) if pay_status == "Paid" else "",
+            clean_val(job.get("CompletedTime")),
+            clean_val(job.get("Notes")),
+        ])
+    style_table(ws_history, {"A": 14, "B": 30, "C": 14, "D": 16, "E": 11, "F": 16, "G": 18, "H": 18, "I": 20, "J": 20, "K": 42})
+    for cell in ws_history["E"][1:]:
+        cell.number_format = '£#,##0.00'
+
+    ws_payments = wb.create_sheet("Payments")
+    ws_payments.append(["Clean Date", "Address", "Postcode", "Amount", "Status", "Method", "Payment Date"])
+    for job in completed_sorted:
+        pay_status, pay_method = _admin_payment_display(job)
+        ws_payments.append([
+            clean_val(job.get("_route_date")),
+            clean_val(job.get("Address")) or clean_val(job.get("address_text")),
+            normalise_postcode(job.get("Postcode")),
+            float(job.get("Price", 0) or 0),
+            pay_status,
+            pay_method,
+            clean_val(job.get("PaymentTime")) if pay_status == "Paid" else "",
+        ])
+    style_table(ws_payments, {"A": 14, "B": 30, "C": 14, "D": 12, "E": 18, "F": 18, "G": 20})
+    for cell in ws_payments["D"][1:]:
+        cell.number_format = '£#,##0.00'
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+def _admin_preview_customer_excel_updates(uploaded_file, current_records):
+    """Preview safe customer-detail changes from a DanCleanUK Customers worksheet."""
+    if uploaded_file is None:
+        return {"changes": [], "unmatched": [], "errors": []}
+    try:
+        uploaded_file.seek(0)
+        df = pd.read_excel(uploaded_file, sheet_name="Customers", dtype=object)
+    except Exception:
+        return {"changes": [], "unmatched": [], "errors": ["Could not read the Customers sheet from this Excel file."]}
+
+    header_map = {str(c).strip().casefold(): c for c in df.columns}
+    required = ["address", "postcode"]
+    if any(name not in header_map for name in required):
+        return {"changes": [], "unmatched": [], "errors": ["The Excel file must contain Address and Postcode columns in the Customers sheet."]}
+
+    def col(name):
+        return header_map.get(name.casefold())
+
+    current = [x for x in (current_records or []) if x.get("active") is not False]
+    by_identity = {
+        _admin_customer_identity(x.get("address"), x.get("postcode")): x
+        for x in current
+    }
+    changes = []
+    unmatched = []
+    errors = []
+
+    for excel_row, (_, row) in enumerate(df.iterrows(), start=2):
+        address = clean_val(row.get(col("address")))
+        postcode = normalise_postcode(row.get(col("postcode")))
+        if not address and not postcode:
+            continue
+        if not address or not postcode:
+            errors.append(f"Row {excel_row}: Address and Postcode are both required.")
+            continue
+        existing = by_identity.get(_admin_customer_identity(address, postcode))
+        if not existing:
+            unmatched.append(f"{address}, {postcode}")
+            continue
+
+        phone = clean_val(row.get(col("phone"))) if col("phone") is not None else clean_val(existing.get("phone"))
+        price_raw = row.get(col("price")) if col("price") is not None else existing.get("price", 0)
+        try:
+            price = float(price_raw) if clean_val(price_raw) else 0.0
+        except Exception:
+            errors.append(f"Row {excel_row}: invalid Price for {address}.")
+            continue
+        plan = normalise_cleaning_plan(row.get(col("cleaning plan"))) if col("cleaning plan") is not None else normalise_cleaning_plan(existing.get("cleaning_plan"))
+        due = _admin_excel_date(row.get(col("next cleaning due"))) if col("next cleaning due") is not None else _admin_excel_date(existing.get("next_cleaning_due"))
+        notes = clean_val(row.get(col("notes"))) if col("notes") is not None else clean_val(existing.get("notes"))
+
+        old = {
+            "Phone": clean_val(existing.get("phone")),
+            "Price": float(existing.get("price", 0) or 0),
+            "Cleaning Plan": normalise_cleaning_plan(existing.get("cleaning_plan")),
+            "Next Cleaning Due": _admin_excel_date(existing.get("next_cleaning_due")) or "",
+            "Notes": clean_val(existing.get("notes")),
+        }
+        new = {
+            "Phone": phone,
+            "Price": price,
+            "Cleaning Plan": plan,
+            "Next Cleaning Due": due or "",
+            "Notes": notes,
+        }
+        changed_fields = [k for k in new if new[k] != old[k]]
+        if changed_fields:
+            changes.append({
+                "customer_id": existing.get("id"),
+                "address": address,
+                "postcode": postcode,
+                "phone": phone,
+                "price": price,
+                "cleaning_plan": plan,
+                "next_due": due,
+                "notes": notes,
+                "changed_fields": changed_fields,
+            })
+
+    return {"changes": changes, "unmatched": unmatched, "errors": errors}
+
+
+def _admin_apply_customer_excel_updates(changes):
+    """Apply only previewed customer detail changes. Never touches saved routes/Driver."""
+    updated = 0
+    failed = []
+    for change in changes or []:
+        due = None
+        if change.get("next_due"):
+            try:
+                due = pd.to_datetime(change.get("next_due")).date()
+            except Exception:
+                due = None
+        ok, message = _admin_update_customer(
+            change.get("customer_id"),
+            change.get("address"),
+            change.get("postcode"),
+            change.get("phone"),
+            change.get("price"),
+            change.get("cleaning_plan"),
+            due,
+            change.get("notes"),
+        )
+        if ok:
+            updated += 1
+        else:
+            failed.append(f"{change.get('address')}: {message or 'update failed'}")
+    return updated, failed
 
 
 def _admin_reminder_message():
@@ -3137,6 +3438,81 @@ if st.session_state.get("admin_office_view", False):
             manual_customers = _admin_load_customer_records(active_only=True)
         else:
             manual_customers = []
+        # Number 2 — Admin Excel backup / customer updates.
+        # Supabase remains the source of truth; Excel is a readable backup and
+        # a safe way to update existing customer details in bulk.
+        if table_ready:
+            with st.expander("📦 Customer Data / Excel Backup", expanded=False):
+                st.caption(
+                    "Download a clean Excel backup of customers, cleaning history and payments. "
+                    "You can edit existing customer details in the Customers sheet and upload it here to apply those changes."
+                )
+                all_for_backup = _admin_load_customer_records(active_only=False)
+                backup_bytes = _admin_build_customer_backup_xlsx(all_for_backup, routes)
+                backup_name = f"DanCleanUK_Customer_Backup_{datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d')}.xlsx"
+                b1, b2 = st.columns([2, 1])
+                b1.download_button(
+                    "⬇️ Export Customer Data / Backup",
+                    data=backup_bytes,
+                    file_name=backup_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="admin_customer_excel_backup_download",
+                )
+                if b2.button("🔄 Refresh Customers", use_container_width=True, key="admin_refresh_customer_book"):
+                    st.rerun()
+
+                st.markdown("#### Update existing customers from Excel")
+                st.caption(
+                    "For safety, Address + Postcode identify the customer. Keep those two columns unchanged here. "
+                    "Use the normal Edit Customer button if an address/postcode itself needs changing."
+                )
+                customer_excel = st.file_uploader(
+                    "Upload edited DanCleanUK Excel backup",
+                    type=["xlsx"],
+                    key="admin_customer_excel_update_file",
+                )
+                if customer_excel is not None:
+                    preview = _admin_preview_customer_excel_updates(customer_excel, manual_customers)
+                    if preview["errors"]:
+                        for error in preview["errors"]:
+                            st.error(error)
+                    if preview["unmatched"]:
+                        st.warning(
+                            f"{len(preview['unmatched'])} row(s) were not matched and will be skipped. "
+                            "New customers are still added with ➕ Add Customer."
+                        )
+                        with st.expander("Show unmatched rows"):
+                            for item in preview["unmatched"]:
+                                st.write(f"• {item}")
+                    changes = preview["changes"]
+                    if changes:
+                        st.success(f"{len(changes)} existing customer(s) have changes ready to apply.")
+                        preview_rows = []
+                        for change in changes:
+                            preview_rows.append({
+                                "Customer": f"{change['address']}, {change['postcode']}",
+                                "Changes": ", ".join(change["changed_fields"]),
+                            })
+                        st.dataframe(pd.DataFrame(preview_rows), hide_index=True, use_container_width=True)
+                        st.info("Your current Supabase customer book is not changed until you press Apply Excel Updates.")
+                        if st.button(
+                            f"✅ Apply {len(changes)} Excel Update(s)",
+                            type="primary",
+                            use_container_width=True,
+                            key="admin_apply_customer_excel_updates",
+                        ):
+                            updated, failed = _admin_apply_customer_excel_updates(changes)
+                            if updated:
+                                st.success(f"Updated {updated} customer(s).")
+                            if failed:
+                                for failure in failed:
+                                    st.error(failure)
+                            if updated and not failed:
+                                st.rerun()
+                    elif not preview["errors"]:
+                        st.info("No customer changes found in this Excel file.")
+
         top1.metric("Customers", len(manual_customers) if table_ready else len(history_customers))
         if top2.button("➕ Add Customer", type="primary", use_container_width=True, key="admin_add_customer_button"):
             st.session_state["admin_add_customer_open"] = not st.session_state["admin_add_customer_open"]
