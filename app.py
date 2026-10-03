@@ -1565,11 +1565,34 @@ def _payment_reminder_stage(job, today=None):
         return 0
     if age >= 14:
         return 14
-    if not clean_val(job.get("PaymentReminderDay3SentAt")):
-        return 3
-    if age >= 7 and not clean_val(job.get("PaymentReminderDay7SentAt")):
-        return 7
-    return 0
+    # Age decides which reminder is due. A job already 7+ days old must not
+    # fall back to a Day 3 reminder just because Day 3 was never sent.
+    if age >= 7:
+        return 0 if clean_val(job.get("PaymentReminderDay7SentAt")) else 7
+    return 0 if clean_val(job.get("PaymentReminderDay3SentAt")) else 3
+
+
+def _payment_customer_key(job):
+    """Stable customer key used only to prevent duplicate SMS reminders in one batch."""
+    address = clean_val(job.get("Address")) or clean_val(job.get("address_text"))
+    postcode = normalise_postcode(job.get("Postcode"))
+    phone = normalise_phone(job.get("Phone"))
+    return (address.strip().lower(), postcode.strip().upper(), phone.strip())
+
+
+def _dedupe_payment_reminders(jobs):
+    """One SMS per customer: keep the oldest/highest-stage outstanding clean."""
+    chosen = {}
+    for job in jobs:
+        key = _payment_customer_key(job)
+        current = chosen.get(key)
+        score = (int(job.get("_reminder_stage", 0) or 0), int(job.get("_age_days", 0) or 0))
+        current_score = (-1, -1) if current is None else (
+            int(current.get("_reminder_stage", 0) or 0), int(current.get("_age_days", 0) or 0)
+        )
+        if current is None or score > current_score:
+            chosen[key] = job
+    return list(chosen.values())
 
 
 def _payment_reminder_message(job, stage):
@@ -2442,7 +2465,10 @@ if st.session_state.get("admin_office_view", False):
             st.success("✅ No outstanding payments.")
         else:
             total = sum(float(x.get("Price", 0) or 0) for x in outstanding)
-            reminder_due = [x for x in outstanding if x.get("_reminder_stage") in (3, 7)]
+            reminder_due_jobs = [x for x in outstanding if x.get("_reminder_stage") in (3, 7)]
+            # Never prepare two SMS messages for the same customer in one batch.
+            # Individual debts remain visible below in All outstanding.
+            reminder_due = _dedupe_payment_reminders(reminder_due_jobs)
             attention = [x for x in outstanding if x.get("_reminder_stage") == 14]
 
             m1, m2, m3, m4 = st.columns(4)
