@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.27-DAILY-RECORD-POLISH"
+APP_VERSION = "27.8.8.5.0.28-START-NEW-DAY-SAFE"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -3345,6 +3345,10 @@ if st.session_state.get("admin_office_view", False):
     elif admin_tab == "🚐 Prepare Route":
         st.header("🚐 Prepare Route")
         st.caption("Select permanent customers here, then send them into the existing locked route optimiser. No spreadsheet is needed for the normal daily workflow.")
+
+        new_day_notice = st.session_state.pop("new_day_reset_notice", "")
+        if new_day_notice:
+            st.success(new_day_notice)
 
         if not _admin_customer_table_ready():
             st.error("Customer storage is not ready yet.")
@@ -6687,32 +6691,68 @@ if st.sidebar.button(
     "🔄 Start New Day / Reset",
     use_container_width=True,
 ):
-    # V27.8: this is a SESSION reset only. Never delete or overwrite either
-    # the local customer records or a permanent Supabase route snapshot.
-    # Keep the selected day's customer rows available so the laptop does not
-    # appear empty after reset, but clear active route/temporary state.
-    # Clear ONLY the local working copy for this date. The permanent Supabase
-    # snapshot remains untouched and can still be loaded until a newly planned
-    # route is deliberately saved/locked. Clearing SQLite here prevents the old
-    # jobs from being merged into a newly uploaded route for the same date.
+    # V27.8.8.5.0.28 — LAPTOP NEW-DAY SAFETY.
+    #
+    # This button resets ONLY the temporary/local working route. Permanent
+    # Supabase saved_routes are never deleted, patched or replaced here. The
+    # permanent customer book is also left untouched. After the reset we open
+    # Admin -> Prepare Route and deliberately show ALL active customers so the
+    # next working day can be selected without uploading/rebuilding anything.
+    #
+    # Clearing the selected date from local SQLite is safe because a locked
+    # route is reconstructed from Supabase whenever it is deliberately loaded.
     delete_day(service_date_str)
+
+    # Clear only route/session state from the previous working day.
     for key in [
         "master_df",
         "route_data",
         "failed_jobs",
         "uploaded_filename",
+        "saved_route_notice",
     ]:
         st.session_state.pop(key, None)
     st.session_state.geocode_cache = {}
-    st.session_state.start_new_day_mode = True
-    st.session_state.replace_saved_route_allowed = True
+
+    # Never grant replacement permission from a general reset. Replacing a
+    # permanent route remains possible only through Admin's explicit Adjust
+    # Saved Route confirmation workflow.
+    st.session_state["replace_saved_route_allowed"] = False
+    st.session_state.pop("admin_replacement_clear_report", None)
+    st.session_state.pop("admin_adjust_saved_route_date", None)
+    st.session_state.pop("admin_adjust_confirm_progress_date", None)
+    st.session_state.pop("admin_adjust_progress_override_date", None)
+
+    # Remove stale Prepare Route widget state from the previous planning job.
+    # Dynamic editor/select-all keys are cleared as well so no old ticks carry
+    # into the next day.
+    for key in list(st.session_state.keys()):
+        if (
+            key.startswith("admin_prepare_select_all_")
+            or key.startswith("admin_prepare_route_editor_")
+        ):
+            st.session_state.pop(key, None)
+    st.session_state.pop("admin_prepare_route_date", None)
+    st.session_state["admin_prepare_route_zone"] = "All zones"
+    st.session_state["admin_prepare_route_search"] = ""
+    st.session_state["admin_prepare_route_filter"] = "All active customers"
+
+    # Open the full permanent customer book immediately on laptop. Prepare
+    # Route will default to tomorrow's London date, which can still be changed.
+    st.session_state["start_new_day_mode"] = True
+    st.session_state["admin_office_view"] = True
+    st.session_state["admin_dashboard_section"] = "🚐 Prepare Route"
+    st.session_state["new_day_reset_notice"] = (
+        "New day ready. Permanent saved routes were not changed. "
+        "Select the customers for the next route below."
+    )
     st.rerun()
 
 if st.session_state.get("start_new_day_mode", False):
     with st.sidebar.container(key="phone_hide_new_day_info"):
         st.info(
-            "New-day session ready. Saved routes are still protected. "
-            "Choose another route date or upload the next day's file."
+            "New-day session ready. Permanent saved routes are protected. "
+            "Use Admin → Prepare Route to select the next day's customers."
         )
 
 
