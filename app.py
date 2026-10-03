@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.18-CUSTOM-APP-ICONS"
+APP_VERSION = "27.8.8.5.0.19-OUTSTANDING-PAYMENTS"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -48,6 +48,7 @@ st.set_page_config(
 )
 
 PHONE_REMINDER_MODE = str(st.query_params.get("phone_reminders", "")).strip().lower() in {"1", "true", "yes"}
+PAYMENT_REMINDER_MODE = str(st.query_params.get("payment_reminders", "")).strip().lower() in {"1", "true", "yes"}
 
 if PHONE_REMINDER_MODE:
     # Streamlit 1.46+ supports additive page-config calls. If an older runtime
@@ -60,7 +61,7 @@ if PHONE_REMINDER_MODE:
     except Exception:
         pass
 
-if not st.session_state.get("admin_office_view", False) and not PHONE_REMINDER_MODE:
+if not st.session_state.get("admin_office_view", False) and not PHONE_REMINDER_MODE and not PAYMENT_REMINDER_MODE:
     st.title("🚗 DanCleanUK Daily Route Optimizer")
 
 # Phone presentation: keep office/admin and routine planning clutter off the
@@ -1532,6 +1533,297 @@ def _phone_reminder_reset_session():
         st.session_state.pop(key, None)
 
 
+
+PAYMENT_REMINDER_URL = "https://dancleanuk-optimizer.streamlit.app/?payment_reminders=1"
+
+
+def _payment_service_date(job):
+    """Business date used for chasing: completion date when available, otherwise route date."""
+    raw = clean_val(job.get("CompletedTime")) or clean_val(job.get("completed_time"))
+    if raw:
+        try:
+            dt = pd.to_datetime(raw, errors="raise")
+            if getattr(dt, "tzinfo", None) is not None:
+                dt = dt.tz_convert("Europe/London")
+            return dt.date()
+        except Exception:
+            pass
+    try:
+        return pd.to_datetime(clean_val(job.get("_route_date"))).date()
+    except Exception:
+        return None
+
+
+def _payment_reminder_stage(job, today=None):
+    """Return 3, 7, 14, or 0. Day 14 is attention-only and never auto-queued."""
+    today = today or datetime.now(ZoneInfo("Europe/London")).date()
+    service_day = _payment_service_date(job)
+    if service_day is None:
+        return 0
+    age = (today - service_day).days
+    if age < 3:
+        return 0
+    if age >= 14:
+        return 14
+    if not clean_val(job.get("PaymentReminderDay3SentAt")):
+        return 3
+    if age >= 7 and not clean_val(job.get("PaymentReminderDay7SentAt")):
+        return 7
+    return 0
+
+
+def _payment_reminder_message(job, stage):
+    amount = float(job.get("Price", 0) or 0)
+    service_day = _payment_service_date(job)
+    service_text = service_day.strftime("%d/%m/%Y") if service_day else clean_val(job.get("_route_date"))
+    if int(stage) == 7:
+        return (
+            f"Hi, this is DanCleanUK. Just a second reminder that the £{amount:.2f} payment "
+            f"for your window clean on {service_text} is still showing as outstanding. "
+            "If you've already paid, please ignore this message. Otherwise, we'd appreciate "
+            "it if you could arrange payment when possible. Thank you, DanCleanUK."
+        )
+    return (
+        f"Hi, this is DanCleanUK 👋 Just a friendly reminder that the £{amount:.2f} payment "
+        f"for your window clean on {service_text} is still showing as outstanding. "
+        "If you've already made the payment, please ignore this message. Thank you! DanCleanUK"
+    )
+
+
+def _payment_reminder_sms_url(job, stage):
+    number = normalise_phone(job.get("Phone"))
+    if number and not number.startswith("+"):
+        number = "+" + number
+    return "sms:" + quote(number, safe="+") + "?body=" + quote(_payment_reminder_message(job, stage))
+
+
+def _admin_patch_saved_route_job(route_date, job_id, updates):
+    """Patch only one job's business metadata inside an existing permanent route."""
+    snapshot = load_route_snapshot(route_date)
+    if not snapshot:
+        return False
+    route_data = dict(snapshot.get("route_data") or {})
+    jobs_data = [dict(x) for x in (route_data.get("jobs_data") or [])]
+    changed = False
+    for job in jobs_data:
+        if str(job.get("job_id")) == str(job_id):
+            job.update(dict(updates or {}))
+            changed = True
+            break
+    if not changed:
+        return False
+    route_data["jobs_data"] = jobs_data
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=representation")
+    if not url or not headers:
+        return False
+    try:
+        response = requests.patch(
+            f"{url}/rest/v1/saved_routes",
+            headers=headers,
+            params={"route_date": f"eq.{route_date}", "select": "route_date"},
+            json={"route_data": route_data, "updated_at": datetime.now(timezone.utc).isoformat()},
+            timeout=30,
+        )
+        return response.status_code == 200 and bool(response.json())
+    except (requests.RequestException, ValueError, TypeError):
+        return False
+
+
+def _admin_prepare_payment_reminder_queue(selected):
+    """Replace the payment-reminder queue with exactly the selected route jobs."""
+    routes = _admin_load_saved_routes()
+    selected_keys = {
+        (str(x.get("_route_date")), str(x.get("job_id"))): int(x.get("_reminder_stage", 0))
+        for x in selected
+    }
+    url, _ = _supabase_config()
+    headers = _supabase_headers("return=representation")
+    if not url or not headers:
+        return False, "Supabase is not available."
+
+    try:
+        changed_routes = 0
+        queued_count = 0
+        for snapshot in routes:
+            route_date = clean_val(snapshot.get("route_date"))
+            route_data = dict(snapshot.get("route_data") or {})
+            jobs_data = [dict(x) for x in (route_data.get("jobs_data") or [])]
+            route_changed = False
+            for job in jobs_data:
+                key = (str(route_date), str(job.get("job_id")))
+                wanted_stage = selected_keys.get(key, 0)
+                old_stage = int(job.get("PaymentReminderQueuedStage", 0) or 0)
+                if old_stage != wanted_stage:
+                    job["PaymentReminderQueuedStage"] = wanted_stage
+                    job["PaymentReminderQueuedAt"] = (
+                        datetime.now(timezone.utc).isoformat() if wanted_stage else ""
+                    )
+                    route_changed = True
+                if wanted_stage:
+                    queued_count += 1
+            if route_changed:
+                route_data["jobs_data"] = jobs_data
+                response = requests.patch(
+                    f"{url}/rest/v1/saved_routes",
+                    headers=headers,
+                    params={"route_date": f"eq.{route_date}", "select": "route_date"},
+                    json={"route_data": route_data, "updated_at": datetime.now(timezone.utc).isoformat()},
+                    timeout=30,
+                )
+                if response.status_code != 200:
+                    return False, "Could not save the complete payment reminder queue."
+                changed_routes += 1
+        return True, queued_count
+    except (requests.RequestException, ValueError, TypeError):
+        return False, "Could not save the payment reminder queue. Please try again."
+
+
+def _admin_load_payment_reminder_queue():
+    queued = []
+    for job in _admin_jobs_from_routes(_admin_load_saved_routes()):
+        stage = int(job.get("PaymentReminderQueuedStage", 0) or 0)
+        if stage not in (3, 7):
+            continue
+        status = clean_val(job.get("Status")).lower()
+        payment = clean_val(job.get("Payment"))
+        if status != "completed" or payment not in {"Bank Transfer", "Not Paid"}:
+            continue
+        item = dict(job)
+        item["_reminder_stage"] = stage
+        queued.append(item)
+    return sorted(queued, key=lambda x: (x.get("_route_date", ""), clean_val(x.get("address_text"))))
+
+
+def _admin_mark_payment_reminder_sent(job):
+    stage = int(job.get("_reminder_stage", 0) or 0)
+    field = "PaymentReminderDay7SentAt" if stage == 7 else "PaymentReminderDay3SentAt"
+    return _admin_patch_saved_route_job(
+        job.get("_route_date"),
+        job.get("job_id"),
+        {
+            field: datetime.now(timezone.utc).isoformat(),
+            "PaymentReminderQueuedStage": 0,
+            "PaymentReminderQueuedAt": "",
+        },
+    )
+
+
+def _payment_phone_reset_session():
+    for key in (
+        "payment_reminder_active_queue",
+        "payment_reminder_index",
+        "payment_reminder_sent_count",
+    ):
+        st.session_state.pop(key, None)
+
+
+# ============================================================
+# ADMIN PAYMENT REMINDER PHONE MODE
+# ============================================================
+if PAYMENT_REMINDER_MODE:
+    st.title("💷 DanCleanUK — Payment Reminders")
+    st.caption("Send prepared payment reminders through this phone's normal Messages app")
+
+    active_queue = st.session_state.get("payment_reminder_active_queue")
+    if not active_queue:
+        queued = _admin_load_payment_reminder_queue()
+        if not queued:
+            st.success("No payment reminders are prepared for this phone.")
+            st.caption("Prepare selected reminders from Admin → Outstanding Payments first.")
+            if st.button("🔄 Refresh", use_container_width=True):
+                st.rerun()
+            st.stop()
+
+        st.success(f"{len(queued)} payment reminder(s) ready.")
+        for row in queued:
+            address = clean_val(row.get("Address")) or clean_val(row.get("address_text")) or "Customer"
+            stage = int(row.get("_reminder_stage", 3))
+            with st.container(border=True):
+                st.markdown(f"**{address}**")
+                st.caption(
+                    f"{normalise_postcode(row.get('Postcode'))} · £{float(row.get('Price', 0) or 0):.2f} "
+                    f"· Day {stage} reminder"
+                )
+
+        if st.button(
+            f"▶️ START SENDING {len(queued)} PAYMENT REMINDER(S)",
+            type="primary",
+            use_container_width=True,
+            key="payment_reminder_start",
+        ):
+            st.session_state["payment_reminder_active_queue"] = queued
+            st.session_state["payment_reminder_index"] = 0
+            st.session_state["payment_reminder_sent_count"] = 0
+            st.rerun()
+        st.stop()
+
+    queue = st.session_state.get("payment_reminder_active_queue", [])
+    index = int(st.session_state.get("payment_reminder_index", 0))
+    sent_count = int(st.session_state.get("payment_reminder_sent_count", 0))
+
+    if index >= len(queue):
+        st.success(f"✅ Payment reminder session finished. {sent_count} marked as sent.")
+        remaining = _admin_load_payment_reminder_queue()
+        if remaining:
+            st.info(f"{len(remaining)} reminder(s) remain prepared — for example customers you skipped.")
+        else:
+            st.info("No prepared payment reminders remain.")
+        if st.button("🔄 RELOAD REMAINING QUEUE", type="primary", use_container_width=True):
+            _payment_phone_reset_session()
+            st.rerun()
+        st.stop()
+
+    current = queue[index]
+    stage = int(current.get("_reminder_stage", 3))
+    address = clean_val(current.get("Address")) or clean_val(current.get("address_text")) or "Customer"
+    st.progress((index + 1) / max(1, len(queue)))
+    st.caption(f"Customer {index + 1} of {len(queue)} · {sent_count} marked sent")
+    st.markdown(f"### {address}")
+    st.write(normalise_postcode(current.get("Postcode")))
+    st.write(f"📞 {clean_val(current.get('Phone'))}")
+    st.write(f"**£{float(current.get('Price', 0) or 0):.2f} outstanding · Day {stage} reminder**")
+
+    with st.expander("Message", expanded=True):
+        st.write(_payment_reminder_message(current, stage))
+
+    st.link_button(
+        "💬 OPEN SMS — MESSAGE READY",
+        _payment_reminder_sms_url(current, stage),
+        type="primary",
+        use_container_width=True,
+    )
+    st.caption("Send it in your normal Messages app, then come back here and press SENT — NEXT.")
+
+    sent_col, skip_col = st.columns(2)
+    if sent_col.button(
+        "✅ SENT — NEXT",
+        type="primary",
+        use_container_width=True,
+        key=f"payment_reminder_sent_{index}",
+    ):
+        if _admin_mark_payment_reminder_sent(current):
+            st.session_state["payment_reminder_sent_count"] = sent_count + 1
+            st.session_state["payment_reminder_index"] = index + 1
+            st.rerun()
+        else:
+            st.error("The reminder status could not be saved. Do not move on yet; please try again.")
+
+    if skip_col.button(
+        "⏭️ SKIP",
+        use_container_width=True,
+        key=f"payment_reminder_skip_{index}",
+    ):
+        st.session_state["payment_reminder_index"] = index + 1
+        st.rerun()
+
+    if st.button("↩️ End / reload queue", use_container_width=True, key="payment_reminder_end"):
+        _payment_phone_reset_session()
+        st.rerun()
+
+    st.stop()
+
+
 # ============================================================
 # ADMIN PHONE REMINDER SEND MODE
 # ============================================================
@@ -2128,32 +2420,147 @@ if st.session_state.get("admin_office_view", False):
 
     elif admin_tab == "💷 Outstanding Payments":
         st.header("💷 Outstanding Payments")
+        st.caption("Completed cleans still waiting for payment. Payment reminders become due from Day 3 and Day 7; Day 14+ stays flagged for your attention.")
+
+        today = datetime.now(ZoneInfo("Europe/London")).date()
         jobs = _admin_jobs_from_routes(routes)
         outstanding = []
         for job in jobs:
             status = clean_val(job.get("Status")).lower()
             payment = clean_val(job.get("Payment"))
             if status == "completed" and payment in {"Bank Transfer", "Not Paid"}:
-                outstanding.append(job)
+                item = dict(job)
+                item["_service_day"] = _payment_service_date(item)
+                item["_age_days"] = (
+                    max(0, (today - item["_service_day"]).days)
+                    if item["_service_day"] is not None else 0
+                )
+                item["_reminder_stage"] = _payment_reminder_stage(item, today)
+                outstanding.append(item)
+
         if not outstanding:
-            st.success("No outstanding payments.")
+            st.success("✅ No outstanding payments.")
         else:
             total = sum(float(x.get("Price", 0) or 0) for x in outstanding)
-            c1, c2 = st.columns(2)
-            c1.metric("Outstanding jobs", len(outstanding))
-            c2.metric("Outstanding total", f"£{total:.2f}")
+            reminder_due = [x for x in outstanding if x.get("_reminder_stage") in (3, 7)]
+            attention = [x for x in outstanding if x.get("_reminder_stage") == 14]
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Outstanding", f"£{total:.2f}")
+            m2.metric("Unpaid jobs", len(outstanding))
+            m3.metric("Reminders due", len(reminder_due))
+            m4.metric("Needs attention", len(attention))
+
+            if attention:
+                st.subheader("🚨 Needs Attention · 14+ days")
+                st.caption("These stay here until you mark them paid or deal with them manually. No automatic third reminder is sent.")
+                for job in sorted(attention, key=lambda x: (-x.get("_age_days", 0), x.get("_route_date", ""))):
+                    address = clean_val(job.get("Address")) or clean_val(job.get("address_text")) or clean_val(job.get("Postcode"))
+                    amount = float(job.get("Price", 0) or 0)
+                    service_day = job.get("_service_day")
+                    service_display = service_day.strftime("%d/%m/%Y") if service_day else clean_val(job.get("_route_date"))
+                    with st.container(border=True):
+                        c1, c2, c3 = st.columns([4, 2, 2])
+                        c1.markdown(f"**{address}**  \n{normalise_postcode(job.get('Postcode'))} · Cleaned {service_display}")
+                        c2.markdown(f"**£{amount:.2f}**  \n🚨 {job.get('_age_days', 0)} days outstanding")
+                        if c3.button("✅ Mark Paid", key=f"attention_paid_{job.get('_route_date')}_{job.get('job_id')}", use_container_width=True):
+                            if _admin_mark_job_paid(job.get("_route_date"), job.get("job_id")):
+                                st.rerun()
+                            else:
+                                st.error("Could not update this payment. Please try again.")
+
+            st.subheader("🔔 Payment reminders")
+            if not reminder_due:
+                st.info("No Day 3 or Day 7 payment reminders are due right now.")
+            else:
+                st.caption("Tick the customers you want to contact. Unticking a customer leaves the debt outstanding but excludes them from this phone reminder batch.")
+
+                if st.button("✅ Select Due", use_container_width=True, key="payment_select_due"):
+                    for job in reminder_due:
+                        key = f"payment_pick_{job.get('_route_date')}_{job.get('job_id')}_{job.get('_reminder_stage')}"
+                        st.session_state[key] = bool(clean_val(job.get("Phone")))
+                    st.rerun()
+                if st.button("⬜ Clear All", use_container_width=True, key="payment_clear_due"):
+                    for job in reminder_due:
+                        key = f"payment_pick_{job.get('_route_date')}_{job.get('job_id')}_{job.get('_reminder_stage')}"
+                        st.session_state[key] = False
+                    st.rerun()
+
+                selected = []
+                for job in sorted(reminder_due, key=lambda x: (x.get("_reminder_stage", 0), x.get("_route_date", ""), clean_val(x.get("address_text")))):
+                    address = clean_val(job.get("Address")) or clean_val(job.get("address_text")) or clean_val(job.get("Postcode"))
+                    amount = float(job.get("Price", 0) or 0)
+                    phone = clean_val(job.get("Phone"))
+                    stage = int(job.get("_reminder_stage", 3))
+                    service_day = job.get("_service_day")
+                    service_display = service_day.strftime("%d/%m/%Y") if service_day else clean_val(job.get("_route_date"))
+                    pick_key = f"payment_pick_{job.get('_route_date')}_{job.get('job_id')}_{stage}"
+                    if pick_key not in st.session_state:
+                        st.session_state[pick_key] = bool(phone)
+
+                    with st.container(border=True):
+                        c1, c2, c3 = st.columns([1, 5, 2])
+                        picked = c1.checkbox(
+                            "Select",
+                            key=pick_key,
+                            disabled=not bool(phone),
+                            label_visibility="collapsed",
+                        )
+                        c2.markdown(
+                            f"**{address}**  \n{normalise_postcode(job.get('Postcode'))} · 📞 {phone or 'No phone'}  \n"
+                            f"Cleaned {service_display} · **£{amount:.2f}**"
+                        )
+                        c3.markdown(f"**Day {stage}**  \n{job.get('_age_days', 0)} days")
+                        if stage == 7:
+                            sent_at = clean_val(job.get("PaymentReminderDay3SentAt"))
+                            if sent_at:
+                                try:
+                                    sent_display = pd.to_datetime(sent_at, utc=True).tz_convert("Europe/London").strftime("%d/%m %H:%M")
+                                    st.caption(f"First reminder sent {sent_display}")
+                                except Exception:
+                                    st.caption("First reminder already sent")
+                        if picked and phone:
+                            selected.append(job)
+
+                if selected:
+                    if st.button(
+                        f"📱 PREPARE {len(selected)} PAYMENT REMINDER(S) FOR PHONE",
+                        type="primary",
+                        use_container_width=True,
+                        key="prepare_payment_phone_queue",
+                    ):
+                        ok, result = _admin_prepare_payment_reminder_queue(selected)
+                        if ok:
+                            st.session_state["payment_queue_notice"] = f"Payment reminder queue ready for {result} customer(s)."
+                            st.rerun()
+                        else:
+                            st.error(str(result))
+                else:
+                    st.button(
+                        "📱 PREPARE PAYMENT REMINDERS FOR PHONE",
+                        disabled=True,
+                        use_container_width=True,
+                        key="prepare_payment_phone_queue_disabled",
+                    )
+
+                payment_notice = st.session_state.pop("payment_queue_notice", "")
+                if payment_notice:
+                    st.success(payment_notice)
+                    st.markdown(f"**On your phone open:** [{PAYMENT_REMINDER_URL}]({PAYMENT_REMINDER_URL})")
+                    st.caption("You can bookmark this payment-reminder page on your phone and reuse it.")
+
+            st.subheader("🧾 All outstanding")
             for job in sorted(outstanding, key=lambda x: (x.get("_route_date", ""), clean_val(x.get("address_text"))), reverse=True):
                 address = clean_val(job.get("Address")) or clean_val(job.get("address_text")) or clean_val(job.get("Postcode"))
                 amount = float(job.get("Price", 0) or 0)
                 payment = clean_val(job.get("Payment"))
-                try:
-                    service_display = pd.to_datetime(job.get("_route_date")).strftime("%d/%m/%Y")
-                except Exception:
-                    service_display = clean_val(job.get("_route_date"))
+                service_day = job.get("_service_day")
+                service_display = service_day.strftime("%d/%m/%Y") if service_day else clean_val(job.get("_route_date"))
+                age = int(job.get("_age_days", 0) or 0)
                 with st.container(border=True):
                     c1, c2, c3 = st.columns([4, 2, 2])
-                    c1.markdown(f"**{address}**  \n{normalise_postcode(job.get('Postcode'))} · {service_display}")
-                    c2.markdown(f"**£{amount:.2f}**  \n{payment}")
+                    c1.markdown(f"**{address}**  \n{normalise_postcode(job.get('Postcode'))} · Cleaned {service_display}")
+                    c2.markdown(f"**£{amount:.2f}**  \n{payment} · {age} day{'s' if age != 1 else ''}")
                     if c3.button("✅ Mark Paid", key=f"admin_paid_{job.get('_route_date')}_{job.get('job_id')}", use_container_width=True):
                         if _admin_mark_job_paid(job.get("_route_date"), job.get("job_id")):
                             st.rerun()
@@ -5415,10 +5822,6 @@ if st.session_state.get("start_new_day_mode", False):
 saved_snapshot = load_route_snapshot(service_date_str)
 
 if saved_snapshot is not None and not st.session_state.get("start_new_day_mode", False):
-    st.success(
-        "🔒 A permanent saved route exists for this date. "
-        "Load it exactly as stored — it cannot be overwritten by a new optimisation."
-    )
     if st.button(
         "📱 LOAD SAVED ROUTE — NO OPTIMISATION",
         type="primary",
@@ -5432,7 +5835,7 @@ if saved_snapshot is not None and not st.session_state.get("start_new_day_mode",
             st.error(message)
 
 if st.session_state.pop("saved_route_notice", None):
-    st.success("✅ Saved laptop route loaded exactly as stored.")
+    pass
 
 # A loaded locked route normally opens in Driver Mode.  The office can switch
 # explicitly to Admin without changing, unlocking or recalculating that route.
@@ -6730,9 +7133,6 @@ if route_data and not route_data.get("persisted_only") and not driver_mode:
             "🔒 You are using the saved route. No optimisation was run on this device."
         )
 
-if driver_mode:
-    st.info("🔒 Saved laptop route · no optimisation on this device")
-
 # ============================================================
 # FAILED ADDRESSES
 # ============================================================
@@ -7193,42 +7593,10 @@ def save_report_to_snapshot(service_date, report_bytes, filename):
 
 
 # ============================================================
-# STEP 1 — OFFICE PAYMENT RECONCILIATION + CLEAN DAILY REPORT
+# DAILY REPORT
 # ============================================================
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("💷 Outstanding Payments")
-
-# Reconciliation belongs on the office/laptop side, never Driver Mode.
-if not driver_mode and df is not None and not df.empty:
-    outstanding_bank = df[
-        df["Status"].astype(str).str.lower().eq("completed")
-        & df["Payment"].astype(str).str.lower().eq("bank transfer")
-    ].copy()
-    if outstanding_bank.empty:
-        st.sidebar.caption("No completed bank transfers waiting for payment.")
-    else:
-        outstanding_total = float(outstanding_bank["Price"].sum())
-        st.sidebar.metric("Outstanding", f"£{outstanding_total:.2f}")
-        for _, pay_row in outstanding_bank.sort_values(["route_order", "address_text"], na_position="last").iterrows():
-            address = clean_val(pay_row.get("Address")) or clean_val(pay_row.get("address_text")) or clean_val(pay_row.get("Postcode"))
-            amount = float(pay_row.get("Price", 0) or 0)
-            st.sidebar.caption(f"{address} — £{amount:.2f}")
-            if st.sidebar.button("✅ Mark Paid", key=f"reconcile_paid_{pay_row['job_id']}", use_container_width=True):
-                matches = df.index[df["job_id"].astype(str) == str(pay_row["job_id"])]
-                if len(matches):
-                    idx = matches[0]
-                    df.at[idx, "Payment"] = "Bank Transfer Paid"
-                    df.at[idx, "PaymentTime"] = now_text()
-                    save_job(df.loc[idx])
-                    st.session_state.master_df = df
-                    current_route_data = st.session_state.get("route_data")
-                    if current_route_data and current_route_data.get("saved_route"):
-                        save_route_snapshot(service_date_str, df, current_route_data)
-                    st.rerun()
-else:
-    if driver_mode:
-        st.sidebar.caption("Payment reconciliation is available on the office view.")
+# Outstanding Payments now belongs exclusively to Admin / Office.
+# Driver sidebar intentionally contains no payment-reconciliation section.
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📊 Daily Report")
