@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.23-ADMIN-EXCEL-BACKUP"
+APP_VERSION = "27.8.8.5.0.24-EXCEL-ADD-QUICK-ADD"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -527,6 +527,7 @@ def save_route_snapshot(service_date, df, route_data):
         "time_s": float(route_data.get("time", 0.0)),
         "saved_at": now_text(),
         "app_version": APP_VERSION,
+        "manual_extra_jobs": int(route_data.get("manual_extra_jobs", 0) or 0),
     }
     if existing_snapshot:
         existing_data = existing_snapshot.get("route_data") or {}
@@ -597,6 +598,7 @@ def load_route_snapshot(service_date):
         row["litres"] = float(data.get("litres", 0.0) or 0.0)
         row["time_s"] = float(data.get("time_s", (row.get("total_minutes") or 0) * 60) or 0.0)
         row["jobs"] = int(row.get("total_jobs") or len(row["route_job_ids"]))
+        row["manual_extra_jobs"] = int(data.get("manual_extra_jobs", 0) or 0)
         row["miles"] = float(row.get("total_miles") or 0.0)
         row["saved_at"] = data.get("saved_at") or row.get("updated_at") or row.get("created_at") or ""
         return row
@@ -770,6 +772,7 @@ def apply_saved_route_snapshot(service_date):
         "persisted_only": False,
         "saved_route": True,
         "saved_at": clean_val(snapshot.get("saved_at")),
+        "manual_extra_jobs": int(snapshot.get("manual_extra_jobs", 0) or 0),
     }
     st.session_state.pop("failed_jobs", None)
     return True, "Permanent saved route loaded."
@@ -1419,9 +1422,10 @@ def _admin_build_customer_backup_xlsx(customer_records, routes):
     ws_summary["A14"] = "How to use this backup"
     ws_summary["A14"].font = bold_font
     ws_summary["A15"] = (
-        "The Customers sheet is designed for simple customer-detail updates. "
-        "Keep Address and Postcode unchanged when using the workbook to update the app; "
-        "edit phone, price, cleaning plan, next cleaning due and notes, then upload it in Admin → Customers."
+        "The Customers sheet can update existing customers or add new customers. "
+        "For an existing customer, keep Address and Postcode unchanged and edit phone, price, cleaning plan, "
+        "next cleaning due or notes. To add a new customer, add a new row with Address, Postcode and a valid Price, "
+        "then upload it in Admin → Customers. Every change is previewed before Supabase is updated."
     )
     ws_summary["A15"].alignment = Alignment(wrap_text=True, vertical="top")
     ws_summary.column_dimensions["A"].width = 34
@@ -1518,31 +1522,44 @@ def _admin_build_customer_backup_xlsx(customer_records, routes):
 
 
 def _admin_preview_customer_excel_updates(uploaded_file, current_records):
-    """Preview safe customer-detail changes from a DanCleanUK Customers worksheet."""
+    """Preview safe customer updates AND new-customer rows from the Customers worksheet.
+
+    Address + Postcode remain the stable identity. Existing active customers are
+    updated; genuinely new identities are offered as additions. Archived identities
+    are never silently recreated.
+    """
+    empty = {"changes": [], "additions": [], "archived": [], "errors": []}
     if uploaded_file is None:
-        return {"changes": [], "unmatched": [], "errors": []}
+        return empty
     try:
         uploaded_file.seek(0)
         df = pd.read_excel(uploaded_file, sheet_name="Customers", dtype=object)
     except Exception:
-        return {"changes": [], "unmatched": [], "errors": ["Could not read the Customers sheet from this Excel file."]}
+        return {**empty, "errors": ["Could not read the Customers sheet from this Excel file."]}
 
     header_map = {str(c).strip().casefold(): c for c in df.columns}
     required = ["address", "postcode"]
     if any(name not in header_map for name in required):
-        return {"changes": [], "unmatched": [], "errors": ["The Excel file must contain Address and Postcode columns in the Customers sheet."]}
+        return {**empty, "errors": ["The Excel file must contain Address and Postcode columns in the Customers sheet."]}
 
     def col(name):
         return header_map.get(name.casefold())
 
-    current = [x for x in (current_records or []) if x.get("active") is not False]
-    by_identity = {
+    all_records = [dict(x) for x in (current_records or [])]
+    active_by_identity = {
         _admin_customer_identity(x.get("address"), x.get("postcode")): x
-        for x in current
+        for x in all_records if x.get("active") is not False
     }
+    archived_by_identity = {
+        _admin_customer_identity(x.get("address"), x.get("postcode")): x
+        for x in all_records if x.get("active") is False
+    }
+
     changes = []
-    unmatched = []
+    additions = []
+    archived = []
     errors = []
+    seen_excel = set()
 
     for excel_row, (_, row) in enumerate(df.iterrows(), start=2):
         address = clean_val(row.get(col("address")))
@@ -1552,21 +1569,44 @@ def _admin_preview_customer_excel_updates(uploaded_file, current_records):
         if not address or not postcode:
             errors.append(f"Row {excel_row}: Address and Postcode are both required.")
             continue
-        existing = by_identity.get(_admin_customer_identity(address, postcode))
-        if not existing:
-            unmatched.append(f"{address}, {postcode}")
+
+        identity = _admin_customer_identity(address, postcode)
+        if identity in seen_excel:
+            errors.append(f"Row {excel_row}: duplicate Excel row for {address}, {postcode}.")
+            continue
+        seen_excel.add(identity)
+
+        existing = active_by_identity.get(identity)
+        archived_record = archived_by_identity.get(identity)
+        if archived_record is not None and existing is None:
+            archived.append(f"{address}, {postcode}")
             continue
 
-        phone = clean_val(row.get(col("phone"))) if col("phone") is not None else clean_val(existing.get("phone"))
-        price_raw = row.get(col("price")) if col("price") is not None else existing.get("price", 0)
+        phone = clean_val(row.get(col("phone"))) if col("phone") is not None else clean_val((existing or {}).get("phone"))
+        price_raw = row.get(col("price")) if col("price") is not None else (existing or {}).get("price", 0)
         try:
             price = float(price_raw) if clean_val(price_raw) else 0.0
         except Exception:
             errors.append(f"Row {excel_row}: invalid Price for {address}.")
             continue
-        plan = normalise_cleaning_plan(row.get(col("cleaning plan"))) if col("cleaning plan") is not None else normalise_cleaning_plan(existing.get("cleaning_plan"))
-        due = _admin_excel_date(row.get(col("next cleaning due"))) if col("next cleaning due") is not None else _admin_excel_date(existing.get("next_cleaning_due"))
-        notes = clean_val(row.get(col("notes"))) if col("notes") is not None else clean_val(existing.get("notes"))
+        plan = normalise_cleaning_plan(row.get(col("cleaning plan"))) if col("cleaning plan") is not None else normalise_cleaning_plan((existing or {}).get("cleaning_plan"))
+        due = _admin_excel_date(row.get(col("next cleaning due"))) if col("next cleaning due") is not None else _admin_excel_date((existing or {}).get("next_cleaning_due"))
+        notes = clean_val(row.get(col("notes"))) if col("notes") is not None else clean_val((existing or {}).get("notes"))
+
+        if existing is None:
+            if price <= 0:
+                errors.append(f"Row {excel_row}: a new customer needs a Price greater than £0 ({address}).")
+                continue
+            additions.append({
+                "address": address,
+                "postcode": postcode,
+                "phone": phone,
+                "price": price,
+                "cleaning_plan": plan,
+                "next_due": due,
+                "notes": notes,
+            })
+            continue
 
         old = {
             "Phone": clean_val(existing.get("phone")),
@@ -1596,13 +1636,15 @@ def _admin_preview_customer_excel_updates(uploaded_file, current_records):
                 "changed_fields": changed_fields,
             })
 
-    return {"changes": changes, "unmatched": unmatched, "errors": errors}
+    return {"changes": changes, "additions": additions, "archived": archived, "errors": errors}
 
 
-def _admin_apply_customer_excel_updates(changes):
-    """Apply only previewed customer detail changes. Never touches saved routes/Driver."""
+def _admin_apply_customer_excel_updates(changes, additions=None):
+    """Apply only previewed Excel changes. Never touches Driver routes or route order."""
     updated = 0
+    added = 0
     failed = []
+
     for change in changes or []:
         due = None
         if change.get("next_due"):
@@ -1624,8 +1666,190 @@ def _admin_apply_customer_excel_updates(changes):
             updated += 1
         else:
             failed.append(f"{change.get('address')}: {message or 'update failed'}")
-    return updated, failed
 
+    for item in additions or []:
+        due = None
+        if item.get("next_due"):
+            try:
+                due = pd.to_datetime(item.get("next_due")).date()
+            except Exception:
+                due = None
+        ok, message = _admin_add_customer(
+            item.get("address"),
+            item.get("postcode"),
+            item.get("phone"),
+            item.get("price"),
+            item.get("cleaning_plan"),
+            due,
+            item.get("notes"),
+        )
+        if ok:
+            added += 1
+        else:
+            failed.append(f"{item.get('address')}: {message or 'add failed'}")
+
+    return updated, added, failed
+
+
+def _driver_quick_customer_action(
+    master_df, service_date, route_data, address, postcode, phone, price,
+    cleaning_plan, notes, action="today", placement="Do Next", tax_rate=0.20,
+):
+    """Save a street enquiry as a customer and optionally append it to today's locked route.
+
+    This is deliberately NOT an optimiser. It only inserts one manual extra stop
+    into the already-saved order and leaves ORS mileage/time exactly as originally
+    calculated.
+    """
+    address = clean_val(address)
+    postcode = normalise_postcode(postcode)
+    phone = clean_val(phone)
+    cleaning_plan = normalise_cleaning_plan(cleaning_plan)
+    notes = clean_val(notes)
+    try:
+        price = float(price or 0)
+    except Exception:
+        price = 0.0
+
+    if not address or not postcode:
+        return False, "Address and postcode are required.", master_df, route_data
+    if price <= 0:
+        return False, "Price must be greater than £0.", master_df, route_data
+
+    identity = _admin_customer_identity(address, postcode)
+    records = _admin_load_customer_records(active_only=False)
+    existing = next(
+        (x for x in records if _admin_customer_identity(x.get("address"), x.get("postcode")) == identity),
+        None,
+    )
+    if existing is not None and existing.get("active") is False:
+        return (
+            False,
+            "This address is archived. Restore/check it in Admin → Customers before adding it again.",
+            master_df,
+            route_data,
+        )
+
+    if action == "save":
+        if existing is not None:
+            return True, "Customer is already in the customer book.", master_df, route_data
+        ok, message = _admin_add_customer(address, postcode, phone, price, cleaning_plan, None, notes)
+        if not ok:
+            return False, message or "Could not save the customer.", master_df, route_data
+        return True, "Customer saved for future work.", master_df, route_data
+
+    if not route_data or not route_data.get("saved_route"):
+        return False, "Load today's saved route first.", master_df, route_data
+    if master_df is None or master_df.empty:
+        return False, "Today's route is not loaded.", master_df, route_data
+
+    # Never add the same address twice to the same working day.
+    for _, current_row in master_df.iterrows():
+        current_identity = _admin_customer_identity(
+            current_row.get("Address") or current_row.get("address_text"),
+            current_row.get("Postcode"),
+        )
+        if current_identity == identity:
+            return False, "This customer is already on today's route.", master_df, route_data
+
+    # If the customer already exists, use the permanent customer-book details so
+    # a phone quick-add cannot accidentally overwrite their normal price/plan.
+    if existing is not None:
+        phone = clean_val(existing.get("phone"))
+        price = float(existing.get("price", 0) or 0)
+        cleaning_plan = normalise_cleaning_plan(existing.get("cleaning_plan"))
+        notes = clean_val(existing.get("notes"))
+    else:
+        ok, message = _admin_add_customer(address, postcode, phone, price, cleaning_plan, None, notes)
+        if not ok:
+            return False, message or "Could not save the new customer.", master_df, route_data
+
+    new_df = master_df.copy()
+    routed = new_df[new_df["route_order"].notna()].copy()
+    routed["_sort"] = pd.to_numeric(routed["route_order"], errors="coerce")
+    routed = routed.sort_values("_sort", na_position="last")
+    ordered_ids = routed["job_id"].astype(str).tolist()
+
+    insert_at = len(ordered_ids)
+    if placement == "Do Next" and ordered_ids:
+        pending_routed = routed[routed["Status"].astype(str).str.lower() != "completed"]
+        if not pending_routed.empty:
+            current_job_id = str(pending_routed.iloc[0]["job_id"])
+            try:
+                # Keep the current stop first; put the street enquiry immediately after it.
+                insert_at = ordered_ids.index(current_job_id) + 1
+            except ValueError:
+                insert_at = len(ordered_ids)
+
+    job_id = make_job_id(
+        service_date,
+        f"extra-{int(time.time() * 1000)}",
+        postcode,
+        phone,
+    )
+    ordered_ids.insert(insert_at, job_id)
+
+    new_row = {
+        "Dates": str(service_date),
+        "Postcode": postcode,
+        "Address": address,
+        "Price": price,
+        "Phone": normalise_phone(phone) if phone else "",
+        "Cleaning Plan": cleaning_plan,
+        "Notes": notes,
+        "job_id": job_id,
+        "service_date": str(service_date),
+        "Status": "pending",
+        "Payment": "Waiting",
+        "PaymentTime": "",
+        "CompletedTime": "",
+        "Next Cleaning Due": "",
+        "route_order": None,
+        "address_text": f"{address}, {postcode}",
+        "latitude": None,
+        "longitude": None,
+        "geo_query": "",
+        "created_at": now_text(),
+        "WhatsAppSent": False,
+        "WhatsAppTime": "",
+        "MessageMethod": "",
+        "MessageTime": "",
+        "MessageOpened": False,
+        "MessageConfirmed": False,
+        "MessageConfirmedTime": "",
+    }
+    new_df = pd.concat([new_df, pd.DataFrame([new_row])], ignore_index=True, sort=False)
+
+    order_map = {jid: pos for pos, jid in enumerate(ordered_ids)}
+    for idx in new_df.index:
+        jid = str(new_df.at[idx, "job_id"])
+        if jid in order_map:
+            new_df.at[idx, "route_order"] = order_map[jid]
+
+    new_route_data = dict(route_data)
+    new_route_data["jobs"] = len(ordered_ids)
+    new_route_data["revenue"] = float(route_data.get("revenue", 0.0) or 0.0) + price
+    new_route_data["take_home"] = float(route_data.get("take_home", 0.0) or 0.0) + (price * (1 - float(tax_rate or 0.0)))
+    new_route_data["manual_extra_jobs"] = int(route_data.get("manual_extra_jobs", 0) or 0) + 1
+    new_route_data["saved_route"] = True
+
+    # Save the permanent route first. If Supabase refuses the update, do not alter
+    # the phone's working dataframe/SQLite cache.
+    if not save_route_snapshot(service_date, new_df, new_route_data):
+        return (
+            False,
+            "Customer was saved, but the extra job could not be added to today's locked route. Try again before cleaning it.",
+            master_df,
+            route_data,
+        )
+
+    save_dataframe(new_df)
+    return (
+        True,
+        "Customer saved and added to today's route. Route order was adjusted manually; no optimisation was run.",
+        new_df,
+        new_route_data,
+    )
 
 def _admin_reminder_message():
     """Standard DanCleanUK next-day reminder. No price or payment details."""
@@ -3462,10 +3686,10 @@ if st.session_state.get("admin_office_view", False):
                 if b2.button("🔄 Refresh Customers", use_container_width=True, key="admin_refresh_customer_book"):
                     st.rerun()
 
-                st.markdown("#### Update existing customers from Excel")
+                st.markdown("#### Update or add customers from Excel")
                 st.caption(
-                    "For safety, Address + Postcode identify the customer. Keep those two columns unchanged here. "
-                    "Use the normal Edit Customer button if an address/postcode itself needs changing."
+                    "Address + Postcode identify an existing customer. Keep those two columns unchanged when editing. "
+                    "To add a new customer, add a new row in the Customers sheet. New rows are previewed before anything is saved."
                 )
                 customer_excel = st.file_uploader(
                     "Upload edited DanCleanUK Excel backup",
@@ -3473,45 +3697,60 @@ if st.session_state.get("admin_office_view", False):
                     key="admin_customer_excel_update_file",
                 )
                 if customer_excel is not None:
-                    preview = _admin_preview_customer_excel_updates(customer_excel, manual_customers)
+                    preview = _admin_preview_customer_excel_updates(customer_excel, all_for_backup)
                     if preview["errors"]:
                         for error in preview["errors"]:
                             st.error(error)
-                    if preview["unmatched"]:
+                    if preview["archived"]:
                         st.warning(
-                            f"{len(preview['unmatched'])} row(s) were not matched and will be skipped. "
-                            "New customers are still added with ➕ Add Customer."
+                            f"{len(preview['archived'])} row(s) match archived customers and will not be recreated automatically."
                         )
-                        with st.expander("Show unmatched rows"):
-                            for item in preview["unmatched"]:
+                        with st.expander("Show archived matches"):
+                            for item in preview["archived"]:
                                 st.write(f"• {item}")
+
                     changes = preview["changes"]
+                    additions = preview["additions"]
+                    preview_rows = []
+                    for change in changes:
+                        preview_rows.append({
+                            "Customer": f"{change['address']}, {change['postcode']}",
+                            "Action": "Update",
+                            "Details": ", ".join(change["changed_fields"]),
+                        })
+                    for item in additions:
+                        preview_rows.append({
+                            "Customer": f"{item['address']}, {item['postcode']}",
+                            "Action": "Add new customer",
+                            "Details": f"£{float(item['price']):.2f}",
+                        })
+
                     if changes:
                         st.success(f"{len(changes)} existing customer(s) have changes ready to apply.")
-                        preview_rows = []
-                        for change in changes:
-                            preview_rows.append({
-                                "Customer": f"{change['address']}, {change['postcode']}",
-                                "Changes": ", ".join(change["changed_fields"]),
-                            })
+                    if additions:
+                        st.success(f"{len(additions)} new customer(s) are ready to add.")
+                    if preview_rows:
                         st.dataframe(pd.DataFrame(preview_rows), hide_index=True, use_container_width=True)
-                        st.info("Your current Supabase customer book is not changed until you press Apply Excel Updates.")
+                        st.info("Supabase is not changed until you press Apply Excel Changes.")
+                        total_excel_actions = len(changes) + len(additions)
                         if st.button(
-                            f"✅ Apply {len(changes)} Excel Update(s)",
+                            f"✅ Apply {total_excel_actions} Excel Change(s)",
                             type="primary",
                             use_container_width=True,
                             key="admin_apply_customer_excel_updates",
                         ):
-                            updated, failed = _admin_apply_customer_excel_updates(changes)
+                            updated, added, failed = _admin_apply_customer_excel_updates(changes, additions)
                             if updated:
                                 st.success(f"Updated {updated} customer(s).")
+                            if added:
+                                st.success(f"Added {added} new customer(s).")
                             if failed:
                                 for failure in failed:
                                     st.error(failure)
-                            if updated and not failed:
+                            if (updated or added) and not failed:
                                 st.rerun()
-                    elif not preview["errors"]:
-                        st.info("No customer changes found in this Excel file.")
+                    elif not preview["errors"] and not preview["archived"]:
+                        st.info("No customer changes or new customers found in this Excel file.")
 
         top1.metric("Customers", len(manual_customers) if table_ready else len(history_customers))
         if top2.button("➕ Add Customer", type="primary", use_container_width=True, key="admin_add_customer_button"):
@@ -7629,6 +7868,77 @@ if "route_order" in pending.columns:
 
 st.markdown("---")
 st.subheader("📍 Planned Route")
+
+# Number 2 extension — quick street enquiry capture for Driver Mode.
+# This never calls the optimiser or ORS. It only inserts one manual stop into
+# the already locked working-day order.
+if driver_mode:
+    quick_notice = st.session_state.pop("driver_quick_add_notice", "")
+    if quick_notice:
+        st.success(quick_notice)
+
+    if "driver_quick_add_open" not in st.session_state:
+        st.session_state["driver_quick_add_open"] = False
+
+    if st.button(
+        "➕ Quick Add Customer",
+        use_container_width=True,
+        key="driver_quick_add_toggle",
+    ):
+        st.session_state["driver_quick_add_open"] = not st.session_state["driver_quick_add_open"]
+        st.rerun()
+
+    if st.session_state.get("driver_quick_add_open", False):
+        with st.container(border=True):
+            st.write("### ➕ New customer while you are out")
+            st.caption("Save them for later, or add them to today's locked route without re-optimising.")
+            with st.form("driver_quick_add_customer_form", clear_on_submit=False):
+                qa1, qa2 = st.columns([2, 1])
+                qa_address = qa1.text_input("Address *", placeholder="e.g. 200 Queensway")
+                qa_postcode = qa2.text_input("Postcode *", placeholder="e.g. NG31 9RA")
+                qa3, qa4 = st.columns(2)
+                qa_phone = qa3.text_input("Phone", placeholder="07...")
+                qa_price = qa4.number_input("Price (£)", min_value=0.0, value=20.0, step=1.0)
+                qa_plan = st.selectbox(
+                    "Cleaning Plan",
+                    ["", "1 Month", "2 Months", "3 Months", "4 Months", "6 Months", "12 Months"],
+                    key="driver_quick_add_plan",
+                )
+                qa_notes = st.text_area("Notes", height=70, placeholder="Gate/access or customer notes")
+                qa_placement = st.radio(
+                    "If adding today",
+                    ["Do Next", "End of Route"],
+                    horizontal=True,
+                    help="Do Next keeps your current stop first and inserts this customer immediately after it.",
+                )
+                save_future = st.form_submit_button("💾 Save for Future", use_container_width=True)
+                add_today = st.form_submit_button("🚗 Add to Today", type="primary", use_container_width=True)
+
+                if save_future or add_today:
+                    action = "today" if add_today else "save"
+                    ok, message, changed_df, changed_route_data = _driver_quick_customer_action(
+                        df,
+                        service_date_str,
+                        st.session_state.get("route_data", {}),
+                        qa_address,
+                        qa_postcode,
+                        qa_phone,
+                        qa_price,
+                        qa_plan,
+                        qa_notes,
+                        action=action,
+                        placement=qa_placement,
+                        tax_rate=TAX_RATE,
+                    )
+                    if ok:
+                        if action == "today":
+                            st.session_state.master_df = changed_df
+                            st.session_state.route_data = changed_route_data
+                        st.session_state["driver_quick_add_open"] = False
+                        st.session_state["driver_quick_add_notice"] = message
+                        st.rerun()
+                    else:
+                        st.error(message)
 
 # Completed jobs are kept in records but displayed separately.
 # Only located customers with a current route position belong in the
