@@ -26,7 +26,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.33-SECURITY-RELOAD-FIX"
+APP_VERSION = "27.8.8.5.0.34-PRIVATE-MESSAGE-CENTRE"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -145,7 +145,7 @@ if not _security_is_unlocked():
             st.error("Incorrect password.")
     st.stop()
 
-# Keep the lock control in the sidebar so the Driver front remains clean.
+# Keep security and phone-message navigation in the sidebar so the Driver front remains clean.
 if st.sidebar.button(
     "🔒 Lock DanCleanUK",
     use_container_width=True,
@@ -153,6 +153,36 @@ if st.sidebar.button(
 ):
     _security_lock()
     st.rerun()
+
+
+def _open_private_message_centre(screen="home"):
+    """Navigate inside this same private Streamlit deployment.
+
+    No second/public app is required. Query parameters only choose which screen
+    this already-authenticated DanCleanUK app renders.
+    """
+    st.session_state["admin_office_view"] = False
+    st.query_params.clear()
+    if screen == "cleaning":
+        st.query_params["messages"] = "1"
+        st.query_params["send"] = "cleaning"
+    elif screen == "payment":
+        st.query_params["messages"] = "1"
+        st.query_params["send"] = "payment"
+    elif screen == "driver":
+        pass
+    else:
+        st.query_params["messages"] = "1"
+    st.rerun()
+
+
+if not MESSAGES_MODE and not PHONE_REMINDER_MODE and not PAYMENT_REMINDER_MODE:
+    if st.sidebar.button(
+        "📱 Phone Reminders",
+        use_container_width=True,
+        key="open_private_phone_reminders",
+    ):
+        _open_private_message_centre("home")
 
 if not st.session_state.get("admin_office_view", False) and not MESSAGES_MODE and not PHONE_REMINDER_MODE and not PAYMENT_REMINDER_MODE:
     st.title("🚗 DanCleanUK Daily Route Optimizer")
@@ -209,25 +239,33 @@ st.markdown(
 # ============================================================
 if MESSAGES_MODE and not PHONE_REMINDER_MODE and not PAYMENT_REMINDER_MODE:
     st.title("📱 DanCleanUK — Phone Reminders")
-    st.caption("Choose which prepared messages you want to send.")
+    st.caption("Private message centre inside your main DanCleanUK app.")
 
-    st.link_button(
+    if st.button(
         "🪟 TOMORROW'S CLEANING / ACCESS REMINDERS",
-        "https://dancleanuk-optimizer.streamlit.app/?messages=1&send=cleaning",
         type="primary",
         use_container_width=True,
-    )
+        key="private_message_centre_cleaning",
+    ):
+        _open_private_message_centre("cleaning")
     st.caption("Tomorrow's message includes the reminder to make sure we have access to the property.")
 
-    st.link_button(
+    if st.button(
         "💷 OUTSTANDING PAYMENT REMINDERS",
-        "https://dancleanuk-optimizer.streamlit.app/?messages=1&send=payment",
         use_container_width=True,
-    )
+        key="private_message_centre_payment",
+    ):
+        _open_private_message_centre("payment")
     st.caption("Prepared Day 3 / Day 7 outstanding-payment reminders.")
 
     st.markdown("---")
-    st.caption("Normal DanCleanUK icon = Driver. This shortcut = all phone reminders.")
+    if st.button(
+        "🚗 RETURN TO DRIVER",
+        use_container_width=True,
+        key="private_message_centre_driver",
+    ):
+        _open_private_message_centre("driver")
+    st.caption("One private DanCleanUK deployment — no separate public Message Centre is needed.")
     st.stop()
 
 
@@ -2337,8 +2375,6 @@ def _admin_mark_reminder_sent(customer_id, scheduled_date):
         return False
 
 
-PHONE_REMINDER_URL = "https://dancleanuk-optimizer.streamlit.app/?messages=1"
-
 
 def _admin_reminder_queue_columns_ready():
     """Check whether the optional phone reminder queue columns exist."""
@@ -2464,8 +2500,6 @@ def _phone_reminder_reset_session():
         st.session_state.pop(key, None)
 
 
-
-PAYMENT_REMINDER_URL = "https://dancleanuk-optimizer.streamlit.app/?mode=payment"
 
 
 def _payment_service_date(job):
@@ -2676,6 +2710,9 @@ def _payment_phone_reset_session():
 # ADMIN PAYMENT REMINDER PHONE MODE
 # ============================================================
 if PAYMENT_REMINDER_MODE:
+    if st.button("← PHONE REMINDERS", use_container_width=True, key="payment_back_to_private_centre"):
+        _payment_phone_reset_session()
+        _open_private_message_centre("home")
     st.title("💷 DanCleanUK — Payment Reminders")
     st.caption("Send prepared payment reminders through this phone's normal Messages app")
 
@@ -2784,6 +2821,9 @@ if PAYMENT_REMINDER_MODE:
 # This is a separate Admin utility reached only with ?phone_reminders=1.
 # It stops before the normal Driver front, so Driver and the route engine remain unchanged.
 if PHONE_REMINDER_MODE:
+    if st.button("← PHONE REMINDERS", use_container_width=True, key="cleaning_back_to_private_centre"):
+        _phone_reminder_reset_session()
+        _open_private_message_centre("home")
     st.title("📱 DanCleanUK — Reminder Sender")
     st.caption("Send tomorrow's prepared reminders through this phone's normal Messages app")
 
@@ -3329,10 +3369,10 @@ if st.session_state.get("admin_office_view", False):
                         phone_queue_notice = st.session_state.pop("admin_phone_queue_notice", "")
                         if phone_queue_notice:
                             st.success(phone_queue_notice)
-                            st.markdown(
-                                f"**On your phone open:** [{PHONE_REMINDER_URL}]({PHONE_REMINDER_URL})"
+                            st.info(
+                                "On your phone: open the normal private DanCleanUK app, open the sidebar, "
+                                "then tap 📱 Phone Reminders → Tomorrow's Cleaning / Access Reminders."
                             )
-                            st.caption("Bookmark that page on your phone — the same link can be reused every day.")
 
                         phone_queue_error = st.session_state.pop("admin_phone_queue_error", "")
                         if phone_queue_error:
@@ -3503,8 +3543,10 @@ if st.session_state.get("admin_office_view", False):
                 payment_notice = st.session_state.pop("payment_queue_notice", "")
                 if payment_notice:
                     st.success(payment_notice)
-                    st.markdown(f"**On your phone open this special payment link:** [{PAYMENT_REMINDER_URL}]({PAYMENT_REMINDER_URL})")
-                    st.caption("Important: do not open the normal DanCleanUK home-screen icon for this step — that intentionally opens Driver. Bookmark this special payment-reminder link separately on your phone and reuse it.")
+                    st.info(
+                        "On your phone: open the normal private DanCleanUK app, open the sidebar, "
+                        "then tap 📱 Phone Reminders → Outstanding Payment Reminders."
+                    )
 
             st.subheader("🧾 All outstanding")
             for job in sorted(outstanding, key=lambda x: (x.get("_route_date", ""), clean_val(x.get("address_text"))), reverse=True):
