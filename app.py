@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.30-DRIVER-PREVIOUS-BALANCE"
+APP_VERSION = "27.8.8.5.0.31-NUMBER-6-WRAPPED"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -3958,7 +3958,7 @@ if st.session_state.get("admin_office_view", False):
 
     else:
         st.header("👥 Customers")
-        st.caption("Permanent customer book · automatically grouped into postcode zones")
+        st.caption("Permanent customer book · postcode zones + automatic area folders")
 
         if "admin_add_customer_open" not in st.session_state:
             st.session_state["admin_add_customer_open"] = False
@@ -4132,19 +4132,66 @@ if st.session_state.get("admin_office_view", False):
         else:
             zone_names = sorted({clean_val(x.get("Zone")) or "Unzoned" for x in cards})
             selected_zone = st.selectbox("Zone", ["All zones"] + zone_names, key="admin_customer_zone_filter")
-            search_customer = st.text_input("Search customers", placeholder="Address, postcode or phone", key="admin_customer_search").strip().casefold()
+            search_customer = st.text_input(
+                "Search customers",
+                placeholder="Address, postcode or phone",
+                key="admin_customer_search",
+            ).strip().casefold()
+
             visible_cards = []
             for item in cards:
                 zone = clean_val(item.get("Zone")) or "Unzoned"
-                haystack = " ".join([clean_val(item.get("Address")), normalise_postcode(item.get("Postcode")), clean_val(item.get("Phone"))]).casefold()
+                haystack = " ".join([
+                    clean_val(item.get("Address")),
+                    normalise_postcode(item.get("Postcode")),
+                    clean_val(item.get("Phone")),
+                ]).casefold()
                 if selected_zone != "All zones" and zone != selected_zone:
                     continue
                 if search_customer and search_customer not in haystack:
                     continue
                 visible_cards.append(item)
 
-            st.caption(f"Showing {len(visible_cards)} customer(s)")
-            for idx, customer in enumerate(sorted(visible_cards, key=lambda x: (clean_val(x.get("Zone")), clean_val(x.get("Address"))))):
+            def _customer_area_bucket(customer):
+                """Return a display area and stable bucket key for Admin folders only.
+
+                This never changes the stored address/postcode/zone. If the address
+                includes a locality after a comma (for example Church Street,
+                Barrowby), that locality is preferred. Otherwise the street name is
+                used and the postcode sector is included in the hidden grouping key
+                so identical street names in different villages are not merged.
+                """
+                raw_address = clean_val(customer.get("Address"))
+                postcode = normalise_postcode(customer.get("Postcode"))
+                parts = [p.strip() for p in raw_address.split(",") if p.strip()]
+
+                if len(parts) >= 2:
+                    # The first component after the house/street is normally the
+                    # village/estate name in the DanCleanUK customer book.
+                    label = parts[1]
+                    key = f"locality::{label.casefold()}"
+                    return label, key
+
+                street = raw_address
+                street = re.sub(
+                    r"^\s*(?:flat\s+[A-Za-z0-9-]+\s*,?\s*)?"
+                    r"(?:\d+[A-Za-z]?(?:\s*[-/]\s*\d+[A-Za-z]?)?)\s+",
+                    "",
+                    street,
+                    flags=re.IGNORECASE,
+                ).strip(" ,-–—")
+                label = street or (postcode or "Other")
+
+                # Keep same-named streets in different postcode sectors apart.
+                compact_pc = postcode.replace(" ", "")
+                sector = postcode
+                if len(compact_pc) >= 5 and " " in postcode:
+                    outward, inward = postcode.split(" ", 1)
+                    sector = f"{outward} {inward[:1]}"
+                key = f"street::{label.casefold()}::{sector.casefold()}"
+                return label, key
+
+            def _render_customer_card(customer):
                 with st.container(border=True):
                     left, middle, right = st.columns([4, 2, 2])
                     address = clean_val(customer.get("Address")) or "Customer"
@@ -4169,6 +4216,7 @@ if st.session_state.get("admin_office_view", False):
                         except Exception:
                             planned_label = planned_service
                         st.caption(f"⏩ One-off moved clean: {planned_label} · regular Next Cleaning Due remains {due}")
+
                     customer_id = customer.get("Customer ID")
                     if customer_id is not None:
                         edit_state_key = "admin_edit_customer_id"
@@ -4262,6 +4310,54 @@ if st.session_state.get("admin_office_view", False):
                                             st.error(message)
                     if notes:
                         st.caption(f"Notes: {notes}")
+
+            st.caption(f"Showing {len(visible_cards)} customer(s)")
+            sorted_cards = sorted(
+                visible_cards,
+                key=lambda x: (clean_val(x.get("Zone")), clean_val(x.get("Address"))),
+            )
+
+            # Search mode deliberately shows direct results. A customer should
+            # never be hidden inside a collapsed area folder while searching.
+            if search_customer:
+                for customer in sorted_cards:
+                    _render_customer_card(customer)
+            else:
+                buckets = {}
+                for customer in sorted_cards:
+                    label, bucket_key = _customer_area_bucket(customer)
+                    bucket = buckets.setdefault(bucket_key, {"label": label, "customers": []})
+                    bucket["customers"].append(customer)
+
+                folder_buckets = [
+                    bucket for bucket in buckets.values()
+                    if len(bucket["customers"]) >= 3
+                ]
+                folder_buckets.sort(key=lambda b: clean_val(b["label"]).casefold())
+                folder_customer_ids = {
+                    id(customer)
+                    for bucket in folder_buckets
+                    for customer in bucket["customers"]
+                }
+                loose_customers = [
+                    customer for customer in sorted_cards
+                    if id(customer) not in folder_customer_ids
+                ]
+
+                if folder_buckets:
+                    st.markdown("#### 📁 Customer Areas")
+                    st.caption("Areas with 3 or more active customers are grouped automatically. This is display only.")
+                    for bucket in folder_buckets:
+                        members = sorted(bucket["customers"], key=lambda x: clean_val(x.get("Address")))
+                        with st.expander(f"📁 {bucket['label']} — {len(members)} customers", expanded=False):
+                            for customer in members:
+                                _render_customer_card(customer)
+
+                if loose_customers:
+                    if folder_buckets:
+                        st.markdown("#### Other customers")
+                    for customer in loose_customers:
+                        _render_customer_card(customer)
 
     # Critical separation: nothing from the locked Driver/Route front renders below.
     st.stop()
