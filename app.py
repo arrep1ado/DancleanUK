@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.26-LIVE-DAILY-RECORD"
+APP_VERSION = "27.8.8.5.0.27-DAILY-RECORD-POLISH"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -1611,13 +1611,13 @@ def _admin_build_live_daily_record_xlsx(snapshot):
         ("Driving Distance", f"{float(snapshot.get('total_miles') or 0):.1f} miles"),
         ("Driving Time", f"{total_minutes // 60}h {total_minutes % 60:02d}m"),
         ("Fuel Cost", float(snapshot.get("fuel_cost") or 0)),
-        ("Take Home", float(snapshot.get("take_home") or 0)),
+        ("Projected Take Home", float(snapshot.get("take_home") or 0)),
     ]
     for r, (label, value) in enumerate(summary, start=5):
         ws.cell(r, 1, label).font = bold_font
         ws.cell(r, 1).fill = section_fill
         ws.cell(r, 2, value)
-        if label in {"Completed Revenue", "Collected", "Outstanding", "Fuel Cost", "Take Home"}:
+        if label in {"Completed Revenue", "Collected", "Outstanding", "Fuel Cost", "Projected Take Home"}:
             ws.cell(r, 2).number_format = '£#,##0.00'
         if label == "Outstanding" and float(outstanding) > 0:
             ws.cell(r, 1).fill = outstanding_fill
@@ -1638,8 +1638,14 @@ def _admin_build_live_daily_record_xlsx(snapshot):
     ws.row_dimensions[start].height = 24
 
     for row_no, job in enumerate(jobs, start=start + 1):
-        pay_status, pay_method = _admin_payment_display(job)
         status = "Completed" if clean_val(job.get("Status")).lower() == "completed" else "Pending"
+        # A payment only becomes due after the clean is completed. Keeping pending
+        # jobs out of the outstanding bucket makes the row wording match the live
+        # Daily Record summary and avoids suggesting that unworked jobs owe money.
+        if status == "Completed":
+            pay_status, pay_method = _admin_payment_display(job)
+        else:
+            pay_status, pay_method = "Not Due Yet", ""
         order = job.get("route_order")
         try:
             order = int(float(order)) + 1
@@ -1663,6 +1669,10 @@ def _admin_build_live_daily_record_xlsx(snapshot):
             cell.border = border
             cell.alignment = Alignment(vertical="top", wrap_text=True)
         ws.cell(row_no, 4).number_format = '£#,##0.00'
+        # Phone numbers are identifiers, not numbers. Force Excel text format so
+        # a leading zero is preserved whenever the stored phone value has one.
+        ws.cell(row_no, 12).number_format = '@'
+        ws.cell(row_no, 12).value = str(ws.cell(row_no, 12).value or "")
         if pay_status == "Paid":
             ws.cell(row_no, 6).fill = paid_fill
         elif status == "Completed":
