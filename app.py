@@ -3,6 +3,7 @@ import html
 import base64
 import json
 import hashlib
+import hmac
 import math
 import re
 import sqlite3
@@ -25,7 +26,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.31-NUMBER-6-WRAPPED"
+APP_VERSION = "27.8.8.5.0.33-SECURITY-RELOAD-FIX"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -71,6 +72,87 @@ if MESSAGES_MODE or PHONE_REMINDER_MODE or PAYMENT_REMINDER_MODE:
         )
     except Exception:
         pass
+
+
+# ============================================================
+# APP SECURITY — NUMBER 7
+# ============================================================
+# One private password protects every entry point in this deployment:
+# Driver, Admin, phone reminders and payment reminders. The password itself
+# lives only in Streamlit Secrets and is never stored in GitHub/app.py.
+#
+# Add this to Streamlit Secrets before deploying this version:
+# DANCLEANUK_APP_PASSWORD = "your-own-strong-password"
+#
+# Authentication is kept only in this browser session and automatically
+# expires after 12 hours. Closing/restarting the session may ask again sooner.
+_SECURITY_SESSION_SECONDS = 12 * 60 * 60
+
+
+def _security_secret_password():
+    try:
+        return str(st.secrets.get("DANCLEANUK_APP_PASSWORD", "")).strip()
+    except Exception:
+        return ""
+
+
+def _security_is_unlocked():
+    if not st.session_state.get("dancleanuk_authenticated", False):
+        return False
+    unlocked_at = float(st.session_state.get("dancleanuk_authenticated_at", 0.0) or 0.0)
+    if unlocked_at <= 0 or (time.time() - unlocked_at) >= _SECURITY_SESSION_SECONDS:
+        st.session_state.pop("dancleanuk_authenticated", None)
+        st.session_state.pop("dancleanuk_authenticated_at", None)
+        return False
+    return True
+
+
+def _security_lock():
+    st.session_state.pop("dancleanuk_authenticated", None)
+    st.session_state.pop("dancleanuk_authenticated_at", None)
+
+
+_security_password = _security_secret_password()
+if not _security_password:
+    st.title("🔒 DanCleanUK")
+    st.error("Security setup required before the app can open.")
+    st.info(
+        'In Streamlit → App settings → Secrets, add: '
+        'DANCLEANUK_APP_PASSWORD = "your password"'
+    )
+    st.caption("The password must be stored in Streamlit Secrets, never in GitHub code.")
+    st.stop()
+
+if not _security_is_unlocked():
+    st.title("🔒 DanCleanUK")
+    st.caption("Enter the DanCleanUK app password to continue.")
+    with st.form("dancleanuk_security_login", clear_on_submit=False):
+        _entered_password = st.text_input(
+            "Password",
+            type="password",
+        )
+        _unlock = st.form_submit_button(
+            "🔓 Open DanCleanUK",
+            type="primary",
+            use_container_width=True,
+        )
+    if _unlock:
+        if hmac.compare_digest(str(_entered_password), _security_password):
+            st.session_state["dancleanuk_authenticated"] = True
+            st.session_state["dancleanuk_authenticated_at"] = time.time()
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
+# Keep the lock control in the sidebar so the Driver front remains clean.
+if st.sidebar.button(
+    "🔒 Lock DanCleanUK",
+    use_container_width=True,
+    key="dancleanuk_lock_app",
+):
+    _security_lock()
+    st.rerun()
 
 if not st.session_state.get("admin_office_view", False) and not MESSAGES_MODE and not PHONE_REMINDER_MODE and not PAYMENT_REMINDER_MODE:
     st.title("🚗 DanCleanUK Daily Route Optimizer")
@@ -877,9 +959,21 @@ init_saved_routes_db()
 if st.session_state.get("app_version") != APP_VERSION:
     # Geocoding is part of route correctness. Never carry coordinates from an
     # older app version into a new geocoding/route engine.
+    #
+    # SECURITY: preserve the authenticated browser session while clearing the
+    # old app state. Without this, the version reset removes the login flag
+    # immediately after a successful password login, which can make the app
+    # appear unable to reload / keep returning to the lock screen.
+    _keep_authenticated = bool(st.session_state.get("dancleanuk_authenticated", False))
+    _keep_authenticated_at = float(st.session_state.get("dancleanuk_authenticated_at", 0.0) or 0.0)
+
     st.session_state.clear()
     st.session_state.app_version = APP_VERSION
     st.session_state.geocode_cache = {}
+
+    if _keep_authenticated and _keep_authenticated_at > 0:
+        st.session_state["dancleanuk_authenticated"] = True
+        st.session_state["dancleanuk_authenticated_at"] = _keep_authenticated_at
 
 if "geocode_cache" not in st.session_state:
     st.session_state.geocode_cache = {}
