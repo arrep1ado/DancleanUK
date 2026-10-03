@@ -47,13 +47,21 @@ st.set_page_config(
     layout="centered",
 )
 
-PHONE_REMINDER_MODE = str(st.query_params.get("phone_reminders", "")).strip().lower() in {"1", "true", "yes"}
+MESSAGES_MODE = str(st.query_params.get("messages", "")).strip().lower() in {"1", "true", "yes"}
+MESSAGE_SEND_MODE = str(st.query_params.get("send", "")).strip().lower()
+
+# Old direct links still work, but Android only needs the single ?messages=1 shortcut.
+PHONE_REMINDER_MODE = (
+    str(st.query_params.get("phone_reminders", "")).strip().lower() in {"1", "true", "yes"}
+    or (MESSAGES_MODE and MESSAGE_SEND_MODE in {"cleaning", "clean", "tomorrow"})
+)
 PAYMENT_REMINDER_MODE = (
     str(st.query_params.get("payment_reminders", "")).strip().lower() in {"1", "true", "yes"}
     or str(st.query_params.get("mode", "")).strip().lower() in {"payment", "payment_reminders", "payments"}
+    or (MESSAGES_MODE and MESSAGE_SEND_MODE in {"payment", "payments"})
 )
 
-if PHONE_REMINDER_MODE:
+if MESSAGES_MODE or PHONE_REMINDER_MODE or PAYMENT_REMINDER_MODE:
     # Streamlit 1.46+ supports additive page-config calls. If an older runtime
     # is ever used, keep the main DanCleanUK icon rather than breaking the app.
     try:
@@ -64,7 +72,7 @@ if PHONE_REMINDER_MODE:
     except Exception:
         pass
 
-if not st.session_state.get("admin_office_view", False) and not PHONE_REMINDER_MODE and not PAYMENT_REMINDER_MODE:
+if not st.session_state.get("admin_office_view", False) and not MESSAGES_MODE and not PHONE_REMINDER_MODE and not PAYMENT_REMINDER_MODE:
     st.title("🚗 DanCleanUK Daily Route Optimizer")
 
 # Phone presentation: keep office/admin and routine planning clutter off the
@@ -112,6 +120,34 @@ st.markdown(
 # ============================================================
 # DATABASE / PERSISTENCE
 # ============================================================
+
+
+# ============================================================
+# ONE PHONE REMINDERS HOME
+# ============================================================
+if MESSAGES_MODE and not PHONE_REMINDER_MODE and not PAYMENT_REMINDER_MODE:
+    st.title("📱 DanCleanUK — Phone Reminders")
+    st.caption("Choose which prepared messages you want to send.")
+
+    st.link_button(
+        "🪟 TOMORROW'S CLEANING / ACCESS REMINDERS",
+        "https://dancleanuk-optimizer.streamlit.app/?messages=1&send=cleaning",
+        type="primary",
+        use_container_width=True,
+    )
+    st.caption("Tomorrow's message includes the reminder to make sure we have access to the property.")
+
+    st.link_button(
+        "💷 OUTSTANDING PAYMENT REMINDERS",
+        "https://dancleanuk-optimizer.streamlit.app/?messages=1&send=payment",
+        use_container_width=True,
+    )
+    st.caption("Prepared Day 3 / Day 7 outstanding-payment reminders.")
+
+    st.markdown("---")
+    st.caption("Normal DanCleanUK icon = Driver. This shortcut = all phone reminders.")
+    st.stop()
+
 
 def db_connect():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -1409,7 +1445,7 @@ def _admin_mark_reminder_sent(customer_id, scheduled_date):
         return False
 
 
-PHONE_REMINDER_URL = "https://dancleanuk-optimizer.streamlit.app/?phone_reminders=1"
+PHONE_REMINDER_URL = "https://dancleanuk-optimizer.streamlit.app/?messages=1"
 
 
 def _admin_reminder_queue_columns_ready():
