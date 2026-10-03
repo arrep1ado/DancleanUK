@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.28-START-NEW-DAY-SAFE"
+APP_VERSION = "27.8.8.5.0.30-DRIVER-PREVIOUS-BALANCE"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -604,6 +604,94 @@ def load_route_snapshot(service_date):
         return row
     except (requests.RequestException, ValueError, TypeError):
         return None
+
+
+def _driver_customer_identity(address, postcode):
+    """Stable Driver-only customer identity for read-only payment history lookup."""
+    return "|".join([
+        " ".join(clean_val(address).casefold().split()),
+        normalise_postcode(postcode).casefold(),
+    ])
+
+
+def _driver_previous_outstanding_by_customer(current_service_date):
+    """Return previous unpaid completed cleans grouped by customer.
+
+    Driver-only read operation. It never changes Admin data, saved routes, payment
+    status or the optimiser. The current working date is deliberately excluded so
+    today's price can be shown separately and can never be counted twice.
+    """
+    url, _ = _supabase_config()
+    headers = _supabase_headers()
+    if not url or not headers:
+        return {}
+
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/saved_routes",
+            headers=headers,
+            params={
+                "select": "route_date,route_data",
+                "route_date": f"lt.{current_service_date}",
+                "order": "route_date.asc",
+                "limit": "1000",
+            },
+            timeout=30,
+        )
+        if response.status_code != 200:
+            return {}
+
+        grouped = {}
+        for snapshot in response.json() or []:
+            route_date = clean_val(snapshot.get("route_date"))
+            route_data = snapshot.get("route_data") or {}
+            for job in route_data.get("jobs_data", []) or []:
+                status = clean_val(job.get("Status")).lower()
+                payment = clean_val(job.get("Payment"))
+                if status != "completed" or payment not in {"Bank Transfer", "Not Paid"}:
+                    continue
+
+                address = clean_val(job.get("Address")) or clean_val(job.get("address_text"))
+                postcode = normalise_postcode(job.get("Postcode"))
+                identity = _driver_customer_identity(address, postcode)
+                if not identity.strip("|"):
+                    continue
+
+                try:
+                    amount = float(job.get("Price", 0) or 0)
+                except (TypeError, ValueError):
+                    amount = 0.0
+                if amount <= 0:
+                    continue
+
+                service_day = (
+                    clean_val(job.get("service_date"))
+                    or clean_val(job.get("Dates"))
+                    or route_date
+                )
+                grouped.setdefault(identity, []).append({
+                    "date": service_day,
+                    "amount": amount,
+                    "route_date": route_date,
+                    "job_id": clean_val(job.get("job_id")),
+                })
+
+        for identity, debts in grouped.items():
+            debts.sort(key=lambda x: (x.get("date", ""), x.get("route_date", ""), x.get("job_id", "")))
+        return grouped
+    except (requests.RequestException, ValueError, TypeError):
+        return {}
+
+
+def _driver_debt_date_display(value):
+    """Business-readable UK date for the Driver previous-balance box."""
+    text = clean_val(value)
+    if not text:
+        return "Date unavailable"
+    try:
+        return pd.to_datetime(text).strftime("%d/%m/%Y")
+    except Exception:
+        return text
 
 
 def load_upcoming_work_records():
@@ -8203,6 +8291,13 @@ if driver_mode:
                     else:
                         st.error(message)
 
+# Driver-only read of previous completed cleans that are still unpaid.
+# One Supabase query serves the whole route; no Admin state or data is changed.
+driver_previous_outstanding = (
+    _driver_previous_outstanding_by_customer(service_date_str)
+    if driver_mode else {}
+)
+
 # Completed jobs are kept in records but displayed separately.
 # Only located customers with a current route position belong in the
 # Planned Route. Unlocated customers stay in the database and appear only
@@ -8305,6 +8400,29 @@ else:
                 f"**Price:** £{price:.2f} "
                 f"| **Payment:** {payment}"
             )
+
+            # Driver-only previous-balance notice. Admin remains the source of
+            # truth for chasing/settling debts; this box simply tells the driver
+            # what to write on today's card while standing at the property.
+            if driver_mode:
+                customer_identity = _driver_customer_identity(street_address, postcode)
+                previous_debts = driver_previous_outstanding.get(customer_identity, [])
+                if previous_debts:
+                    previous_total = sum(float(item.get("amount", 0) or 0) for item in previous_debts)
+                    card_total = previous_total + price
+                    debt_count = len(previous_debts)
+                    debt_word = "payment" if debt_count == 1 else "payments"
+                    debt_lines = [
+                        f"**£{float(item.get('amount', 0) or 0):.2f} — {_driver_debt_date_display(item.get('date'))}**"
+                        for item in previous_debts
+                    ]
+                    st.warning(
+                        f"⚠️ **{debt_count} previous {debt_word} outstanding**\n\n"
+                        + "\n\n".join(debt_lines)
+                        + f"\n\n**Previous balance:** £{previous_total:.2f}"
+                        + f"\n\n**Today's clean:** £{price:.2f}"
+                        + f"\n\n**CARD AMOUNT: £{card_total:.2f}"
+                    )
 
             col1, col2 = st.columns(2)
 
