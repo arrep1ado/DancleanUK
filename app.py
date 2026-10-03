@@ -26,7 +26,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.35-TWO-UNPAID-REVIEW"
+APP_VERSION = "27.8.8.5.0.36-PREPARE-ROUTE-SORTED"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -1126,6 +1126,44 @@ def calculate_next_cleaning_due(service_date_value, cleaning_plan):
         return (service + pd.DateOffset(months=months)).date().isoformat()
     except Exception:
         return ""
+
+
+def _admin_prepare_customer_sort_parts(address, postcode=""):
+    """Natural Admin display sort: area/street first, then house number.
+
+    This is presentation-only. It never changes the stored customer address,
+    route selection, geocoding, ORS matrices or the locked V26.13 optimiser.
+    """
+    raw = clean_val(address).strip()
+    pc = normalise_postcode(postcode)
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+
+    first_part = parts[0] if parts else raw
+    locality = parts[1] if len(parts) >= 2 else ""
+
+    # Accept the customer-book formats we use: 143 Queensway, 7A High Street,
+    # 10-12 Main Street and optional Flat prefixes. The first numeric component
+    # is used only as a natural display key.
+    number_match = re.match(
+        r"^\s*(?:flat\s+[A-Za-z0-9-]+\s*,?\s*)?"
+        r"(\d+)([A-Za-z]?)(?:\s*[-/]\s*(\d+)[A-Za-z]?)?\s+(.*)$",
+        first_part,
+        flags=re.IGNORECASE,
+    )
+    if number_match:
+        house_number = int(number_match.group(1))
+        house_suffix = clean_val(number_match.group(2)).casefold()
+        street = clean_val(number_match.group(4))
+    else:
+        house_number = 10**9
+        house_suffix = ""
+        street = first_part
+
+    street_key = re.sub(r"[^a-z0-9]+", " ", street.casefold()).strip()
+    area_label = locality or street or pc or "Other"
+    area_key = re.sub(r"[^a-z0-9]+", " ", area_label.casefold()).strip()
+
+    return area_key, street_key, house_number, house_suffix, pc.casefold(), raw.casefold()
 
 
 # ============================================================
@@ -3911,8 +3949,33 @@ if st.session_state.get("admin_office_view", False):
                 if visible_route_df.empty:
                     st.info("No customers match these route filters.")
                 else:
+                    # ADMIN DISPLAY ONLY — keep the customer picker human-friendly.
+                    # Group by locality/street and sort house numbers numerically, so
+                    # Queensway appears 143, 178, 180, 182... instead of text order.
+                    # This does NOT set or influence the optimised driving order.
+                    sort_parts = visible_route_df.apply(
+                        lambda row: _admin_prepare_customer_sort_parts(
+                            row.get("Address"), row.get("Postcode")
+                        ),
+                        axis=1,
+                    )
+                    visible_route_df = visible_route_df.copy()
+                    visible_route_df["_display_area_sort"] = [x[0] for x in sort_parts]
+                    visible_route_df["_display_street_sort"] = [x[1] for x in sort_parts]
+                    visible_route_df["_display_house_number"] = [x[2] for x in sort_parts]
+                    visible_route_df["_display_house_suffix"] = [x[3] for x in sort_parts]
+                    visible_route_df["_display_postcode_sort"] = [x[4] for x in sort_parts]
+                    visible_route_df["_display_address_sort"] = [x[5] for x in sort_parts]
                     visible_route_df = visible_route_df.sort_values(
-                        ["Zone", "_effective_date", "Postcode", "Address"],
+                        [
+                            "_display_area_sort",
+                            "_display_street_sort",
+                            "_display_house_number",
+                            "_display_house_suffix",
+                            "_display_postcode_sort",
+                            "_display_address_sort",
+                        ],
+                        kind="stable",
                         na_position="last",
                     ).reset_index(drop=True)
                     editor = visible_route_df[[
