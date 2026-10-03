@@ -26,7 +26,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.34-PRIVATE-MESSAGE-CENTRE"
+APP_VERSION = "27.8.8.5.0.35-TWO-UNPAID-REVIEW"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -1168,6 +1168,62 @@ def _admin_jobs_from_routes(routes):
             item["_route_data"] = route_data
             rows.append(item)
     return rows
+
+
+def _admin_outstanding_summary_by_customer(routes):
+    """Admin-only read summary of completed cleans that are still unpaid.
+
+    This does not alter payment records, customer records, saved routes or routing.
+    It is used only to warn before another clean is scheduled.
+    """
+    grouped = {}
+    for job in _admin_jobs_from_routes(routes):
+        status = clean_val(job.get("Status")).lower()
+        payment = clean_val(job.get("Payment"))
+        if status != "completed" or payment not in {"Bank Transfer", "Not Paid"}:
+            continue
+
+        address = clean_val(job.get("Address")) or clean_val(job.get("address_text"))
+        postcode = normalise_postcode(job.get("Postcode"))
+        identity = _admin_customer_identity(address, postcode)
+        if not identity.strip("|"):
+            continue
+
+        try:
+            amount = float(job.get("Price", 0) or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+
+        service_day = _payment_service_date(job)
+        if service_day is not None:
+            service_text = service_day.strftime("%d/%m/%Y")
+            sort_value = service_day.isoformat()
+        else:
+            raw_date = clean_val(job.get("service_date")) or clean_val(job.get("Dates")) or clean_val(job.get("_route_date"))
+            try:
+                parsed = pd.to_datetime(raw_date)
+                service_text = parsed.strftime("%d/%m/%Y")
+                sort_value = parsed.date().isoformat()
+            except Exception:
+                service_text = raw_date or "Date unavailable"
+                sort_value = raw_date
+
+        grouped.setdefault(identity, []).append({
+            "amount": amount,
+            "date": service_text,
+            "sort": sort_value,
+        })
+
+    summary = {}
+    for identity, debts in grouped.items():
+        debts.sort(key=lambda item: item.get("sort", ""))
+        summary[identity] = {
+            "count": len(debts),
+            "total": sum(float(item.get("amount", 0) or 0) for item in debts),
+            "dates": [item.get("date", "") for item in debts],
+            "debts": debts,
+        }
+    return summary
 
 
 def _admin_mark_job_paid(route_date, job_id):
@@ -3734,6 +3790,10 @@ if st.session_state.get("admin_office_view", False):
                                 ". Adjustment is still available, but Admin will ask for confirmation first."
                             )
 
+                # ADMIN DISPLAY ONLY: warn before scheduling a customer who already
+                # has unpaid completed cleans. Nothing is blocked or changed automatically.
+                outstanding_by_customer = _admin_outstanding_summary_by_customer(routes)
+
                 route_rows = []
                 for row in route_customers:
                     due_raw = clean_val(row.get("next_cleaning_due"))
@@ -3745,10 +3805,27 @@ if st.session_state.get("admin_office_view", False):
                             effective_date = pd.to_datetime(effective_raw).date()
                         except Exception:
                             effective_date = None
+                    customer_address = clean_val(row.get("address"))
+                    customer_postcode = normalise_postcode(row.get("postcode"))
+                    customer_identity = _admin_customer_identity(customer_address, customer_postcode)
+                    debt_summary = outstanding_by_customer.get(customer_identity, {})
+                    unpaid_count = int(debt_summary.get("count", 0) or 0)
+                    unpaid_total = float(debt_summary.get("total", 0) or 0)
+                    unpaid_dates = [clean_val(x) for x in debt_summary.get("dates", []) if clean_val(x)]
+                    if unpaid_count >= 2:
+                        payment_alert = (
+                            f"⚠️ {unpaid_count} UNPAID · £{unpaid_total:.2f} · "
+                            + ", ".join(unpaid_dates)
+                        )
+                    elif unpaid_count == 1:
+                        payment_alert = f"1 unpaid · £{unpaid_total:.2f} · {unpaid_dates[0] if unpaid_dates else 'date unavailable'}"
+                    else:
+                        payment_alert = "—"
+
                     route_rows.append({
                         "Customer ID": row.get("id"),
-                        "Address": clean_val(row.get("address")),
-                        "Postcode": normalise_postcode(row.get("postcode")),
+                        "Address": customer_address,
+                        "Postcode": customer_postcode,
                         "Price": float(row.get("price", 0) or 0),
                         "Phone": clean_val(row.get("phone")),
                         "Cleaning Plan": normalise_cleaning_plan(row.get("cleaning_plan")),
@@ -3756,6 +3833,10 @@ if st.session_state.get("admin_office_view", False):
                         "Planned Service Date": planned_raw,
                         "Notes": clean_val(row.get("notes")),
                         "Zone": clean_val(row.get("zone")) or _admin_auto_zone(row.get("postcode")),
+                        "Payment Alert": payment_alert,
+                        "Unpaid Cleans": unpaid_count,
+                        "Outstanding Balance": unpaid_total,
+                        "Outstanding Dates": ", ".join(unpaid_dates),
                         "_effective_date": effective_date,
                     })
 
@@ -3836,7 +3917,8 @@ if st.session_state.get("admin_office_view", False):
                     ).reset_index(drop=True)
                     editor = visible_route_df[[
                         "Customer ID", "Address", "Postcode", "Zone", "Price", "Phone",
-                        "Cleaning Plan", "Next Cleaning Due", "Planned Service Date", "Notes"
+                        "Cleaning Plan", "Next Cleaning Due", "Planned Service Date", "Notes",
+                        "Payment Alert", "Unpaid Cleans", "Outstanding Balance", "Outstanding Dates"
                     ]].copy()
 
                     select_all_shown = st.checkbox(
@@ -3867,12 +3949,17 @@ if st.session_state.get("admin_office_view", False):
                         use_container_width=True,
                         disabled=[
                             "Customer ID", "Address", "Postcode", "Zone", "Price", "Phone",
-                            "Cleaning Plan", "Next Cleaning Due", "Planned Service Date", "Notes"
+                            "Cleaning Plan", "Next Cleaning Due", "Planned Service Date", "Notes",
+                            "Payment Alert", "Unpaid Cleans", "Outstanding Balance", "Outstanding Dates"
                         ],
                         column_config={
                             "Select": st.column_config.CheckboxColumn("Select"),
                             "Customer ID": None,
                             "Price": st.column_config.NumberColumn("Price", format="£%.2f"),
+                            "Payment Alert": st.column_config.TextColumn("Payment warning", width="large"),
+                            "Unpaid Cleans": None,
+                            "Outstanding Balance": None,
+                            "Outstanding Dates": None,
                         },
                         # A separate editor state for normal preparation vs saved-route correction
                         # avoids stale checkbox selections leaking between the two workflows.
@@ -3889,8 +3976,35 @@ if st.session_state.get("admin_office_view", False):
                         f"Route date {target_route_date.strftime('%d/%m/%Y')}"
                     )
 
+                    selected_two_plus = selected_route_rows[
+                        pd.to_numeric(selected_route_rows["Unpaid Cleans"], errors="coerce").fillna(0) >= 2
+                    ].copy() if not selected_route_rows.empty else selected_route_rows.copy()
+
+                    debt_review_confirmed = True
+                    if not selected_two_plus.empty:
+                        st.error(
+                            f"⚠️ PAYMENT REVIEW — {len(selected_two_plus)} selected customer(s) already have "
+                            "2 or more completed cleans unpaid. Review before scheduling another visit."
+                        )
+                        for _, debt_row in selected_two_plus.iterrows():
+                            st.markdown(
+                                f"**{clean_val(debt_row.get('Address'))}** — "
+                                f"{int(debt_row.get('Unpaid Cleans', 0) or 0)} unpaid cleans · "
+                                f"£{float(debt_row.get('Outstanding Balance', 0) or 0):.2f} · "
+                                f"{clean_val(debt_row.get('Outstanding Dates'))}"
+                            )
+                        debt_review_confirmed = st.checkbox(
+                            "I reviewed these outstanding payments and still want to schedule this visit.",
+                            value=False,
+                            key=f"admin_confirm_two_unpaid_{target_route_str}_{'adjust' if adjustment_active else 'new'}",
+                        )
+
                     adjustment_allowed = bool(route_locked and adjustment_active)
-                    prepare_disabled = selected_route_rows.empty or (route_locked and not adjustment_allowed)
+                    prepare_disabled = (
+                        selected_route_rows.empty
+                        or (route_locked and not adjustment_allowed)
+                        or (not debt_review_confirmed)
+                    )
                     send_label = (
                         "🚀 SEND ADJUSTED JOBS TO ROUTE OPTIMIZER"
                         if adjustment_allowed
