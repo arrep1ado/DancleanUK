@@ -25,7 +25,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # Version 26.10
 # ============================================================
 
-APP_VERSION = "27.8.8.5.0.25-QUICK-ADD-NAME"
+APP_VERSION = "27.8.8.5.0.26-LIVE-DAILY-RECORD"
 DB_FILE = "dancleanuk.db"
 
 # ============================================================
@@ -1514,6 +1514,169 @@ def _admin_build_customer_backup_xlsx(customer_records, routes):
     style_table(ws_payments, {"A": 14, "B": 30, "C": 14, "D": 12, "E": 18, "F": 18, "G": 20})
     for cell in ws_payments["D"][1:]:
         cell.number_format = '£#,##0.00'
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+def _admin_build_live_daily_record_xlsx(snapshot):
+    """Build the current Daily Record directly from one permanent saved route.
+
+    The saved Supabase route is the source of truth. This export is generated
+    fresh each time, so Done/Paid/progress/notes cannot drift away from the
+    current saved route just because an older report file was saved earlier.
+    """
+    snapshot = dict(snapshot or {})
+    route_date = clean_val(snapshot.get("route_date"))
+    route_data = dict(snapshot.get("route_data") or {})
+    jobs = [dict(x) for x in (route_data.get("jobs_data") or [])]
+
+    def sort_key(job):
+        try:
+            return (0, float(job.get("route_order")))
+        except Exception:
+            return (1, clean_val(job.get("Address")) or clean_val(job.get("address_text")))
+
+    def display_time(value):
+        text = clean_val(value)
+        if not text:
+            return ""
+        try:
+            dt = pd.to_datetime(text).to_pydatetime()
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.astimezone(ZoneInfo("Europe/London")).strftime("%H:%M")
+        except Exception:
+            return text
+
+    jobs = sorted(jobs, key=sort_key)
+    completed = [j for j in jobs if clean_val(j.get("Status")).lower() == "completed"]
+    pending = [j for j in jobs if clean_val(j.get("Status")).lower() != "completed"]
+
+    completed_revenue = sum(float(j.get("Price", 0) or 0) for j in completed)
+    collected = 0.0
+    outstanding = 0.0
+    paid_jobs = 0
+    outstanding_jobs = 0
+    for job in completed:
+        pay_status, _ = _admin_payment_display(job)
+        amount = float(job.get("Price", 0) or 0)
+        if pay_status == "Paid":
+            collected += amount
+            paid_jobs += 1
+        else:
+            outstanding += amount
+            outstanding_jobs += 1
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Daily Record"
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    section_fill = PatternFill("solid", fgColor="D9EAF7")
+    paid_fill = PatternFill("solid", fgColor="E2F0D9")
+    outstanding_fill = PatternFill("solid", fgColor="FCE4D6")
+    header_font = Font(color="FFFFFF", bold=True)
+    title_font = Font(bold=True, size=16)
+    bold_font = Font(bold=True)
+    thin = Side(style="thin", color="D9E1F2")
+    border = Border(bottom=thin)
+
+    ws["A1"] = "DanCleanUK Daily Record"
+    ws["A1"].font = title_font
+    ws["A2"] = "Date"
+    ws["A2"].font = bold_font
+    try:
+        ws["B2"] = pd.to_datetime(route_date).strftime("%d/%m/%Y")
+    except Exception:
+        ws["B2"] = route_date
+    ws["A3"] = "Status"
+    ws["A3"].font = bold_font
+    ws["B3"] = "Complete" if jobs and not pending else "In progress"
+
+    total_minutes = int(round(float(snapshot.get("total_minutes") or (route_data.get("time_s", 0) or 0) / 60.0)))
+    summary = [
+        ("Jobs", len(jobs)),
+        ("Completed", len(completed)),
+        ("Pending", len(pending)),
+        ("Completed Revenue", completed_revenue),
+        ("Collected", collected),
+        ("Outstanding", outstanding),
+        ("Paid Jobs", paid_jobs),
+        ("Outstanding Jobs", outstanding_jobs),
+        ("Driving Distance", f"{float(snapshot.get('total_miles') or 0):.1f} miles"),
+        ("Driving Time", f"{total_minutes // 60}h {total_minutes % 60:02d}m"),
+        ("Fuel Cost", float(snapshot.get("fuel_cost") or 0)),
+        ("Take Home", float(snapshot.get("take_home") or 0)),
+    ]
+    for r, (label, value) in enumerate(summary, start=5):
+        ws.cell(r, 1, label).font = bold_font
+        ws.cell(r, 1).fill = section_fill
+        ws.cell(r, 2, value)
+        if label in {"Completed Revenue", "Collected", "Outstanding", "Fuel Cost", "Take Home"}:
+            ws.cell(r, 2).number_format = '£#,##0.00'
+        if label == "Outstanding" and float(outstanding) > 0:
+            ws.cell(r, 1).fill = outstanding_fill
+            ws.cell(r, 2).fill = outstanding_fill
+            ws.cell(r, 2).font = bold_font
+
+    start = 19
+    headers = [
+        "Order", "Address", "Postcode", "Price", "Job Status",
+        "Payment Status", "Payment Method", "Completed Time", "Payment Time",
+        "Cleaning Plan", "Next Cleaning Due", "Phone", "Notes",
+    ]
+    for c, heading in enumerate(headers, start=1):
+        cell = ws.cell(start, c, heading)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(vertical="center")
+    ws.row_dimensions[start].height = 24
+
+    for row_no, job in enumerate(jobs, start=start + 1):
+        pay_status, pay_method = _admin_payment_display(job)
+        status = "Completed" if clean_val(job.get("Status")).lower() == "completed" else "Pending"
+        order = job.get("route_order")
+        try:
+            order = int(float(order)) + 1
+        except Exception:
+            order = ""
+        values = [
+            order,
+            clean_val(job.get("Address")) or clean_val(job.get("address_text")),
+            normalise_postcode(job.get("Postcode")),
+            float(job.get("Price", 0) or 0),
+            status, pay_status, pay_method,
+            display_time(job.get("CompletedTime")) if clean_val(job.get("CompletedTime")) else "",
+            display_time(job.get("PaymentTime")) if clean_val(job.get("PaymentTime")) else "",
+            normalise_cleaning_plan(job.get("Cleaning Plan")),
+            _admin_excel_date(job.get("Next Cleaning Due")) or "",
+            clean_val(job.get("Phone")),
+            clean_val(job.get("Notes")),
+        ]
+        for c, value in enumerate(values, start=1):
+            cell = ws.cell(row_no, c, value)
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        ws.cell(row_no, 4).number_format = '£#,##0.00'
+        if pay_status == "Paid":
+            ws.cell(row_no, 6).fill = paid_fill
+        elif status == "Completed":
+            ws.cell(row_no, 6).fill = outstanding_fill
+
+    widths = {
+        "A": 8, "B": 30, "C": 14, "D": 11, "E": 14, "F": 18, "G": 18,
+        "H": 16, "I": 16, "J": 16, "K": 18, "L": 16, "M": 42,
+    }
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = f"A{start + 1}"
+    if jobs:
+        ws.auto_filter.ref = f"A{start}:M{start + len(jobs)}"
 
     output = io.BytesIO()
     wb.save(output)
@@ -3624,36 +3787,72 @@ if st.session_state.get("admin_office_view", False):
                 )
 
     elif admin_tab == "📊 Daily Reports":
-        st.header("📊 Daily Reports")
-        report_routes = []
-        for snapshot in routes:
-            data = snapshot.get("route_data") or {}
-            if data.get("report_b64"):
-                report_routes.append((snapshot, data))
-        if not report_routes:
-            st.info("No saved Daily Reports yet. Reports saved by the Driver/Route workflow will appear here automatically.")
+        st.header("📊 Daily Records")
+        st.caption(
+            "Each permanent saved route is the live record for that working day. "
+            "Done, payment status, notes and progress come directly from Supabase; "
+            "the Excel download is generated fresh from that record."
+        )
+
+        live_routes = sorted(
+            [dict(x) for x in (routes or [])],
+            key=lambda x: clean_val(x.get("route_date")),
+            reverse=True,
+        )
+        if not live_routes:
+            st.info("No permanent saved routes yet. Save/lock a route and its Daily Record will appear here automatically.")
         else:
-            st.caption(f"{len(report_routes)} saved report(s)")
-            for snapshot, data in report_routes:
+            st.caption(f"{len(live_routes)} daily record(s)")
+            for snapshot in live_routes:
                 route_date = clean_val(snapshot.get("route_date"))
+                data = dict(snapshot.get("route_data") or {})
+                jobs_data = [dict(x) for x in (data.get("jobs_data") or [])]
+                completed = [j for j in jobs_data if clean_val(j.get("Status")).lower() == "completed"]
+                pending_count = max(len(jobs_data) - len(completed), 0)
+                completed_revenue = sum(float(j.get("Price", 0) or 0) for j in completed)
+                collected = 0.0
+                outstanding = 0.0
+                for job in completed:
+                    pay_status, _ = _admin_payment_display(job)
+                    amount = float(job.get("Price", 0) or 0)
+                    if pay_status == "Paid":
+                        collected += amount
+                    else:
+                        outstanding += amount
                 try:
                     date_label = pd.to_datetime(route_date).strftime("%d/%m/%Y")
                 except Exception:
                     date_label = route_date
-                jobs_data = data.get("jobs_data", []) or []
-                completed = [j for j in jobs_data if clean_val(j.get("Status")).lower() == "completed"]
-                revenue = sum(float(j.get("Price", 0) or 0) for j in completed)
-                filename = clean_val(data.get("report_filename")) or f"DanCleanUK_Daily_Report_{route_date}.xlsx"
-                try:
-                    report_bytes = base64.b64decode(data.get("report_b64") or "")
-                except Exception:
-                    report_bytes = b""
+                status_label = "✅ Complete" if jobs_data and pending_count == 0 else "🟠 In progress"
+                total_minutes = int(round(float(snapshot.get("total_minutes") or (data.get("time_s", 0) or 0) / 60.0)))
+                live_report = _admin_build_live_daily_record_xlsx(snapshot)
+                filename = f"DanCleanUK_Daily_Record_{route_date}.xlsx"
+
                 with st.container(border=True):
-                    c1, c2, c3 = st.columns([3, 2, 2])
-                    c1.markdown(f"**{date_label}**")
-                    c2.markdown(f"{len(completed)} completed job(s)  \n**£{revenue:.2f}**")
-                    if report_bytes:
-                        c3.download_button("⬇️ Download Excel", data=report_bytes, file_name=filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"admin_report_{route_date}", use_container_width=True)
+                    top1, top2, top3 = st.columns([3, 2, 2])
+                    top1.markdown(f"### {date_label}  \n{status_label}")
+                    top2.metric("Completed", f"{len(completed)} / {len(jobs_data)}")
+                    top3.metric("Completed Revenue", f"£{completed_revenue:.2f}")
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Collected", f"£{collected:.2f}")
+                    m2.metric("Outstanding", f"£{outstanding:.2f}")
+                    m3.metric("Miles", f"{float(snapshot.get('total_miles') or 0):.1f}")
+                    m4.metric("Driving", f"{total_minutes // 60}h {total_minutes % 60:02d}m")
+
+                    if pending_count:
+                        st.caption(f"{pending_count} job(s) still pending on this saved route.")
+                    else:
+                        st.caption("All jobs on this saved route are completed.")
+
+                    st.download_button(
+                        "⬇️ Download Current Daily Record",
+                        data=live_report,
+                        file_name=filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"admin_live_daily_record_{route_date}",
+                        use_container_width=True,
+                    )
 
     else:
         st.header("👥 Customers")
