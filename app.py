@@ -48,7 +48,10 @@ st.set_page_config(
 )
 
 PHONE_REMINDER_MODE = str(st.query_params.get("phone_reminders", "")).strip().lower() in {"1", "true", "yes"}
-PAYMENT_REMINDER_MODE = str(st.query_params.get("payment_reminders", "")).strip().lower() in {"1", "true", "yes"}
+PAYMENT_REMINDER_MODE = (
+    str(st.query_params.get("payment_reminders", "")).strip().lower() in {"1", "true", "yes"}
+    or str(st.query_params.get("mode", "")).strip().lower() in {"payment", "payment_reminders", "payments"}
+)
 
 if PHONE_REMINDER_MODE:
     # Streamlit 1.46+ supports additive page-config calls. If an older runtime
@@ -1534,7 +1537,7 @@ def _phone_reminder_reset_session():
 
 
 
-PAYMENT_REMINDER_URL = "https://dancleanuk-optimizer.streamlit.app/?payment_reminders=1"
+PAYMENT_REMINDER_URL = "https://dancleanuk-optimizer.streamlit.app/?mode=payment"
 
 
 def _payment_service_date(job):
@@ -2572,8 +2575,8 @@ if st.session_state.get("admin_office_view", False):
                 payment_notice = st.session_state.pop("payment_queue_notice", "")
                 if payment_notice:
                     st.success(payment_notice)
-                    st.markdown(f"**On your phone open:** [{PAYMENT_REMINDER_URL}]({PAYMENT_REMINDER_URL})")
-                    st.caption("You can bookmark this payment-reminder page on your phone and reuse it.")
+                    st.markdown(f"**On your phone open this special payment link:** [{PAYMENT_REMINDER_URL}]({PAYMENT_REMINDER_URL})")
+                    st.caption("Important: do not open the normal DanCleanUK home-screen icon for this step — that intentionally opens Driver. Bookmark this special payment-reminder link separately on your phone and reuse it.")
 
             st.subheader("🧾 All outstanding")
             for job in sorted(outstanding, key=lambda x: (x.get("_route_date", ""), clean_val(x.get("address_text"))), reverse=True):
